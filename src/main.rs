@@ -58,7 +58,7 @@ async fn run_review(archetype_name: &str, input_source: &cli::InputSource) -> Re
         project.archetypes.iter().collect()
     } else {
         let arch = project.archetypes.get(archetype_name).ok_or_else(|| {
-            let available: Vec<_> = project.archetypes.keys().map(|s| s.as_str()).collect();
+            let available: Vec<_> = project.archetypes.keys().map(String::as_str).collect();
             anyhow::anyhow!(
                 "unknown archetype '{archetype_name}'\n  available: {}",
                 if available.is_empty() {
@@ -106,20 +106,20 @@ async fn run_review(archetype_name: &str, input_source: &cli::InputSource) -> Re
 
         if let Some(ref session_id) = arch.claude {
             let sid = session_id.clone();
-            let aname = arch_name.to_string();
+            let aname = (*arch_name).clone();
             let prompt = assembled.clone();
             handles.push((
-                arch_name.to_string(),
+                (*arch_name).clone(),
                 tokio::spawn(async move { provider::invoke_claude(&sid, &aname, &prompt).await }),
             ));
         }
 
         if let Some(ref session_id) = arch.codex {
             let sid = session_id.clone();
-            let aname = arch_name.to_string();
+            let aname = (*arch_name).clone();
             let prompt = assembled.clone();
             handles.push((
-                arch_name.to_string(),
+                (*arch_name).clone(),
                 tokio::spawn(async move { provider::invoke_codex(&sid, &aname, &prompt).await }),
             ));
         }

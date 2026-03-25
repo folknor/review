@@ -16,7 +16,7 @@ pub fn register(
 
     register_on_project(project, archetype, claude, codex);
 
-    let entry = project.archetypes.get(archetype).unwrap();
+    let entry = project.archetypes.get(archetype).expect("archetype just inserted");
     let prompt_diff = entry.prompt_diff.clone();
     let prompt_document = entry.prompt_document.clone();
 
@@ -94,7 +94,7 @@ fn deregister_on_project(
     }
 
     if claude_only || codex_only {
-        let entry = project.archetypes.get_mut(archetype).unwrap();
+        let entry = project.archetypes.get_mut(archetype).expect("archetype existence checked above");
         if claude_only {
             entry.claude = None;
         }
@@ -143,6 +143,7 @@ fn print_project(name: &str, project: &config::Project) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;

@@ -95,7 +95,7 @@ pub fn resolve_project_from<'a>(config: &'a Config, cwd: &Path) -> Result<(Strin
         let project_path = canonicalize_best_effort(&expand_path(&project.path));
         if cwd.starts_with(&project_path) {
             let depth = project_path.components().count();
-            if best.as_ref().map_or(true, |(_, _, d)| depth > *d) {
+            if best.as_ref().is_none_or(|(_, _, d)| depth > *d) {
                 best = Some((name.clone(), project, depth));
             }
         }
@@ -118,14 +118,14 @@ pub fn resolve_project_mut(config: &mut Config) -> Result<(String, &mut Project)
         let project_path = canonicalize_best_effort(&expand_path(&project.path));
         if cwd.starts_with(&project_path) {
             let depth = project_path.components().count();
-            if best.as_ref().map_or(true, |(_, d)| depth > *d) {
+            if best.as_ref().is_none_or(|(_, d)| depth > *d) {
                 best = Some((name.clone(), depth));
             }
         }
     }
     match best {
         Some((name, _)) => {
-            let project = config.projects.get_mut(&name).unwrap();
+            let project = config.projects.get_mut(&name).expect("project disappeared from map");
             Ok((name, project))
         }
         None => bail!(
@@ -136,6 +136,7 @@ pub fn resolve_project_mut(config: &mut Config) -> Result<(String, &mut Project)
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
