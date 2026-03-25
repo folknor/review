@@ -4,6 +4,11 @@ use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+/// Check whether a provider binary is available on PATH.
+pub fn is_available(provider: &str) -> bool {
+    which::which(provider).is_ok()
+}
+
 fn temp_path(archetype: &str, provider: &str) -> String {
     let pid = std::process::id();
     let safe_name: String = archetype

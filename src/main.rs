@@ -68,31 +68,53 @@ async fn main() -> Result<()> {
     // Assemble prompts and spawn all providers in parallel
     let mut handles: Vec<(String, tokio::task::JoinHandle<provider::ProviderResult>)> = Vec::new();
 
+    let claude_available = provider::is_available("claude");
+    let codex_available = provider::is_available("codex");
+
+    if !claude_available {
+        eprintln!("warning: 'claude' not found on PATH, skipping claude sessions");
+    }
+    if !codex_available {
+        eprintln!("warning: 'codex' not found on PATH, skipping codex sessions");
+    }
+
     for arch_name in &runnable {
         let assembled = prompt::assemble(&cfg, arch_name, &context, &stdin_instructions);
         let arch_cfg = cfg.frontmatter.archetypes.get(*arch_name).expect("filtered above");
         let host_cfg = arch_cfg.resolve_host(&hostname).expect("filtered above");
 
-        if let Some(ref session_id) = host_cfg.claude {
-            let sid = session_id.clone();
-            let prompt = assembled.clone();
-            let root = project_root.clone();
-            handles.push((
-                (*arch_name).to_string(),
-                tokio::spawn(async move { provider::invoke_claude(&sid, &prompt, &root).await }),
-            ));
+        if claude_available {
+            if let Some(ref session_id) = host_cfg.claude {
+                let sid = session_id.clone();
+                let prompt = assembled.clone();
+                let root = project_root.clone();
+                handles.push((
+                    (*arch_name).to_string(),
+                    tokio::spawn(async move { provider::invoke_claude(&sid, &prompt, &root).await }),
+                ));
+            }
         }
 
-        if let Some(ref session_id) = host_cfg.codex {
-            let sid = session_id.clone();
-            let aname = (*arch_name).to_string();
-            let prompt = assembled.clone();
-            let root = project_root.clone();
-            handles.push((
-                (*arch_name).to_string(),
-                tokio::spawn(async move { provider::invoke_codex(&sid, &aname, &prompt, &root).await }),
-            ));
+        if codex_available {
+            if let Some(ref session_id) = host_cfg.codex {
+                let sid = session_id.clone();
+                let aname = (*arch_name).to_string();
+                let prompt = assembled.clone();
+                let root = project_root.clone();
+                handles.push((
+                    (*arch_name).to_string(),
+                    tokio::spawn(async move { provider::invoke_codex(&sid, &aname, &prompt, &root).await }),
+                ));
+            }
         }
+    }
+
+    if handles.is_empty() {
+        bail!(
+            "no providers available to run\n\n\
+             Sessions are configured but the provider binaries are not on PATH.\n\
+             Install 'claude' and/or 'codex' to proceed."
+        );
     }
 
     // Collect results
