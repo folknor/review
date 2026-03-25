@@ -84,11 +84,14 @@ async fn run_claude(session_id: &str, prompt: &str, project_root: &Path) -> Resu
     let output = child.wait_with_output();
 
     let (write_res, output) = tokio::join!(write_result, output);
-    write_res?;
-
     let output = output.context("failed to wait for claude")?;
 
+    // Only fail on write error if the child also failed —
+    // the provider may have closed stdin early after reading enough
     if !output.status.success() {
+        if let Err(e) = write_res {
+            anyhow::bail!("failed to write prompt: {e}");
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("claude exited with error: {}", stderr.trim());
     }
@@ -119,8 +122,6 @@ async fn run_codex(
     let output = child.wait_with_output();
 
     let (write_res, output) = tokio::join!(write_result, output);
-    write_res?;
-
     let output = output.context("failed to wait for codex")?;
 
     // Always clean up the temp file
@@ -128,6 +129,9 @@ async fn run_codex(
 
     if !output.status.success() {
         cleanup().await;
+        if let Err(e) = write_res {
+            anyhow::bail!("failed to write prompt: {e}");
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("codex exited with error: {}", stderr.trim());
     }
@@ -139,9 +143,14 @@ async fn run_codex(
 }
 
 pub fn print_result(result: &ProviderResult) {
-    println!("--- {} ---", result.provider);
     match &result.output {
-        Ok(text) => println!("{text}"),
-        Err(err) => eprintln!("error: {err}"),
+        Ok(text) => {
+            println!("--- {} ---", result.provider);
+            println!("{text}");
+        }
+        Err(err) => {
+            eprintln!("--- {} ---", result.provider);
+            eprintln!("error: {err}");
+        }
     }
 }
