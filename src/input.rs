@@ -1,105 +1,73 @@
 use anyhow::{Context, Result, bail};
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::process::Command;
 
 use crate::cli::InputSource;
 
-pub enum ContentType {
-    Diff,
-    Document,
-}
-
-pub struct ResolvedInput {
-    pub content: String,
-    pub content_type: ContentType,
-}
-
-pub fn resolve(input: &InputSource) -> Result<ResolvedInput> {
+pub fn resolve(input: &InputSource) -> Result<String> {
     if !input.is_specified() {
         bail!(
             "no input source specified\n\n\
              Usage: review <archetype> <input-source>\n\n\
              Input sources:\n  \
-             --unstaged              working tree changes\n  \
-             --staged                staged changes\n  \
-             --commit <hash>         diff of a specific commit\n  \
-             --range <a..b>          diff across a commit range\n  \
-             --branch                full branch diff against main\n  \
-             --document <path>       a file as-is\n  \
-             --stdin                 read from stdin (diff)\n  \
-             --stdin --as-document   read from stdin (document)"
+             --unstaged          working tree changes\n  \
+             --staged            staged changes\n  \
+             --commit <hash>     diff of a specific commit\n  \
+             --range <a..b>      diff across a commit range\n  \
+             --branch            full branch diff against main\n  \
+             --document <path>   a file as-is"
         );
     }
 
     resolve_flags(input)
 }
 
-fn resolve_flags(input: &InputSource) -> Result<ResolvedInput> {
+const MAX_STDIN_BYTES: usize = 20_000;
 
+pub fn read_stdin() -> Result<String> {
+    if std::io::stdin().is_terminal() {
+        bail!(
+            "no instructions provided on stdin\n\n\
+             Pipe your review instructions via stdin, e.g.:\n  \
+             echo \"review for security issues\" | review security --staged"
+        );
+    }
+    let mut buf = String::new();
+    std::io::stdin()
+        .take(MAX_STDIN_BYTES as u64 + 1)
+        .read_to_string(&mut buf)
+        .context("failed to read from stdin")?;
+    if buf.len() > MAX_STDIN_BYTES {
+        bail!("stdin instructions exceed {MAX_STDIN_BYTES} byte limit");
+    }
+    Ok(buf)
+}
+
+fn resolve_flags(input: &InputSource) -> Result<String> {
     if input.unstaged {
-        let output = git(&["diff"])?;
-        return Ok(ResolvedInput {
-            content: output,
-            content_type: ContentType::Diff,
-        });
+        return git(&["diff"]);
     }
 
     if input.staged {
-        let output = git(&["diff", "--cached"])?;
-        return Ok(ResolvedInput {
-            content: output,
-            content_type: ContentType::Diff,
-        });
+        return git(&["diff", "--cached"]);
     }
 
     if let Some(ref hash) = input.commit {
-        let output = git(&["show", "--format=", "--no-notes", hash])?;
-        return Ok(ResolvedInput {
-            content: output,
-            content_type: ContentType::Diff,
-        });
+        return git(&["show", "--format=", "--no-notes", hash]);
     }
 
     if let Some(ref range) = input.range {
-        let output = git(&["diff", range])?;
-        return Ok(ResolvedInput {
-            content: output,
-            content_type: ContentType::Diff,
-        });
+        return git(&["diff", range]);
     }
 
     if input.branch {
         let base = detect_default_branch()?;
-        let output = git(&["diff", &format!("{base}...HEAD")])?;
-        return Ok(ResolvedInput {
-            content: output,
-            content_type: ContentType::Diff,
-        });
+        return git(&["diff", &format!("{base}...HEAD")]);
     }
 
     if let Some(ref path) = input.document {
-        let content =
-            std::fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
-        return Ok(ResolvedInput {
-            content,
-            content_type: ContentType::Document,
-        });
-    }
-
-    if input.stdin {
-        let mut buf = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buf)
-            .context("failed to read from stdin")?;
-        let content_type = if input.as_document {
-            ContentType::Document
-        } else {
-            ContentType::Diff
-        };
-        return Ok(ResolvedInput {
-            content: buf,
-            content_type,
-        });
+        return std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {path}"));
     }
 
     unreachable!()
@@ -135,5 +103,3 @@ fn git(args: &[&str]) -> Result<String> {
 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
-
-

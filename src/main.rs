@@ -46,7 +46,8 @@ async fn run_review(archetype_name: &str, input_source: &cli::InputSource) -> Re
     let cfg = config::load()?;
     let (project_name, project) = config::resolve_project(&cfg)?;
 
-    let resolved_input = input::resolve(input_source)?;
+    let stdin_instructions = input::read_stdin()?;
+    let content = input::resolve(input_source)?;
 
     let owned_name;
     let archetypes_to_run: Vec<(&String, &config::Archetype)> = if archetype_name == "all" {
@@ -100,8 +101,8 @@ async fn run_review(archetype_name: &str, input_source: &cli::InputSource) -> Re
             arch_name,
             &project_name,
             arch,
-            &resolved_input.content_type,
-            &resolved_input.content,
+            &stdin_instructions,
+            &content,
         )?;
 
         if let Some(ref session_id) = arch.claude {

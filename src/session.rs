@@ -17,16 +17,15 @@ pub fn register(
     register_on_project(project, archetype, claude, codex);
 
     let entry = project.archetypes.get(archetype).expect("archetype just inserted");
-    let prompt_diff = entry.prompt_diff.clone();
-    let prompt_document = entry.prompt_document.clone();
+    let prompt_path = entry.prompt.clone();
 
     config::save(config)?;
     println!("registered session(s) for archetype '{archetype}'");
 
-    for (label, path) in [("diff", &prompt_diff), ("document", &prompt_document)] {
-        if !config::expand_path(path).exists() {
-            eprintln!("warning: {label} prompt file does not exist: {path}");
-        }
+    if let Some(p) = &prompt_path
+        && !config::expand_path(p).exists()
+    {
+        eprintln!("warning: prompt file does not exist: {p}");
     }
 
     Ok(())
@@ -44,8 +43,7 @@ fn register_on_project(
         .or_insert_with(|| Archetype {
             claude: None,
             codex: None,
-            prompt_diff: format!("~/.config/review/prompts/{archetype}/diff.md"),
-            prompt_document: format!("~/.config/review/prompts/{archetype}/document.md"),
+            prompt: None,
         });
 
     if let Some(id) = claude {
@@ -155,8 +153,7 @@ mod tests {
             Archetype {
                 claude: Some("claude-123".into()),
                 codex: Some("codex-456".into()),
-                prompt_diff: "d".into(),
-                prompt_document: "d".into(),
+                prompt: None,
             },
         );
         Project {

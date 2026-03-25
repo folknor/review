@@ -6,7 +6,7 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<ManagementCommand>,
 
-    /// Archetype name (e.g. security, bugs, perf, arch) or "all"
+    /// Archetype name or "all". Built-in: security, bugs, perf, arch. Custom archetypes also supported.
     #[arg(required_unless_present = "command")]
     pub archetype: Option<String>,
 
@@ -78,14 +78,6 @@ pub struct InputSource {
     /// A file path to review as-is (not a diff)
     #[arg(long)]
     pub document: Option<String>,
-
-    /// Read input from stdin
-    #[arg(long)]
-    pub stdin: bool,
-
-    /// Treat stdin input as a document instead of a diff
-    #[arg(long, requires = "stdin")]
-    pub as_document: bool,
 }
 
 impl InputSource {
@@ -96,6 +88,5 @@ impl InputSource {
             || self.range.is_some()
             || self.branch
             || self.document.is_some()
-            || self.stdin
     }
 }

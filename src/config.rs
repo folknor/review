@@ -3,16 +3,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Config {
+    #[serde(default)]
     pub global: Global,
     #[serde(default)]
     pub projects: BTreeMap<String, Project>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 pub struct Global {
-    pub prefix: String,
+    pub prefix: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -26,8 +27,7 @@ pub struct Project {
 pub struct Archetype {
     pub claude: Option<String>,
     pub codex: Option<String>,
-    pub prompt_diff: String,
-    pub prompt_document: String,
+    pub prompt: Option<String>,
 }
 
 impl Archetype {
@@ -165,7 +165,7 @@ mod tests {
         );
         Config {
             global: Global {
-                prefix: "~/.config/review/prompts/prefix.md".to_string(),
+                prefix: None,
             },
             projects,
         }
@@ -214,8 +214,7 @@ mod tests {
         let arch = Archetype {
             claude: Some("c".into()),
             codex: Some("x".into()),
-            prompt_diff: "d".into(),
-            prompt_document: "d".into(),
+            prompt: None,
         };
         assert!(arch.has_sessions());
     }
@@ -225,8 +224,7 @@ mod tests {
         let arch = Archetype {
             claude: None,
             codex: None,
-            prompt_diff: "d".into(),
-            prompt_document: "d".into(),
+            prompt: None,
         };
         assert!(!arch.has_sessions());
     }

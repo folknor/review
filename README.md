@@ -4,7 +4,7 @@ A Rust CLI that fans out code reviews to persistent AI sessions across multiple 
 
 ## How it works
 
-You configure **archetypes** -- named reviewer perspectives like `security`, `bugs`, `perf`, `arch` -- each backed by long-lived sessions in one or more AI providers. When you run a review, the tool assembles a prompt (grounding prefix + archetype-specific instructions + your diff or document), sends it to all providers for that archetype in parallel, and prints the labeled results.
+You configure **archetypes** -- named reviewer perspectives like `security`, `bugs`, `perf`, `arch` -- each backed by long-lived sessions in one or more AI providers. When you run a review, you pipe your instructions via stdin and specify what to review with a flag. The tool assembles a prompt (grounding prefix + archetype prompt + your instructions + content), sends it to all providers for that archetype in parallel, and prints the labeled results.
 
 Sessions carry project familiarity from previous interactions. A grounding prefix on every invocation tells the reviewer not to trust its memory of the codebase, only what's explicitly provided.
 
@@ -23,27 +23,11 @@ Requires Rust 1.92+.
 ```toml
 # ~/.config/review/config.toml
 
-[global]
-prefix = "~/.config/review/prompts/prefix.md"
-
 [projects.myproject]
 path = "/home/you/myproject"
 ```
 
-### 2. Create prompt files
-
-```
-~/.config/review/prompts/
-  prefix.md                  # grounding prompt (sent every time)
-  security/
-    diff.md                  # security review instructions for diffs
-    document.md              # security review instructions for documents
-  bugs/
-    diff.md
-    document.md
-```
-
-### 3. Register sessions
+### 2. Register sessions
 
 ```
 cd /home/you/myproject
@@ -52,19 +36,35 @@ review register security --codex <session-id>
 review register bugs --claude <session-id>
 ```
 
-### 4. Run reviews
+### 3. Run reviews
 
 ```
-review security --staged
-review bugs --branch
-review all --unstaged
+echo "look for auth boundary violations" | review security --staged
+echo "check for edge cases" | review bugs --branch
+echo "review this spec for gaps" | review arch --document spec.md
+echo "full review" | review all --unstaged
 ```
 
 ## Usage
 
 ```
-review <archetype> <input-source>
+echo "<instructions>" | review <archetype> <input-source>
 ```
+
+Instructions are piped via stdin (required, 20KB limit). An input source flag is always required.
+
+### Built-in archetypes
+
+| Archetype | Focus |
+|-----------|-------|
+| `security` | Auth boundaries, injection, secrets, trust assumptions |
+| `bugs` | Logic errors, edge cases, error handling, crashes |
+| `perf` | Allocations, complexity, hot paths, async blocking |
+| `arch` | Coupling, abstractions, API design, consistency |
+
+Custom archetypes are also supported -- any name works. Built-in archetypes include tailored prompts; custom ones use a generic fallback. All prompts are overridable in config.
+
+Use `all` to fan out to every configured archetype.
 
 ### Input sources
 
@@ -75,11 +75,7 @@ review <archetype> <input-source>
 | `--commit <hash>` | Diff of a specific commit |
 | `--range <a..b>` | Diff across a commit range |
 | `--branch` | Full branch diff against default branch |
-| `--document <path>` | A file reviewed as-is, not as a diff |
-| `--stdin` | Read from stdin (treated as diff) |
-| `--stdin --as-document` | Read from stdin (treated as document) |
-
-Use `all` as the archetype to fan out to every configured archetype.
+| `--document <path>` | A file reviewed as-is |
 
 ### Session management
 
@@ -121,17 +117,16 @@ When using `all`, archetype headers are added:
 Single config file at `~/.config/review/config.toml`.
 
 ```toml
-[global]
-prefix = "~/.config/review/prompts/prefix.md"
-
 [projects.myproject]
 path = "/home/you/myproject"
 
 [projects.myproject.archetypes.security]
 claude = "session-abc123"
 codex = "session-def456"
-prompt_diff = "~/.config/review/prompts/security/diff.md"
-prompt_document = "~/.config/review/prompts/security/document.md"
+# prompt = "~/custom/security-prompt.md"    # optional override
+
+[global]
+# prefix = "~/custom/prefix.md"            # optional override
 ```
 
 Project resolution is prefix-based -- running `review` from any subdirectory of a registered project path matches that project. Nested project paths resolve to the most specific match.
