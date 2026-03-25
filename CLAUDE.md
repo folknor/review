@@ -36,10 +36,10 @@ Single binary crate, no workspace.
 
 ## Architecture
 
-- `src/cli.rs` — Clap CLI. Archetypes are subcommands (security, bugs, perf, arch, all). `init` creates a starter `.review.md`.
+- `src/cli.rs` — Clap CLI. Archetype is a positional arg, `init` is the only subcommand.
 - `src/config.rs` — Parses `.review.md` in cwd. YAML frontmatter for host-scoped sessions (archetype → hostname → provider), markdown `## headings` for archetype prompts. Uses `yaml-front-matter` and `gethostname` crates.
 - `src/input.rs` — Builds context line from flags (e.g. "You are reviewing staged changes."). Reads stdin instructions (required, 20KB limit).
-- `src/prompt.rs` — Assembles: compiled prefix + archetype prompt (from .review.md or built-in) + context line + stdin instructions. Built-in prompts for security, bugs, perf, arch.
+- `src/prompt.rs` — Assembles: compiled prefix + archetype prompt (from .review.md or built-in) + stdin instructions + context line. Built-in prompts for security, bugs, perf, arch.
 - `src/provider.rs` — Async provider invocation. Prompts piped via stdin. Claude uses `--permission-mode plan`, Codex uses `--sandbox read-only`.
 - `src/main.rs` — Wires CLI to config, prompt assembly, and provider dispatch.
 - `prompts/` — Default prompt templates compiled into the binary via `include_str!`.

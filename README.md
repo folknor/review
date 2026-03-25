@@ -4,7 +4,7 @@ A Rust CLI that fans out code reviews to persistent AI sessions across multiple 
 
 ## How it works
 
-You configure **archetypes** -- reviewer perspectives like `security`, `bugs`, `perf`, `arch` -- each backed by long-lived sessions in one or more AI providers. When you run a review, you pipe your instructions via stdin and tell the tool what to review with a flag. The tool builds a prompt and sends it to all providers for that archetype in parallel. The agents have project familiarity from their persistent sessions and fetch the code themselves.
+You configure **archetypes** -- reviewer perspectives like `security`, `bugs`, `perf`, `arch`, or any custom name -- each backed by long-lived sessions in one or more AI providers. When you run a review, you pipe your instructions via stdin and tell the tool what to review with a flag. The tool builds a prompt and sends it to all providers for that archetype in parallel. The agents have project familiarity from their persistent sessions and fetch the code themselves.
 
 ## Install
 
@@ -25,15 +25,17 @@ review init
 
 ### 2. Add session IDs
 
-Edit `.review.md` and add your provider session IDs:
+Edit `.review.md` and add your provider session IDs under your hostname:
 
 ```markdown
 ---
 security:
-  claude: "your-claude-session-id"
-  codex: "your-codex-session-id"
+  myhostname:
+    claude: "your-claude-session-id"
+    codex: "your-codex-session-id"
 bugs:
-  claude: "your-claude-session-id"
+  myhostname:
+    claude: "your-claude-session-id"
 ---
 ```
 
@@ -43,7 +45,8 @@ bugs:
 echo "look for auth boundary violations" | review security --staged
 echo "check for edge cases" | review bugs --commit abc123
 echo "review this spec for gaps" | review arch --document spec.md
-echo "full review" | review all --unstaged
+echo "full review" | review all --general
+echo "check logging patterns" | review logging --general
 ```
 
 ## Usage
@@ -56,13 +59,18 @@ Instructions are piped via stdin (required, 20KB limit). A flag telling the agen
 
 ### Archetypes
 
-| Command | Focus |
-|---------|-------|
-| `review security` | Auth boundaries, injection, secrets, trust assumptions |
-| `review bugs` | Logic errors, edge cases, error handling, crashes |
-| `review perf` | Allocations, complexity, hot paths, async blocking |
-| `review arch` | Coupling, abstractions, API design, consistency |
-| `review all` | Fan out to all configured archetypes |
+Built-in archetypes have tailored prompts:
+
+| Archetype | Focus |
+|-----------|-------|
+| `security` | Auth boundaries, injection, secrets, trust assumptions |
+| `bugs` | Logic errors, edge cases, error handling, crashes |
+| `perf` | Allocations, complexity, hot paths, async blocking |
+| `arch` | Coupling, abstractions, API design, consistency |
+
+Custom archetype names are also supported — any name works. Custom archetypes use a generic fallback prompt unless overridden in `.review.md`.
+
+Use `all` to fan out to every configured archetype.
 
 ### Flags
 
@@ -73,6 +81,7 @@ Instructions are piped via stdin (required, 20KB limit). A flag telling the agen
 | `--commit <hash>` | "You are reviewing commit \<hash\>." |
 | `--range <a..b>` | "You are reviewing commits \<a..b\>." |
 | `--document <path>` | "You are reviewing the file \<path\>." |
+| `--general` | "You are reviewing the entire codebase." |
 
 The agents fetch the actual content themselves using their project context.
 
@@ -102,28 +111,33 @@ When using `all`, archetype headers are added:
 
 ## Configuration
 
-Per-project `.review.md` in the project root. Run `review init` to create a starter.
+Per-project `.review.md` in the project root (discovered by walking up to the git root). Run `review init` to create a starter.
 
 ```markdown
 ---
 security:
-  claude: "session-abc123"
-  codex: "session-def456"
+  myhostname:
+    claude: "session-abc123"
+    codex: "session-def456"
 bugs:
-  claude: "session-ghi789"
+  myhostname:
+    claude: "session-ghi789"
+logging:
+  myhostname:
+    claude: "session-jkl012"
 ---
 
-# security
+## security
 
 Custom security review instructions here.
 Overrides the built-in security prompt.
 
-# bugs
+## bugs
 
 Custom bugs review instructions here.
 ```
 
-The YAML frontmatter maps archetypes to provider session IDs. Markdown `# headings` optionally override the built-in archetype prompts.
+Session IDs are scoped by hostname, so the same `.review.md` works across machines with different sessions. Markdown `## headings` optionally override the built-in archetype prompts.
 
 ## Providers
 
@@ -143,4 +157,4 @@ codex exec --sandbox read-only resume <session-id> -o <file>
 
 Runs in read-only sandbox. Prompt piped via stdin, output captured from the `-o` file.
 
-Both providers run in parallel. If one fails, the other's results are still shown.
+Both providers run in parallel. If one fails, the other's results are still shown. Providers whose binaries aren't installed are silently skipped.

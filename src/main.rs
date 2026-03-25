@@ -13,20 +13,15 @@ use cli::Cli;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if cli.is_init() {
+    if matches!(cli.command, Some(cli::Command::Init)) {
         return config::init();
     }
 
-    let archetype_name = cli.archetype_name().ok_or_else(|| {
-        anyhow::anyhow!("no archetype specified\n  Use a subcommand (security, bugs, perf, arch, all) or --type <name>")
+    let archetype_name = cli.archetype.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("no archetype specified\n  Usage: review <archetype> <flags>")
     })?;
 
-    if archetype_name == "all" && cli.archetype_type.is_some() {
-        bail!("'all' is reserved and cannot be used as a custom archetype name");
-    }
-
-    let input = cli.input_source().expect("not init");
-    if !input.is_specified() {
+    if !cli.input.is_specified() {
         bail!(
             "no input source specified\n\n\
              Provide one of: --unstaged, --staged, --commit, --range, --document, --general"
@@ -34,7 +29,7 @@ async fn main() -> Result<()> {
     }
 
     let (cfg, project_root) = config::load()?;
-    let context = input::context_line(input);
+    let context = input::context_line(&cli.input);
     let stdin_instructions = input::read_stdin()?;
 
     let hostname = config::hostname();

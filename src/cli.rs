@@ -5,7 +5,7 @@ Quick start:
   review init                                                Create a .review.md
   echo \"check for auth issues\" | review security --staged    Run a review
   echo \"full review\" | review all --staged                   Review with all archetypes
-  echo \"check logging\" | review --type logging --general     Custom archetype";
+  echo \"check logging\" | review logging --general            Custom archetype";
 
 #[derive(Parser)]
 #[command(
@@ -17,9 +17,9 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Custom archetype name (use instead of a subcommand)
-    #[arg(long = "type", global = false)]
-    pub archetype_type: Option<String>,
+    /// Archetype name (e.g. security, bugs, perf, arch, or custom) or "all"
+    #[arg(required_unless_present = "command")]
+    pub archetype: Option<String>,
 
     #[command(flatten)]
     pub input: InputSource,
@@ -29,79 +29,6 @@ pub struct Cli {
 pub enum Command {
     /// Create a starter .review.md in the current directory
     Init,
-
-    /// Review with the security archetype
-    Security {
-        #[command(flatten)]
-        input: InputSource,
-    },
-
-    /// Review with the bugs archetype
-    Bugs {
-        #[command(flatten)]
-        input: InputSource,
-    },
-
-    /// Review with the perf archetype
-    Perf {
-        #[command(flatten)]
-        input: InputSource,
-    },
-
-    /// Review with the arch archetype
-    Arch {
-        #[command(flatten)]
-        input: InputSource,
-    },
-
-    /// Review with all archetypes
-    All {
-        #[command(flatten)]
-        input: InputSource,
-    },
-}
-
-impl Cli {
-    pub fn archetype_name(&self) -> Option<&str> {
-        if let Some(ref cmd) = self.command {
-            return match cmd {
-                Command::Security { .. } => Some("security"),
-                Command::Bugs { .. } => Some("bugs"),
-                Command::Perf { .. } => Some("perf"),
-                Command::Arch { .. } => Some("arch"),
-                Command::All { .. } => Some("all"),
-                Command::Init => None,
-            };
-        }
-        self.archetype_type.as_deref()
-    }
-
-    pub fn input_source(&self) -> Option<&InputSource> {
-        if let Some(ref cmd) = self.command {
-            return match cmd {
-                Command::Security { input }
-                | Command::Bugs { input }
-                | Command::Perf { input }
-                | Command::Arch { input }
-                | Command::All { input } => {
-                    // If flags were placed before the subcommand, clap routes them
-                    // to the top-level Cli.input. Fall back to that if the subcommand's
-                    // input is empty.
-                    if input.is_specified() {
-                        Some(input)
-                    } else {
-                        Some(&self.input)
-                    }
-                }
-                Command::Init => None,
-            };
-        }
-        Some(&self.input)
-    }
-
-    pub fn is_init(&self) -> bool {
-        matches!(self.command, Some(Command::Init))
-    }
 }
 
 #[derive(clap::Args)]
