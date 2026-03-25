@@ -102,27 +102,40 @@ pub fn parse(raw: &str) -> Result<ReviewConfig> {
 
     let raw_fm = document.metadata;
 
-    // "all" is reserved
-    if raw_fm.archetypes.contains_key("all") {
-        bail!("'all' is a reserved name and cannot be used as an archetype in {CONFIG_FILENAME}");
+    // Reserved names
+    for reserved in ["all", "init"] {
+        if raw_fm.archetypes.contains_key(reserved) {
+            bail!("'{reserved}' is a reserved name and cannot be used as an archetype in {CONFIG_FILENAME}");
+        }
     }
 
-    // Validate group names don't collide with archetypes
+    // Validate group names
     for name in raw_fm.groups.keys() {
-        if name == "all" {
-            bail!("'all' is a reserved name and cannot be used as a group in {CONFIG_FILENAME}");
+        for reserved in ["all", "init"] {
+            if name == reserved {
+                bail!("'{reserved}' is a reserved name and cannot be used as a group in {CONFIG_FILENAME}");
+            }
         }
         if raw_fm.archetypes.contains_key(name) {
             bail!("group '{name}' conflicts with an archetype of the same name in {CONFIG_FILENAME}");
         }
     }
 
-    // Validate group members reference existing archetypes
+    // Validate group members: must exist, no duplicates, not empty
     for (group_name, members) in &raw_fm.groups {
+        if members.is_empty() {
+            bail!("group '{group_name}' is empty in {CONFIG_FILENAME}");
+        }
+        let mut seen = std::collections::HashSet::new();
         for member in members {
             if !raw_fm.archetypes.contains_key(member) {
                 bail!(
                     "group '{group_name}' references unknown archetype '{member}' in {CONFIG_FILENAME}"
+                );
+            }
+            if !seen.insert(member) {
+                bail!(
+                    "group '{group_name}' contains duplicate archetype '{member}' in {CONFIG_FILENAME}"
                 );
             }
         }

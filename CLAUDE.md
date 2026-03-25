@@ -48,7 +48,7 @@ Single binary crate, no workspace.
 
 - The tool is a **prompt builder**, not a content fetcher. Flags like `--staged` add context hints; agents fetch the actual code themselves.
 - Providers get prompts via **stdin pipe**, not CLI args, to avoid shell argument length limits.
-- Claude runs in `plan` mode (read-only). Codex runs with `--sandbox read-only`.
+- Claude runs with `--permission-mode dontAsk` (uses pre-approved permissions, rejects interactive prompts). Codex runs with `--sandbox read-only`.
 - All prompt templates are compiled into the binary. `.review.md` headings override built-in archetype prompts.
 - No global config — `.review.md` lives in the project root.
 

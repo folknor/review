@@ -58,17 +58,20 @@ async fn run_claude(session_id: &str, prompt: &str, project_root: &Path) -> Resu
         .spawn()
         .context("failed to spawn claude")?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(prompt.as_bytes())
-            .await
-            .context("failed to write prompt to claude stdin")?;
-    }
+    // Write stdin on a separate task to avoid deadlock:
+    // the child may fill its stdout buffer before reading all of stdin.
+    let stdin = child.stdin.take().context("failed to open claude stdin")?;
+    let prompt_bytes = prompt.as_bytes().to_vec();
+    let write_handle = tokio::spawn(async move {
+        let mut stdin = stdin;
+        let _ = stdin.write_all(&prompt_bytes).await;
+        drop(stdin); // close stdin so child sees EOF
+    });
 
-    let output = child
-        .wait_with_output()
-        .await
-        .context("failed to wait for claude")?;
+    let output = child.wait_with_output().await;
+    let _ = write_handle.await;
+
+    let output = output.context("failed to wait for claude")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -95,19 +98,21 @@ async fn run_codex(
         .spawn()
         .context("failed to spawn codex")?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(prompt.as_bytes())
-            .await
-            .context("failed to write prompt to codex stdin")?;
-    }
+    // Write stdin on a separate task to avoid deadlock
+    let stdin = child.stdin.take().context("failed to open codex stdin")?;
+    let prompt_bytes = prompt.as_bytes().to_vec();
+    let write_handle = tokio::spawn(async move {
+        let mut stdin = stdin;
+        let _ = stdin.write_all(&prompt_bytes).await;
+        drop(stdin);
+    });
 
-    let output = child
-        .wait_with_output()
-        .await
-        .context("failed to wait for codex")?;
+    let output = child.wait_with_output().await;
+    let _ = write_handle.await;
 
-    // Always clean up the temp file, even on error
+    let output = output.context("failed to wait for codex")?;
+
+    // Always clean up the temp file
     let cleanup = || async { let _ = tokio::fs::remove_file(&output_path).await; };
 
     if !output.status.success() {
