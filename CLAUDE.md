@@ -21,7 +21,7 @@
 
 A Rust CLI (`review`) that fans out code reviews to persistent AI sessions across multiple providers (Claude Code, Codex). It's a prompt builder that knows about sessions — the agents fetch code themselves.
 
-Fixed archetypes: security, bugs, perf, arch. Per-project config via `.review.md` (YAML frontmatter for host-scoped session IDs, markdown `## headings` for archetype prompts).
+Fixed archetypes: security, bugs, perf, arch. Per-project config via `.review.md` (YAML frontmatter for host-scoped session IDs, markdown `## headings` for archetype prompts). Custom archetypes and groups also supported.
 
 ## Build and run
 
@@ -37,7 +37,7 @@ Single binary crate, no workspace.
 ## Architecture
 
 - `src/cli.rs` — Clap CLI. Archetype is a positional arg, `init` is the only subcommand.
-- `src/config.rs` — Parses `.review.md` in cwd. YAML frontmatter for host-scoped sessions (archetype → hostname → provider), markdown `## headings` for archetype prompts. Uses `yaml-front-matter` and `gethostname` crates.
+- `src/config.rs` — Parses `.review.md` in cwd. YAML frontmatter for host-scoped sessions (archetype → hostname → provider), markdown `## headings` for archetype prompts, `_groups` for named archetype sets. Uses `yaml-front-matter` and `gethostname` crates.
 - `src/input.rs` — Builds context line from flags (e.g. "You are reviewing staged changes."). Reads stdin instructions (required, 20KB limit).
 - `src/prompt.rs` — Assembles: compiled prefix + archetype prompt (from .review.md or built-in) + stdin instructions + context line. Built-in prompts for security, bugs, perf, arch.
 - `src/provider.rs` — Async provider invocation. Prompts piped via stdin. Claude uses `--permission-mode plan`, Codex uses `--sandbox read-only`.
@@ -63,6 +63,9 @@ security:
 bugs:
   myhostname:
     claude: "session-id"
+
+_groups:
+  sweep: [security, bugs]
 ---
 
 ## security

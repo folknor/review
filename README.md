@@ -70,7 +70,7 @@ Built-in archetypes have tailored prompts:
 
 Custom archetype names are also supported — any name works. Custom archetypes use a generic fallback prompt unless overridden in `.review.md`.
 
-Use `all` to fan out to every configured archetype.
+Use `all` to fan out to every configured archetype, or define **groups** to fan out to a named subset.
 
 ### Flags
 
@@ -122,9 +122,16 @@ security:
 bugs:
   myhostname:
     claude: "session-ghi789"
-logging:
+tilemaker:
   myhostname:
     claude: "session-jkl012"
+tippecanoe:
+  myhostname:
+    claude: "session-mno345"
+
+_groups:
+  sweep: [security, bugs]
+  competitors: [tilemaker, tippecanoe]
 ---
 
 ## security
@@ -138,6 +145,17 @@ Custom bugs review instructions here.
 ```
 
 Session IDs are scoped by hostname, so the same `.review.md` works across machines with different sessions. Markdown `## headings` optionally override the built-in archetype prompts.
+
+### Groups
+
+Groups fan out to multiple archetypes with a single command:
+
+```
+echo "how to handle clipping?" | review competitors --general
+echo "full sweep" | review sweep --staged
+```
+
+Define groups in the `_groups` key of the frontmatter. Group names must not conflict with archetype names. `all` is reserved and runs every configured archetype.
 
 ## Providers
 

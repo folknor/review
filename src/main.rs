@@ -40,20 +40,23 @@ async fn main() -> Result<()> {
             .keys()
             .map(String::as_str)
             .collect()
-    } else {
-        if !cfg.frontmatter.archetypes.contains_key(archetype_name) {
-            let available: Vec<_> = cfg.frontmatter.archetypes.keys().map(String::as_str).collect();
-            bail!(
-                "archetype '{archetype_name}' not found in .review.md\n  \
-                 configured: {}",
-                if available.is_empty() {
-                    "(none)".to_string()
-                } else {
-                    available.join(", ")
-                }
-            );
-        }
+    } else if let Some(group) = cfg.frontmatter.groups.get(archetype_name) {
+        group.iter().map(String::as_str).collect()
+    } else if cfg.frontmatter.archetypes.contains_key(archetype_name) {
         vec![archetype_name]
+    } else {
+        let mut available: Vec<&str> = cfg.frontmatter.archetypes.keys().map(String::as_str).collect();
+        let groups: Vec<&str> = cfg.frontmatter.groups.keys().map(String::as_str).collect();
+        available.extend(groups);
+        bail!(
+            "'{archetype_name}' not found in .review.md\n  \
+             configured: {}",
+            if available.is_empty() {
+                "(none)".to_string()
+            } else {
+                available.join(", ")
+            }
+        );
     };
 
     // Filter to archetypes that have sessions configured for this host

@@ -6,9 +6,17 @@ use yaml_front_matter::YamlFrontMatter;
 const CONFIG_FILENAME: &str = ".review.md";
 
 #[derive(Debug, Deserialize)]
-pub struct Frontmatter {
+pub struct RawFrontmatter {
+    #[serde(default, rename = "_groups")]
+    pub groups: BTreeMap<String, Vec<String>>,
     #[serde(flatten)]
     pub archetypes: BTreeMap<String, ArchetypeConfig>,
+}
+
+#[derive(Debug)]
+pub struct Frontmatter {
+    pub archetypes: BTreeMap<String, ArchetypeConfig>,
+    pub groups: BTreeMap<String, Vec<String>>,
 }
 
 /// Per-archetype config: maps hostname → provider sessions.
@@ -85,22 +93,48 @@ fn find_config() -> Result<std::path::PathBuf> {
 }
 
 pub fn parse(raw: &str) -> Result<ReviewConfig> {
-    let document = YamlFrontMatter::parse::<Frontmatter>(raw).map_err(|e| {
+    let document = YamlFrontMatter::parse::<RawFrontmatter>(raw).map_err(|e| {
         anyhow::anyhow!(
             "failed to parse {CONFIG_FILENAME}: {e}\n  \
              frontmatter keys must be archetype names with hostname/provider sub-keys"
         )
     })?;
 
+    let raw_fm = document.metadata;
+
     // "all" is reserved
-    if document.metadata.archetypes.contains_key("all") {
+    if raw_fm.archetypes.contains_key("all") {
         bail!("'all' is a reserved name and cannot be used as an archetype in {CONFIG_FILENAME}");
+    }
+
+    // Validate group names don't collide with archetypes
+    for name in raw_fm.groups.keys() {
+        if name == "all" {
+            bail!("'all' is a reserved name and cannot be used as a group in {CONFIG_FILENAME}");
+        }
+        if raw_fm.archetypes.contains_key(name) {
+            bail!("group '{name}' conflicts with an archetype of the same name in {CONFIG_FILENAME}");
+        }
+    }
+
+    // Validate group members reference existing archetypes
+    for (group_name, members) in &raw_fm.groups {
+        for member in members {
+            if !raw_fm.archetypes.contains_key(member) {
+                bail!(
+                    "group '{group_name}' references unknown archetype '{member}' in {CONFIG_FILENAME}"
+                );
+            }
+        }
     }
 
     let archetype_prompts = parse_archetype_sections(&document.content);
 
     Ok(ReviewConfig {
-        frontmatter: document.metadata,
+        frontmatter: Frontmatter {
+            archetypes: raw_fm.archetypes,
+            groups: raw_fm.groups,
+        },
         archetype_prompts,
     })
 }
@@ -139,7 +173,8 @@ fn parse_archetype_sections(body: &str) -> BTreeMap<String, String> {
 const INIT_TEMPLATE_PREFIX: &str = "\
 ---
 # Session IDs are scoped by hostname.
-# Supported archetypes: security, bugs, perf, arch
+# Archetypes with built-in prompts: security, bugs, perf, arch
+# Custom archetype names are also supported.
 #
 # security:
 #   myhostname:
@@ -148,6 +183,10 @@ const INIT_TEMPLATE_PREFIX: &str = "\
 # bugs:
 #   myhostname:
 #     claude: \"your-claude-session-id\"
+#
+# Groups fan out to multiple archetypes:
+# _groups:
+#   sweep: [security, bugs, perf]
 ---
 
 ## security
@@ -306,5 +345,62 @@ security:
         assert!(!sec.has_sessions_for_host("host-c"));
         assert_eq!(sec.resolve_host("host-a").unwrap().claude.as_deref(), Some("sess-a"));
         assert_eq!(sec.resolve_host("host-b").unwrap().codex.as_deref(), Some("sess-b"));
+    }
+
+    #[test]
+    fn parses_groups() {
+        let raw = "\
+---
+security:
+  myhost:
+    claude: \"sess-1\"
+bugs:
+  myhost:
+    claude: \"sess-2\"
+perf:
+  myhost:
+    claude: \"sess-3\"
+_groups:
+  sweep: [security, bugs, perf]
+---
+";
+        let cfg = parse(raw).unwrap();
+        assert_eq!(cfg.frontmatter.groups.len(), 1);
+        assert_eq!(cfg.frontmatter.groups["sweep"], vec!["security", "bugs", "perf"]);
+        assert!(!cfg.frontmatter.archetypes.contains_key("_groups"));
+    }
+
+    #[test]
+    fn group_with_unknown_member_errors() {
+        let raw = "\
+---
+security:
+  myhost:
+    claude: \"sess-1\"
+_groups:
+  sweep: [security, nonexistent]
+---
+";
+        let result = parse(raw);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("nonexistent"));
+    }
+
+    #[test]
+    fn group_name_conflicts_with_archetype() {
+        let raw = "\
+---
+security:
+  myhost:
+    claude: \"sess-1\"
+_groups:
+  security: [security]
+---
+";
+        let result = parse(raw);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("conflicts"));
     }
 }
