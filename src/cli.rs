@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 const AFTER_HELP: &str = "\
 Built-in archetypes (with tailored prompts):
@@ -45,6 +45,13 @@ pub struct Cli {
 
     #[command(flatten)]
     pub input: InputSource,
+}
+
+impl Cli {
+    pub fn print_help() {
+        let mut cmd = Self::command();
+        let _ = cmd.print_help();
+    }
 }
 
 #[derive(Subcommand)]

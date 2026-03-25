@@ -17,14 +17,29 @@ async fn main() -> Result<()> {
         return config::init();
     }
 
-    let archetype_name = cli.archetype.as_deref().ok_or_else(|| {
-        anyhow::anyhow!("no archetype specified\n  Usage: review <archetype> <flags>")
-    })?;
+    // #1/#2: No archetype → print help
+    let archetype_name = match cli.archetype.as_deref() {
+        Some(name) => name,
+        None => {
+            Cli::print_help();
+            std::process::exit(0);
+        }
+    };
 
+    if cli.raw && cli.input.is_specified() {
+        bail!(
+            "--raw cannot be combined with review scope flags\n\n\
+             With --raw you need to provide the entire context yourself;\n\
+             pointers to documents, git hashes, whatever."
+        );
+    }
+
+    // #3: "review scope" not "input source"
     if !cli.raw && !cli.input.is_specified() {
         bail!(
-            "no input source specified\n\n\
-             Provide one of: --unstaged, --staged, --commit, --range, --document, --general\n\
+            "no review scope specified\n\n\
+             Tell the agent what to look at:\n  \
+             --unstaged, --staged, --commit, --range, --document, --general\n\
              Or use --raw to send only piped stdin"
         );
     }
@@ -33,6 +48,12 @@ async fn main() -> Result<()> {
     let stdin_instructions = input::read_stdin()?;
 
     let hostname = config::hostname();
+
+    // #9/#10: Show config path and hostname in dry-run
+    if cli.dry_run {
+        eprintln!("config: {}", project_root.join(".review.md").display());
+        eprintln!("hostname: {hostname}");
+    }
 
     let archetypes_to_run: Vec<&str> = if archetype_name == "all" {
         cfg.frontmatter
@@ -75,13 +96,20 @@ async fn main() -> Result<()> {
         .copied()
         .collect();
 
+    // #6: Better error for empty results
     if runnable.is_empty() {
-        let name = if skipped.len() == 1 { skipped[0] } else { "archetype" };
+        if skipped.is_empty() {
+            bail!(
+                "no archetypes configured in .review.md\n\n\
+                 Run `review init` to create a starter config."
+            );
+        }
+        let example = skipped[0];
         bail!(
             "no sessions configured for host '{hostname}': {}\n\n\
              Add session IDs to your .review.md frontmatter, e.g.:\n\
              ---\n\
-             {name}:\n  \
+             {example}:\n  \
                {hostname}:\n    \
                  claude: \"your-session-id\"\n\
              ---",
@@ -207,7 +235,7 @@ async fn main() -> Result<()> {
         grouped.push((arch_name, result));
     }
 
-    // Print results
+    // Print results (#11: errors to stderr)
     let multi = runnable.len() > 1;
     let mut current_arch = "";
     for (arch_name, result) in &grouped {
@@ -219,6 +247,12 @@ async fn main() -> Result<()> {
             current_arch = arch_name;
         }
         provider::print_result(result);
+    }
+
+    // #5: Non-zero exit when all providers failed
+    let all_failed = grouped.iter().all(|(_, r)| r.output.is_err());
+    if all_failed {
+        std::process::exit(1);
     }
 
     Ok(())

@@ -48,6 +48,25 @@ pub async fn invoke_codex(
     }
 }
 
+/// Write prompt to stdin on a spawned task. Returns an error if the write fails.
+async fn write_stdin(
+    stdin: tokio::process::ChildStdin,
+    prompt_bytes: Vec<u8>,
+) -> Result<(), anyhow::Error> {
+    let handle = tokio::spawn(async move {
+        let mut stdin = stdin;
+        let result = stdin.write_all(&prompt_bytes).await;
+        drop(stdin); // close stdin so child sees EOF
+        result
+    });
+
+    match handle.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(anyhow::anyhow!("failed to write prompt to stdin: {e}")),
+        Err(e) => Err(anyhow::anyhow!("stdin write task panicked: {e}")),
+    }
+}
+
 async fn run_claude(session_id: &str, prompt: &str, project_root: &Path) -> Result<String> {
     let mut child = Command::new("claude")
         .args(["--resume", session_id, "--print", "--permission-mode", "dontAsk"])
@@ -58,18 +77,14 @@ async fn run_claude(session_id: &str, prompt: &str, project_root: &Path) -> Resu
         .spawn()
         .context("failed to spawn claude")?;
 
-    // Write stdin on a separate task to avoid deadlock:
-    // the child may fill its stdout buffer before reading all of stdin.
     let stdin = child.stdin.take().context("failed to open claude stdin")?;
-    let prompt_bytes = prompt.as_bytes().to_vec();
-    let write_handle = tokio::spawn(async move {
-        let mut stdin = stdin;
-        let _ = stdin.write_all(&prompt_bytes).await;
-        drop(stdin); // close stdin so child sees EOF
-    });
+    let write_result = write_stdin(stdin, prompt.as_bytes().to_vec());
 
-    let output = child.wait_with_output().await;
-    let _ = write_handle.await;
+    // Read stdout/stderr concurrently with stdin write
+    let output = child.wait_with_output();
+
+    let (write_res, output) = tokio::join!(write_result, output);
+    write_res?;
 
     let output = output.context("failed to wait for claude")?;
 
@@ -98,17 +113,13 @@ async fn run_codex(
         .spawn()
         .context("failed to spawn codex")?;
 
-    // Write stdin on a separate task to avoid deadlock
     let stdin = child.stdin.take().context("failed to open codex stdin")?;
-    let prompt_bytes = prompt.as_bytes().to_vec();
-    let write_handle = tokio::spawn(async move {
-        let mut stdin = stdin;
-        let _ = stdin.write_all(&prompt_bytes).await;
-        drop(stdin);
-    });
+    let write_result = write_stdin(stdin, prompt.as_bytes().to_vec());
 
-    let output = child.wait_with_output().await;
-    let _ = write_handle.await;
+    let output = child.wait_with_output();
+
+    let (write_res, output) = tokio::join!(write_result, output);
+    write_res?;
 
     let output = output.context("failed to wait for codex")?;
 
@@ -131,6 +142,6 @@ pub fn print_result(result: &ProviderResult) {
     println!("--- {} ---", result.provider);
     match &result.output {
         Ok(text) => println!("{text}"),
-        Err(err) => println!("error: {err}"),
+        Err(err) => eprintln!("error: {err}"),
     }
 }
