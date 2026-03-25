@@ -8,33 +8,36 @@ mod session;
 use anyhow::{Result, bail};
 use clap::Parser;
 
-use cli::{Cli, Command};
+use cli::{Cli, ManagementCommand};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Review { archetype, input } => run_review(&archetype, &input).await,
-        Command::Register {
+        Some(ManagementCommand::Register {
             archetype,
             claude,
             codex,
-        } => {
+        }) => {
             let mut cfg = config::load()?;
             session::register(&mut cfg, &archetype, claude, codex)
         }
-        Command::Deregister {
+        Some(ManagementCommand::Deregister {
             archetype,
             claude,
             codex,
-        } => {
+        }) => {
             let mut cfg = config::load()?;
             session::deregister(&mut cfg, &archetype, claude, codex)
         }
-        Command::List { all } => {
+        Some(ManagementCommand::List { all }) => {
             let cfg = config::load()?;
             session::list(&cfg, all)
+        }
+        None => {
+            let archetype = cli.archetype.expect("archetype required for review");
+            run_review(&archetype, &cli.input).await
         }
     }
 }

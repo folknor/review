@@ -80,31 +80,46 @@ pub fn resolve_project(config: &Config) -> Result<(String, &Project)> {
 }
 
 pub fn resolve_project_from<'a>(config: &'a Config, cwd: &Path) -> Result<(String, &'a Project)> {
+    let mut best: Option<(String, &Project, usize)> = None;
     for (name, project) in &config.projects {
         let project_path = expand_path(&project.path);
         if cwd.starts_with(&project_path) {
-            return Ok((name.clone(), project));
+            let depth = project_path.components().count();
+            if best.as_ref().map_or(true, |(_, _, d)| depth > *d) {
+                best = Some((name.clone(), project, depth));
+            }
         }
     }
-    bail!(
-        "current directory is not a registered project\n  cwd: {}\n  hint: add a [projects.<name>] entry in ~/.config/review/config.toml",
-        cwd.display()
-    );
+    match best {
+        Some((name, project, _)) => Ok((name, project)),
+        None => bail!(
+            "current directory is not a registered project\n  cwd: {}\n  hint: add a [projects.<name>] entry in ~/.config/review/config.toml",
+            cwd.display()
+        ),
+    }
 }
 
 /// Resolve project mutably for config updates.
 pub fn resolve_project_mut(config: &mut Config) -> Result<(String, &mut Project)> {
     let cwd = std::env::current_dir().context("failed to get current directory")?;
+    let mut best: Option<(String, usize)> = None;
     for (name, project) in &config.projects {
         let project_path = expand_path(&project.path);
         if cwd.starts_with(&project_path) {
-            let name = name.clone();
-            let project = config.projects.get_mut(&name).unwrap();
-            return Ok((name, project));
+            let depth = project_path.components().count();
+            if best.as_ref().map_or(true, |(_, d)| depth > *d) {
+                best = Some((name.clone(), depth));
+            }
         }
     }
-    bail!(
-        "current directory is not a registered project\n  cwd: {}\n  hint: add a [projects.<name>] entry in ~/.config/review/config.toml",
-        cwd.display()
-    );
+    match best {
+        Some((name, _)) => {
+            let project = config.projects.get_mut(&name).unwrap();
+            Ok((name, project))
+        }
+        None => bail!(
+            "current directory is not a registered project\n  cwd: {}\n  hint: add a [projects.<name>] entry in ~/.config/review/config.toml",
+            cwd.display()
+        ),
+    }
 }

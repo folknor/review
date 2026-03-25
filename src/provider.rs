@@ -3,6 +3,11 @@ use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+fn temp_path(archetype: &str, provider: &str) -> String {
+    let pid = std::process::id();
+    format!("/tmp/review-{archetype}-{provider}-{pid}.txt")
+}
+
 pub struct ProviderResult {
     pub provider: String,
     pub output: Result<String>,
@@ -33,7 +38,7 @@ pub async fn invoke_codex(
 }
 
 async fn run_claude(session_id: &str, archetype: &str, prompt: &str) -> Result<String> {
-    let output_path = format!("/tmp/review-{archetype}-claude.txt");
+    let output_path = temp_path(archetype, "claude");
 
     let mut child = Command::new("claude")
         .args(["--resume", session_id, "--print"])
@@ -69,7 +74,7 @@ async fn run_claude(session_id: &str, archetype: &str, prompt: &str) -> Result<S
 }
 
 async fn run_codex(session_id: &str, archetype: &str, prompt: &str) -> Result<String> {
-    let output_path = format!("/tmp/review-{archetype}-codex.txt");
+    let output_path = temp_path(archetype, "codex");
 
     let mut child = Command::new("codex")
         .args(["exec", "resume", session_id, "-o", &output_path])
@@ -112,7 +117,7 @@ pub fn print_results(results: &[ProviderResult]) {
         println!("--- {} ---", result.provider);
         match &result.output {
             Ok(text) => println!("{text}"),
-            Err(err) => eprintln!("error: {err}"),
+            Err(err) => println!("error: {err}"),
         }
     }
 }

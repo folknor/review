@@ -15,8 +15,13 @@ pub struct ResolvedInput {
 }
 
 pub fn resolve(input: &InputSource) -> Result<ResolvedInput> {
-    // Check for stdin pipe first
-    if !atty_stdin() {
+    // Explicit flags take priority over stdin
+    if input.is_specified() {
+        return resolve_flags(input);
+    }
+
+    // Only fall back to stdin when no flags are given and stdin is piped
+    if !std::io::stdin().is_terminal() {
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)
@@ -27,20 +32,21 @@ pub fn resolve(input: &InputSource) -> Result<ResolvedInput> {
         });
     }
 
-    if !input.is_specified() {
-        bail!(
-            "no input source specified\n\n\
-             Usage: review <archetype> <input-source>\n\n\
-             Input sources:\n  \
-             --unstaged          working tree changes\n  \
-             --staged            staged changes\n  \
-             --commit <hash>     diff of a specific commit\n  \
-             --range <a..b>      diff across a commit range\n  \
-             --branch            full branch diff against main\n  \
-             --document <path>   a file as-is\n  \
-             <stdin pipe>        piped input"
-        );
-    }
+    bail!(
+        "no input source specified\n\n\
+         Usage: review <archetype> <input-source>\n\n\
+         Input sources:\n  \
+         --unstaged          working tree changes\n  \
+         --staged            staged changes\n  \
+         --commit <hash>     diff of a specific commit\n  \
+         --range <a..b>      diff across a commit range\n  \
+         --branch            full branch diff against main\n  \
+         --document <path>   a file as-is\n  \
+         <stdin pipe>        piped input"
+    );
+}
+
+fn resolve_flags(input: &InputSource) -> Result<ResolvedInput> {
 
     if input.unstaged {
         let output = git(&["diff"])?;
@@ -59,7 +65,7 @@ pub fn resolve(input: &InputSource) -> Result<ResolvedInput> {
     }
 
     if let Some(ref hash) = input.commit {
-        let output = git(&["diff", &format!("{hash}~1"), hash])?;
+        let output = git(&["show", "--format=", hash])?;
         return Ok(ResolvedInput {
             content: output,
             content_type: ContentType::Diff,
@@ -108,7 +114,4 @@ fn git(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn atty_stdin() -> bool {
-    std::io::stdin().is_terminal()
-}
 

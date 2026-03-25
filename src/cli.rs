@@ -4,20 +4,18 @@ use clap::{Parser, Subcommand};
 #[command(name = "review", about = "Fan out code reviews to persistent AI sessions")]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<ManagementCommand>,
+
+    /// Archetype name (e.g. security, bugs, perf, arch) or "all"
+    #[arg(required_unless_present = "command")]
+    pub archetype: Option<String>,
+
+    #[command(flatten)]
+    pub input: InputSource,
 }
 
 #[derive(Subcommand)]
-pub enum Command {
-    /// Run a review with the given archetype
-    Review {
-        /// Archetype name (e.g. security, bugs, perf, arch) or "all"
-        archetype: String,
-
-        #[command(flatten)]
-        input: InputSource,
-    },
-
+pub enum ManagementCommand {
     /// Register a provider session for an archetype
     Register {
         /// Archetype name
