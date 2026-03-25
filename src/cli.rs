@@ -11,14 +11,14 @@ Quick start:
 #[command(
     name = "review",
     about = "Fan out code reviews to persistent AI sessions",
-    after_help = AFTER_HELP
+    after_help = AFTER_HELP,
+    subcommand_precedence_over_arg = true
 )]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
     /// Archetype name (e.g. security, bugs, perf, arch, or custom) or "all"
-    #[arg(required_unless_present = "command")]
     pub archetype: Option<String>,
 
     #[command(flatten)]
