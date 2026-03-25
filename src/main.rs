@@ -7,27 +7,27 @@ mod provider;
 use anyhow::{Result, bail};
 use clap::Parser;
 
-use cli::Cli;
+use cli::{Cli, Command};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cfg = config::load()?;
 
-    let context = input::context_line(&cli.input)?;
+    if matches!(cli.command, Command::Init) {
+        return config::init();
+    }
+
+    let cfg = config::load()?;
+    let input = cli.command.input_source().expect("not init");
+    let context = input::context_line(input);
     let stdin_instructions = input::read_stdin()?;
 
-    let archetype_name = &cli.archetype;
+    let archetype_name = cli.command.archetype_name();
 
     let archetypes_to_run: Vec<&str> = if archetype_name == "all" {
         config::BUILTIN_ARCHETYPES.to_vec()
-    } else if config::BUILTIN_ARCHETYPES.contains(&archetype_name.as_str()) {
-        vec![archetype_name.as_str()]
     } else {
-        bail!(
-            "unknown archetype '{archetype_name}'\n  available: {}, all",
-            config::BUILTIN_ARCHETYPES.join(", ")
-        );
+        vec![archetype_name]
     };
 
     // Filter to archetypes that have sessions configured

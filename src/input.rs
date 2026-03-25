@@ -5,36 +5,22 @@ use crate::cli::InputSource;
 
 const MAX_STDIN_BYTES: usize = 20_000;
 
-pub fn context_line(input: &InputSource) -> Result<String> {
-    if !input.is_specified() {
-        bail!(
-            "no input source specified\n\n\
-             Usage: review <archetype> <input-source>\n\n\
-             Input sources:\n  \
-             --unstaged          staged changes\n  \
-             --staged            staged changes\n  \
-             --commit <hash>     a specific commit\n  \
-             --range <a..b>      a commit range\n  \
-             --document <path>   a file"
-        );
-    }
-
+pub fn context_line(input: &InputSource) -> String {
     if input.unstaged {
-        return Ok("You are reviewing unstaged changes.".into());
+        return "You are reviewing unstaged changes.".into();
     }
     if input.staged {
-        return Ok("You are reviewing staged changes.".into());
+        return "You are reviewing staged changes.".into();
     }
     if let Some(ref hash) = input.commit {
-        return Ok(format!("You are reviewing commit {hash}."));
+        return format!("You are reviewing commit {hash}.");
     }
     if let Some(ref range) = input.range {
-        return Ok(format!("You are reviewing commits {range}."));
+        return format!("You are reviewing commits {range}.");
     }
     if let Some(ref path) = input.document {
-        return Ok(format!("You are reviewing the file {path}."));
+        return format!("You are reviewing the file {path}.");
     }
-
     unreachable!()
 }
 

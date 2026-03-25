@@ -19,52 +19,55 @@
 
 ## What this project is
 
-A Rust CLI (`review`) that fans out code reviews to persistent AI sessions across multiple providers (Claude Code, Codex). Each project configures named reviewer archetypes (security, bugs, perf, etc.) backed by long-lived sessions. The tool assembles a prompt (prefix + archetype prompt + user instructions from stdin + content), sends it to all providers for the archetype in parallel, and prints labeled results.
+A Rust CLI (`review`) that fans out code reviews to persistent AI sessions across multiple providers (Claude Code, Codex). It's a prompt builder that knows about sessions — the agents fetch code themselves.
+
+Fixed archetypes: security, bugs, perf, arch. Per-project config via `.review.md` (YAML frontmatter for session IDs, markdown headings for archetype prompts).
 
 ## Build and run
 
 ```
 cargo build
-echo "review this for issues" | cargo run -- <archetype> --staged
+cargo install --path .
+review init
+echo "review for issues" | review security --staged
 ```
 
 Single binary crate, no workspace.
 
 ## Architecture
 
-- `src/cli.rs` — Clap CLI. The review action is the **default** (archetype is a top-level positional arg). Management commands (`register`, `deregister`, `list`) are subcommands.
-- `src/config.rs` — TOML config at `~/.config/review/config.toml`. Project resolution is longest-prefix match against cwd, with path canonicalization.
-- `src/input.rs` — Resolves input sources (git diff variants, document file). Reads user instructions from stdin (required, 20KB limit).
-- `src/prompt.rs` — Assembles: prefix + archetype prompt + stdin instructions + content. Built-in prompts for security, bugs, perf, arch; generic fallback for custom archetypes.
-- `src/provider.rs` — Async provider invocation. Prompts piped via stdin to providers. PID-scoped temp files for codex output. Errors print to stdout within the labeled block.
-- `src/session.rs` — Register/deregister/list commands that mutate the config file.
-- `src/main.rs` — Wires CLI parsing to the appropriate handler.
+- `src/cli.rs` — Clap CLI. Archetypes are subcommands (security, bugs, perf, arch, all). `init` creates a starter `.review.md`.
+- `src/config.rs` — Parses `.review.md` in cwd. YAML frontmatter for sessions, markdown `# headings` for archetype prompts. Uses `yaml-front-matter` crate.
+- `src/input.rs` — Builds context line from flags (e.g. "You are reviewing staged changes."). Reads stdin instructions (required, 20KB limit).
+- `src/prompt.rs` — Assembles: compiled prefix + archetype prompt (from .review.md or built-in) + context line + stdin instructions. Built-in prompts for security, bugs, perf, arch.
+- `src/provider.rs` — Async provider invocation. Prompts piped via stdin. Claude uses `--permission-mode plan`, Codex uses `--sandbox read-only`.
+- `src/main.rs` — Wires CLI to config, prompt assembly, and provider dispatch.
 - `prompts/` — Default prompt templates compiled into the binary via `include_str!`.
 
 ## Design decisions
 
+- The tool is a **prompt builder**, not a content fetcher. Flags like `--staged` add context hints; agents fetch the actual code themselves.
 - Providers get prompts via **stdin pipe**, not CLI args, to avoid shell argument length limits.
-- Temp output files include PID to prevent races between concurrent invocations.
-- `git show --format= --no-notes` is used for `--commit` to handle root commits.
-- The CLI uses `Option<ManagementCommand>` so that no subcommand = review mode.
-- Config writes are atomic (temp file + rename).
-- All prompt templates are compiled into the binary with optional config overrides.
-- Stdin is always the user's per-invocation review instructions; flags provide the content to review.
+- Claude runs in `plan` mode (read-only). Codex runs with `--sandbox read-only`.
+- All prompt templates are compiled into the binary. `.review.md` headings override built-in archetype prompts.
+- No global config — `.review.md` lives in the project root.
 
 ## Config format
 
-```toml
-[projects.myproject]
-path = "/home/user/myproject"
+```markdown
+---
+security:
+  claude: "session-id"
+  codex: "session-id"
+bugs:
+  claude: "session-id"
+---
 
-[projects.myproject.archetypes.security]
-claude = "session-id"
-codex = "session-id"
-# prompt = "~/custom/security.md"   # optional override
-```
+# security
 
-Global prefix override (optional):
-```toml
-[global]
-prefix = "~/custom/prefix.md"
+Custom security review instructions here.
+
+# bugs
+
+Custom bugs review instructions here.
 ```

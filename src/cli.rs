@@ -1,27 +1,84 @@
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
-use crate::config::BUILTIN_ARCHETYPES;
-
-fn archetype_help() -> String {
-    format!(
-        "Archetype name or \"all\". Built-in: {}",
-        BUILTIN_ARCHETYPES.join(", ")
-    )
-}
+const AFTER_HELP: &str = "\
+Quick start:
+  review init                                                Create a .review.md
+  echo \"check for auth issues\" | review security --staged    Run a review
+  echo \"full review\" | review all --staged                   Review with all archetypes";
 
 #[derive(Parser)]
-#[command(name = "review", about = "Fan out code reviews to persistent AI sessions")]
+#[command(
+    name = "review",
+    about = "Fan out code reviews to persistent AI sessions",
+    after_help = AFTER_HELP
+)]
 pub struct Cli {
-    /// Archetype to review with
-    #[arg(help = archetype_help())]
-    pub archetype: String,
+    #[command(subcommand)]
+    pub command: Command,
+}
 
-    #[command(flatten)]
-    pub input: InputSource,
+#[derive(Subcommand)]
+pub enum Command {
+    /// Create a starter .review.md in the current directory
+    Init,
+
+    /// Review with the security archetype
+    Security {
+        #[command(flatten)]
+        input: InputSource,
+    },
+
+    /// Review with the bugs archetype
+    Bugs {
+        #[command(flatten)]
+        input: InputSource,
+    },
+
+    /// Review with the perf archetype
+    Perf {
+        #[command(flatten)]
+        input: InputSource,
+    },
+
+    /// Review with the arch archetype
+    Arch {
+        #[command(flatten)]
+        input: InputSource,
+    },
+
+    /// Review with all archetypes
+    All {
+        #[command(flatten)]
+        input: InputSource,
+    },
+}
+
+impl Command {
+    pub fn archetype_name(&self) -> &'static str {
+        match self {
+            Self::Security { .. } => "security",
+            Self::Bugs { .. } => "bugs",
+            Self::Perf { .. } => "perf",
+            Self::Arch { .. } => "arch",
+            Self::All { .. } => "all",
+            Self::Init => unreachable!(),
+        }
+    }
+
+    pub fn input_source(&self) -> Option<&InputSource> {
+        match self {
+            Self::Security { input }
+            | Self::Bugs { input }
+            | Self::Perf { input }
+            | Self::Arch { input }
+            | Self::All { input } => Some(input),
+            Self::Init => None,
+        }
+    }
 }
 
 #[derive(clap::Args)]
-#[group(required = false, multiple = false)]
+#[group(required = true, multiple = false)]
 pub struct InputSource {
     /// Review unstaged changes
     #[arg(long)]
@@ -42,14 +99,5 @@ pub struct InputSource {
     /// Review a file
     #[arg(long)]
     pub document: Option<String>,
-}
 
-impl InputSource {
-    pub fn is_specified(&self) -> bool {
-        self.unstaged
-            || self.staged
-            || self.commit.is_some()
-            || self.range.is_some()
-            || self.document.is_some()
-    }
 }

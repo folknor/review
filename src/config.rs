@@ -36,8 +36,12 @@ pub fn load() -> Result<ReviewConfig> {
         .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?
         .join(CONFIG_FILENAME);
 
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|_| anyhow::anyhow!("no {CONFIG_FILENAME} found in current directory"))?;
+    let raw = std::fs::read_to_string(&path).map_err(|_| {
+        anyhow::anyhow!(
+            "no {CONFIG_FILENAME} found in current directory\n\n\
+             Run `review init` to create one."
+        )
+    })?;
 
     parse(&raw)
 }
@@ -98,6 +102,48 @@ fn parse_archetype_sections(body: &str) -> BTreeMap<String, String> {
     }
 
     sections
+}
+
+const INIT_TEMPLATE: &str = "\
+---
+# Add your provider session IDs below.
+# Supported archetypes: security, bugs, perf, arch
+#
+# security:
+#   claude: \"your-claude-session-id\"
+#   codex: \"your-codex-session-id\"
+# bugs:
+#   claude: \"your-claude-session-id\"
+---
+
+# security
+
+# bugs
+
+# perf
+
+# arch
+";
+
+pub fn init() -> Result<()> {
+    let path = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?
+        .join(CONFIG_FILENAME);
+
+    if path.exists() {
+        bail!("{CONFIG_FILENAME} already exists");
+    }
+
+    std::fs::write(&path, INIT_TEMPLATE)
+        .map_err(|e| anyhow::anyhow!("failed to write {CONFIG_FILENAME}: {e}"))?;
+
+    println!("Created {CONFIG_FILENAME}");
+    println!();
+    println!("Next steps:");
+    println!("  1. Add your session IDs to the frontmatter");
+    println!("  2. Optionally add review instructions under each # heading");
+    println!("  3. Run: echo \"check for issues\" | review security --staged");
+    Ok(())
 }
 
 #[cfg(test)]

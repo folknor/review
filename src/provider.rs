@@ -42,7 +42,7 @@ pub async fn invoke_codex(
 
 async fn run_claude(session_id: &str, prompt: &str) -> Result<String> {
     let mut child = Command::new("claude")
-        .args(["--resume", session_id, "--print"])
+        .args(["--resume", session_id, "--print", "--permission-mode", "plan"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -73,7 +73,7 @@ async fn run_codex(session_id: &str, archetype: &str, prompt: &str) -> Result<St
     let output_path = temp_path(archetype, "codex");
 
     let mut child = Command::new("codex")
-        .args(["exec", "resume", session_id, "-o", &output_path])
+        .args(["exec", "--sandbox", "read-only", "resume", session_id, "-o", &output_path])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
