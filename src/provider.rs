@@ -5,7 +5,11 @@ use tokio::process::Command;
 
 fn temp_path(archetype: &str, provider: &str) -> String {
     let pid = std::process::id();
-    format!("/tmp/review-{archetype}-{provider}-{pid}.txt")
+    let safe_name: String = archetype
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .collect();
+    format!("/tmp/review-{safe_name}-{provider}-{pid}.txt")
 }
 
 pub struct ProviderResult {
@@ -37,9 +41,7 @@ pub async fn invoke_codex(
     }
 }
 
-async fn run_claude(session_id: &str, archetype: &str, prompt: &str) -> Result<String> {
-    let output_path = temp_path(archetype, "claude");
-
+async fn run_claude(session_id: &str, _archetype: &str, prompt: &str) -> Result<String> {
     let mut child = Command::new("claude")
         .args(["--resume", session_id, "--print"])
         .stdin(Stdio::piped())
@@ -65,12 +67,7 @@ async fn run_claude(session_id: &str, archetype: &str, prompt: &str) -> Result<S
         anyhow::bail!("claude exited with error: {}", stderr.trim());
     }
 
-    let result = String::from_utf8_lossy(&output.stdout).into_owned();
-    tokio::fs::write(&output_path, &result)
-        .await
-        .with_context(|| format!("failed to write {output_path}"))?;
-
-    Ok(result)
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 async fn run_codex(session_id: &str, archetype: &str, prompt: &str) -> Result<String> {
@@ -106,18 +103,15 @@ async fn run_codex(session_id: &str, archetype: &str, prompt: &str) -> Result<St
         .await
         .with_context(|| format!("failed to read codex output from {output_path}"))?;
 
+    let _ = tokio::fs::remove_file(&output_path).await;
+
     Ok(result)
 }
 
-pub fn print_results(results: &[ProviderResult]) {
-    for (i, result) in results.iter().enumerate() {
-        if i > 0 {
-            println!();
-        }
-        println!("--- {} ---", result.provider);
-        match &result.output {
-            Ok(text) => println!("{text}"),
-            Err(err) => println!("error: {err}"),
-        }
+pub fn print_result(result: &ProviderResult) {
+    println!("--- {} ---", result.provider);
+    match &result.output {
+        Ok(text) => println!("{text}"),
+        Err(err) => println!("error: {err}"),
     }
 }

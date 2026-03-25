@@ -78,6 +78,14 @@ pub struct InputSource {
     /// A file path to review as-is (not a diff)
     #[arg(long)]
     pub document: Option<String>,
+
+    /// Read input from stdin
+    #[arg(long)]
+    pub stdin: bool,
+
+    /// Treat stdin input as a document instead of a diff
+    #[arg(long, requires = "stdin")]
+    pub as_document: bool,
 }
 
 impl InputSource {
@@ -88,5 +96,6 @@ impl InputSource {
             || self.range.is_some()
             || self.branch
             || self.document.is_some()
+            || self.stdin
     }
 }

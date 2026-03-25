@@ -50,6 +50,11 @@ async fn run_review(archetype_name: &str, input_source: &cli::InputSource) -> Re
 
     let owned_name;
     let archetypes_to_run: Vec<(&String, &config::Archetype)> = if archetype_name == "all" {
+        if project.archetypes.is_empty() {
+            bail!(
+                "no archetypes configured for project '{project_name}'\n  hint: review register <archetype> --claude <session-id>"
+            );
+        }
         project.archetypes.iter().collect()
     } else {
         let arch = project.archetypes.get(archetype_name).ok_or_else(|| {
@@ -67,17 +72,29 @@ async fn run_review(archetype_name: &str, input_source: &cli::InputSource) -> Re
         vec![(&owned_name, arch)]
     };
 
-    for (arch_name, arch) in &archetypes_to_run {
-        if !arch.has_sessions() {
-            bail!(
-                "no sessions registered for archetype '{arch_name}'\n  hint: review register {arch_name} --claude <session-id>"
-            );
-        }
+    // Filter to archetypes that have sessions; warn about the rest
+    let runnable: Vec<_> = archetypes_to_run
+        .iter()
+        .filter(|(name, arch)| {
+            if arch.has_sessions() {
+                true
+            } else {
+                eprintln!(
+                    "warning: skipping archetype '{name}' (no sessions registered)"
+                );
+                false
+            }
+        })
+        .collect();
+
+    if runnable.is_empty() {
+        bail!("no archetypes have registered sessions\n  hint: review register <archetype> --claude <session-id>");
     }
 
-    let mut all_results = Vec::new();
+    // Assemble prompts and spawn all providers across all archetypes in parallel
+    let mut handles: Vec<(String, tokio::task::JoinHandle<provider::ProviderResult>)> = Vec::new();
 
-    for (arch_name, arch) in &archetypes_to_run {
+    for (arch_name, arch) in &runnable {
         let assembled = prompt::assemble(
             &cfg.global.prefix,
             arch_name,
@@ -87,14 +104,13 @@ async fn run_review(archetype_name: &str, input_source: &cli::InputSource) -> Re
             &resolved_input.content,
         )?;
 
-        let mut handles = Vec::new();
-
         if let Some(ref session_id) = arch.claude {
             let sid = session_id.clone();
             let aname = arch_name.to_string();
             let prompt = assembled.clone();
-            handles.push(tokio::spawn(
-                async move { provider::invoke_claude(&sid, &aname, &prompt).await },
+            handles.push((
+                arch_name.to_string(),
+                tokio::spawn(async move { provider::invoke_claude(&sid, &aname, &prompt).await }),
             ));
         }
 
@@ -102,25 +118,38 @@ async fn run_review(archetype_name: &str, input_source: &cli::InputSource) -> Re
             let sid = session_id.clone();
             let aname = arch_name.to_string();
             let prompt = assembled.clone();
-            handles.push(tokio::spawn(
-                async move { provider::invoke_codex(&sid, &aname, &prompt).await },
+            handles.push((
+                arch_name.to_string(),
+                tokio::spawn(async move { provider::invoke_codex(&sid, &aname, &prompt).await }),
             ));
         }
+    }
 
-        let mut results = Vec::new();
-        for handle in handles {
-            results.push(handle.await?);
-        }
+    // Collect results, grouping by archetype
+    let mut grouped: Vec<(String, provider::ProviderResult)> = Vec::new();
+    for (arch_name, handle) in handles {
+        let result = match handle.await {
+            Ok(r) => r,
+            Err(err) => provider::ProviderResult {
+                provider: "unknown".into(),
+                output: Err(anyhow::anyhow!("task panicked: {err}")),
+            },
+        };
+        grouped.push((arch_name, result));
+    }
 
-        if archetypes_to_run.len() > 1 {
+    // Print results, adding archetype headers when multiple archetypes
+    let multi = runnable.len() > 1;
+    let mut current_arch = "";
+    for (arch_name, result) in &grouped {
+        if multi && arch_name.as_str() != current_arch {
+            if !current_arch.is_empty() {
+                println!();
+            }
             println!("=== {arch_name} ===\n");
+            current_arch = arch_name;
         }
-        provider::print_results(&results);
-        all_results.extend(results);
-
-        if archetypes_to_run.len() > 1 {
-            println!();
-        }
+        provider::print_result(result);
     }
 
     Ok(())
