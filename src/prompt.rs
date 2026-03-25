@@ -31,5 +31,5 @@ pub fn assemble(
         .map(String::as_str)
         .unwrap_or_else(|| builtin_prompt(archetype_name));
 
-    format!("{prefix}\n\n{archetype_prompt}\n\n{context}\n\n{stdin_instructions}")
+    format!("{prefix}\n\n{archetype_prompt}\n\n{stdin_instructions}\n\n{context}")
 }

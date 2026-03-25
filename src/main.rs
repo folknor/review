@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
         return config::init();
     }
 
-    let cfg = config::load()?;
+    let (cfg, project_root) = config::load()?;
     let input = cli.command.input_source().expect("not init");
     let context = input::context_line(input);
     let stdin_instructions = input::read_stdin()?;
@@ -31,6 +31,7 @@ async fn main() -> Result<()> {
     };
 
     // Filter to archetypes that have sessions configured
+    let mut skipped: Vec<&str> = Vec::new();
     let runnable: Vec<&str> = archetypes_to_run
         .iter()
         .filter(|name| {
@@ -39,14 +40,26 @@ async fn main() -> Result<()> {
             {
                 return true;
             }
-            eprintln!("warning: skipping archetype '{name}' (no sessions in .review.md)");
+            skipped.push(name);
             false
         })
         .copied()
         .collect();
 
     if runnable.is_empty() {
-        bail!("no archetypes have sessions configured in .review.md");
+        let missing = skipped.join(", ");
+        bail!(
+            "no sessions configured for: {missing}\n\n\
+             Add session IDs to your .review.md frontmatter, e.g.:\n\
+             ---\n\
+             {missing}:\n  \
+               claude: \"your-session-id\"\n\
+             ---"
+        );
+    }
+
+    for name in &skipped {
+        eprintln!("warning: skipping '{name}' (no sessions in .review.md)");
     }
 
     // Assemble prompts and spawn all providers in parallel
@@ -59,9 +72,10 @@ async fn main() -> Result<()> {
         if let Some(ref session_id) = arch_cfg.claude {
             let sid = session_id.clone();
             let prompt = assembled.clone();
+            let root = project_root.clone();
             handles.push((
                 (*arch_name).to_string(),
-                tokio::spawn(async move { provider::invoke_claude(&sid, &prompt).await }),
+                tokio::spawn(async move { provider::invoke_claude(&sid, &prompt, &root).await }),
             ));
         }
 
@@ -69,9 +83,10 @@ async fn main() -> Result<()> {
             let sid = session_id.clone();
             let aname = (*arch_name).to_string();
             let prompt = assembled.clone();
+            let root = project_root.clone();
             handles.push((
                 (*arch_name).to_string(),
-                tokio::spawn(async move { provider::invoke_codex(&sid, &aname, &prompt).await }),
+                tokio::spawn(async move { provider::invoke_codex(&sid, &aname, &prompt, &root).await }),
             ));
         }
     }

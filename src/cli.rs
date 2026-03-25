@@ -100,4 +100,7 @@ pub struct InputSource {
     #[arg(long)]
     pub document: Option<String>,
 
+    /// Review the entire codebase
+    #[arg(long)]
+    pub general: bool,
 }

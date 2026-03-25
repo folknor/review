@@ -21,6 +21,9 @@ pub fn context_line(input: &InputSource) -> String {
     if let Some(ref path) = input.document {
         return format!("You are reviewing the file {path}.");
     }
+    if input.general {
+        return "You are reviewing the entire codebase.".into();
+    }
     unreachable!()
 }
 

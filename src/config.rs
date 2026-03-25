@@ -31,19 +31,39 @@ pub struct ReviewConfig {
     pub archetype_prompts: BTreeMap<String, String>,
 }
 
-pub fn load() -> Result<ReviewConfig> {
-    let path = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?
-        .join(CONFIG_FILENAME);
+pub fn load() -> Result<(ReviewConfig, std::path::PathBuf)> {
+    let path = find_config()?;
+    let project_root = path.parent().expect("config file has parent dir").to_path_buf();
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+    let config = parse(&raw)?;
+    Ok((config, project_root))
+}
 
-    let raw = std::fs::read_to_string(&path).map_err(|_| {
-        anyhow::anyhow!(
-            "no {CONFIG_FILENAME} found in current directory\n\n\
-             Run `review init` to create one."
-        )
-    })?;
+fn find_config() -> Result<std::path::PathBuf> {
+    let mut dir = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
 
-    parse(&raw)
+    loop {
+        let candidate = dir.join(CONFIG_FILENAME);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+        // Stop at git root — don't walk above the repository
+        if dir.join(".git").exists() {
+            bail!(
+                "no {CONFIG_FILENAME} found (searched up to git root: {})\n\n\
+                 Run `review init` to create one.",
+                dir.display()
+            );
+        }
+        if !dir.pop() {
+            bail!(
+                "no {CONFIG_FILENAME} found in current or parent directories\n\n\
+                 Run `review init` to create one."
+            );
+        }
+    }
 }
 
 pub fn parse(raw: &str) -> Result<ReviewConfig> {
@@ -79,7 +99,7 @@ fn parse_archetype_sections(body: &str) -> BTreeMap<String, String> {
     let mut current_content = String::new();
 
     for line in body.lines() {
-        if let Some(heading) = line.strip_prefix("# ") {
+        if let Some(heading) = line.strip_prefix("## ") {
             if let Some(name) = current_name.take() {
                 let trimmed = current_content.trim().to_string();
                 if !trimmed.is_empty() {
@@ -116,13 +136,13 @@ const INIT_TEMPLATE: &str = "\
 #   claude: \"your-claude-session-id\"
 ---
 
-# security
+## security
 
-# bugs
+## bugs
 
-# perf
+## perf
 
-# arch
+## arch
 ";
 
 pub fn init() -> Result<()> {
@@ -131,7 +151,16 @@ pub fn init() -> Result<()> {
         .join(CONFIG_FILENAME);
 
     if path.exists() {
-        bail!("{CONFIG_FILENAME} already exists");
+        bail!("{CONFIG_FILENAME} already exists in current directory");
+    }
+
+    // Warn if a parent directory already has one
+    if let Ok(existing) = find_config() {
+        bail!(
+            "{CONFIG_FILENAME} already exists at {}\n  \
+             Creating another here would shadow it.",
+            existing.display()
+        );
     }
 
     std::fs::write(&path, INIT_TEMPLATE)
@@ -141,7 +170,7 @@ pub fn init() -> Result<()> {
     println!();
     println!("Next steps:");
     println!("  1. Add your session IDs to the frontmatter");
-    println!("  2. Optionally add review instructions under each # heading");
+    println!("  2. Optionally add review instructions under each ## heading");
     println!("  3. Run: echo \"check for issues\" | review security --staged");
     Ok(())
 }
@@ -162,11 +191,11 @@ bugs:
   codex: \"sess-3\"
 ---
 
-# security
+## security
 
 Check for auth issues and injection vectors.
 
-# bugs
+## bugs
 
 Look for logic errors and edge cases.
 ";
@@ -213,9 +242,9 @@ security:
   claude: \"sess-1\"
 ---
 
-# security
+## security
 
-# bugs
+## bugs
 ";
         let cfg = parse(raw).unwrap();
         assert!(cfg.archetype_prompts.is_empty());

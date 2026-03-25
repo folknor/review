@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::path::Path;
 use std::process::Stdio;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -20,8 +21,9 @@ pub struct ProviderResult {
 pub async fn invoke_claude(
     session_id: &str,
     prompt: &str,
+    project_root: &Path,
 ) -> ProviderResult {
-    let result = run_claude(session_id, prompt).await;
+    let result = run_claude(session_id, prompt, project_root).await;
     ProviderResult {
         provider: "claude".into(),
         output: result,
@@ -32,17 +34,19 @@ pub async fn invoke_codex(
     session_id: &str,
     archetype: &str,
     prompt: &str,
+    project_root: &Path,
 ) -> ProviderResult {
-    let result = run_codex(session_id, archetype, prompt).await;
+    let result = run_codex(session_id, archetype, prompt, project_root).await;
     ProviderResult {
         provider: "codex".into(),
         output: result,
     }
 }
 
-async fn run_claude(session_id: &str, prompt: &str) -> Result<String> {
+async fn run_claude(session_id: &str, prompt: &str, project_root: &Path) -> Result<String> {
     let mut child = Command::new("claude")
         .args(["--resume", session_id, "--print", "--permission-mode", "plan"])
+        .current_dir(project_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -69,11 +73,17 @@ async fn run_claude(session_id: &str, prompt: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-async fn run_codex(session_id: &str, archetype: &str, prompt: &str) -> Result<String> {
+async fn run_codex(
+    session_id: &str,
+    archetype: &str,
+    prompt: &str,
+    project_root: &Path,
+) -> Result<String> {
     let output_path = temp_path(archetype, "codex");
 
     let mut child = Command::new("codex")
         .args(["exec", "--sandbox", "read-only", "resume", session_id, "-o", &output_path])
+        .current_dir(project_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -92,14 +102,17 @@ async fn run_codex(session_id: &str, archetype: &str, prompt: &str) -> Result<St
         .await
         .context("failed to wait for codex")?;
 
+    // Always clean up the temp file, even on error
+    let cleanup = || async { let _ = tokio::fs::remove_file(&output_path).await; };
+
     if !output.status.success() {
+        cleanup().await;
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("codex exited with error: {}", stderr.trim());
     }
 
-    // Codex writes output to the -o file; always clean up
     let result = tokio::fs::read_to_string(&output_path).await;
-    let _ = tokio::fs::remove_file(&output_path).await;
+    cleanup().await;
 
     result.with_context(|| format!("failed to read codex output from {output_path}"))
 }
