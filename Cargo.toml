@@ -10,6 +10,7 @@ serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 yaml-front-matter = "0.1.0"
+gethostname = "0.5"
 
 [lints.clippy]
 # Style: modern idiomatic Rust

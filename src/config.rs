@@ -13,16 +13,36 @@ pub struct Frontmatter {
     pub archetypes: BTreeMap<String, ArchetypeConfig>,
 }
 
+/// Per-archetype config: maps hostname → provider sessions.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ArchetypeConfig {
+    #[serde(flatten)]
+    pub hosts: BTreeMap<String, HostConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HostConfig {
     pub claude: Option<String>,
     pub codex: Option<String>,
 }
 
 impl ArchetypeConfig {
-    pub fn has_sessions(&self) -> bool {
-        self.claude.is_some() || self.codex.is_some()
+    /// Resolve config for the current hostname. Returns None if this host has no entry.
+    pub fn resolve_host(&self, hostname: &str) -> Option<&HostConfig> {
+        self.hosts.get(hostname)
     }
+
+    pub fn has_sessions_for_host(&self, hostname: &str) -> bool {
+        self.resolve_host(hostname)
+            .map(|h| h.claude.is_some() || h.codex.is_some())
+            .unwrap_or(false)
+    }
+}
+
+pub fn hostname() -> String {
+    gethostname::gethostname()
+        .to_string_lossy()
+        .to_string()
 }
 
 #[derive(Debug)]
@@ -124,16 +144,18 @@ fn parse_archetype_sections(body: &str) -> BTreeMap<String, String> {
     sections
 }
 
-const INIT_TEMPLATE: &str = "\
+const INIT_TEMPLATE_PREFIX: &str = "\
 ---
-# Add your provider session IDs below.
+# Session IDs are scoped by hostname.
 # Supported archetypes: security, bugs, perf, arch
 #
 # security:
-#   claude: \"your-claude-session-id\"
-#   codex: \"your-codex-session-id\"
+#   myhostname:
+#     claude: \"your-claude-session-id\"
+#     codex: \"your-codex-session-id\"
 # bugs:
-#   claude: \"your-claude-session-id\"
+#   myhostname:
+#     claude: \"your-claude-session-id\"
 ---
 
 ## security
@@ -163,13 +185,15 @@ pub fn init() -> Result<()> {
         );
     }
 
-    std::fs::write(&path, INIT_TEMPLATE)
+    let host = hostname();
+    let content = INIT_TEMPLATE_PREFIX.replacen("myhostname", &host, 2);
+    std::fs::write(&path, content)
         .map_err(|e| anyhow::anyhow!("failed to write {CONFIG_FILENAME}: {e}"))?;
 
     println!("Created {CONFIG_FILENAME}");
     println!();
     println!("Next steps:");
-    println!("  1. Add your session IDs to the frontmatter");
+    println!("  1. Add your session IDs under your hostname ({host}) in the frontmatter");
     println!("  2. Optionally add review instructions under each ## heading");
     println!("  3. Run: echo \"check for issues\" | review security --staged");
     Ok(())
@@ -185,10 +209,12 @@ mod tests {
         let raw = "\
 ---
 security:
-  claude: \"sess-1\"
+  myhost:
+    claude: \"sess-1\"
 bugs:
-  claude: \"sess-2\"
-  codex: \"sess-3\"
+  myhost:
+    claude: \"sess-2\"
+    codex: \"sess-3\"
 ---
 
 ## security
@@ -201,12 +227,13 @@ Look for logic errors and edge cases.
 ";
         let cfg = parse(raw).unwrap();
         assert_eq!(cfg.frontmatter.archetypes.len(), 2);
-        assert_eq!(
-            cfg.frontmatter.archetypes["security"].claude.as_deref(),
-            Some("sess-1")
-        );
-        assert!(cfg.frontmatter.archetypes["security"].codex.is_none());
-        assert!(cfg.frontmatter.archetypes["bugs"].codex.is_some());
+
+        let sec_host = cfg.frontmatter.archetypes["security"].resolve_host("myhost").unwrap();
+        assert_eq!(sec_host.claude.as_deref(), Some("sess-1"));
+        assert!(sec_host.codex.is_none());
+
+        let bugs_host = cfg.frontmatter.archetypes["bugs"].resolve_host("myhost").unwrap();
+        assert!(bugs_host.codex.is_some());
 
         assert_eq!(cfg.archetype_prompts.len(), 2);
         assert!(cfg.archetype_prompts["security"].contains("auth issues"));
@@ -218,7 +245,8 @@ Look for logic errors and edge cases.
         let raw = "\
 ---
 foobar:
-  claude: \"sess-1\"
+  myhost:
+    claude: \"sess-1\"
 ---
 ";
         let result = parse(raw);
@@ -239,7 +267,8 @@ foobar:
         let raw = "\
 ---
 security:
-  claude: \"sess-1\"
+  myhost:
+    claude: \"sess-1\"
 ---
 
 ## security
@@ -251,20 +280,40 @@ security:
     }
 
     #[test]
-    fn has_sessions_both() {
-        let cfg = ArchetypeConfig {
+    fn has_sessions_for_matching_host() {
+        let mut hosts = BTreeMap::new();
+        hosts.insert("myhost".to_string(), HostConfig {
             claude: Some("c".into()),
             codex: Some("x".into()),
-        };
-        assert!(cfg.has_sessions());
+        });
+        let cfg = ArchetypeConfig { hosts };
+        assert!(cfg.has_sessions_for_host("myhost"));
+        assert!(!cfg.has_sessions_for_host("otherhost"));
     }
 
     #[test]
-    fn has_sessions_none() {
-        let cfg = ArchetypeConfig {
-            claude: None,
-            codex: None,
-        };
-        assert!(!cfg.has_sessions());
+    fn no_sessions_for_any_host() {
+        let cfg = ArchetypeConfig { hosts: BTreeMap::new() };
+        assert!(!cfg.has_sessions_for_host("myhost"));
+    }
+
+    #[test]
+    fn multiple_hosts() {
+        let raw = "\
+---
+security:
+  host-a:
+    claude: \"sess-a\"
+  host-b:
+    codex: \"sess-b\"
+---
+";
+        let cfg = parse(raw).unwrap();
+        let sec = &cfg.frontmatter.archetypes["security"];
+        assert!(sec.has_sessions_for_host("host-a"));
+        assert!(sec.has_sessions_for_host("host-b"));
+        assert!(!sec.has_sessions_for_host("host-c"));
+        assert_eq!(sec.resolve_host("host-a").unwrap().claude.as_deref(), Some("sess-a"));
+        assert_eq!(sec.resolve_host("host-b").unwrap().codex.as_deref(), Some("sess-b"));
     }
 }

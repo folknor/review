@@ -24,19 +24,21 @@ async fn main() -> Result<()> {
 
     let archetype_name = cli.command.archetype_name();
 
+    let hostname = config::hostname();
+
     let archetypes_to_run: Vec<&str> = if archetype_name == "all" {
         config::BUILTIN_ARCHETYPES.to_vec()
     } else {
         vec![archetype_name]
     };
 
-    // Filter to archetypes that have sessions configured
+    // Filter to archetypes that have sessions configured for this host
     let mut skipped: Vec<&str> = Vec::new();
     let runnable: Vec<&str> = archetypes_to_run
         .iter()
         .filter(|name| {
             if let Some(arch) = cfg.frontmatter.archetypes.get(**name)
-                && arch.has_sessions()
+                && arch.has_sessions_for_host(&hostname)
             {
                 return true;
             }
@@ -49,17 +51,18 @@ async fn main() -> Result<()> {
     if runnable.is_empty() {
         let missing = skipped.join(", ");
         bail!(
-            "no sessions configured for: {missing}\n\n\
+            "no sessions configured for host '{hostname}': {missing}\n\n\
              Add session IDs to your .review.md frontmatter, e.g.:\n\
              ---\n\
              {missing}:\n  \
-               claude: \"your-session-id\"\n\
+               {hostname}:\n    \
+                 claude: \"your-session-id\"\n\
              ---"
         );
     }
 
     for name in &skipped {
-        eprintln!("warning: skipping '{name}' (no sessions in .review.md)");
+        eprintln!("warning: skipping '{name}' (no sessions for host '{hostname}' in .review.md)");
     }
 
     // Assemble prompts and spawn all providers in parallel
@@ -68,8 +71,9 @@ async fn main() -> Result<()> {
     for arch_name in &runnable {
         let assembled = prompt::assemble(&cfg, arch_name, &context, &stdin_instructions);
         let arch_cfg = cfg.frontmatter.archetypes.get(*arch_name).expect("filtered above");
+        let host_cfg = arch_cfg.resolve_host(&hostname).expect("filtered above");
 
-        if let Some(ref session_id) = arch_cfg.claude {
+        if let Some(ref session_id) = host_cfg.claude {
             let sid = session_id.clone();
             let prompt = assembled.clone();
             let root = project_root.clone();
@@ -79,7 +83,7 @@ async fn main() -> Result<()> {
             ));
         }
 
-        if let Some(ref session_id) = arch_cfg.codex {
+        if let Some(ref session_id) = host_cfg.codex {
             let sid = session_id.clone();
             let aname = (*arch_name).to_string();
             let prompt = assembled.clone();

@@ -21,7 +21,7 @@
 
 A Rust CLI (`review`) that fans out code reviews to persistent AI sessions across multiple providers (Claude Code, Codex). It's a prompt builder that knows about sessions — the agents fetch code themselves.
 
-Fixed archetypes: security, bugs, perf, arch. Per-project config via `.review.md` (YAML frontmatter for session IDs, markdown headings for archetype prompts).
+Fixed archetypes: security, bugs, perf, arch. Per-project config via `.review.md` (YAML frontmatter for host-scoped session IDs, markdown `## headings` for archetype prompts).
 
 ## Build and run
 
@@ -37,7 +37,7 @@ Single binary crate, no workspace.
 ## Architecture
 
 - `src/cli.rs` — Clap CLI. Archetypes are subcommands (security, bugs, perf, arch, all). `init` creates a starter `.review.md`.
-- `src/config.rs` — Parses `.review.md` in cwd. YAML frontmatter for sessions, markdown `# headings` for archetype prompts. Uses `yaml-front-matter` crate.
+- `src/config.rs` — Parses `.review.md` in cwd. YAML frontmatter for host-scoped sessions (archetype → hostname → provider), markdown `## headings` for archetype prompts. Uses `yaml-front-matter` and `gethostname` crates.
 - `src/input.rs` — Builds context line from flags (e.g. "You are reviewing staged changes."). Reads stdin instructions (required, 20KB limit).
 - `src/prompt.rs` — Assembles: compiled prefix + archetype prompt (from .review.md or built-in) + context line + stdin instructions. Built-in prompts for security, bugs, perf, arch.
 - `src/provider.rs` — Async provider invocation. Prompts piped via stdin. Claude uses `--permission-mode plan`, Codex uses `--sandbox read-only`.
@@ -57,17 +57,19 @@ Single binary crate, no workspace.
 ```markdown
 ---
 security:
-  claude: "session-id"
-  codex: "session-id"
+  myhostname:
+    claude: "session-id"
+    codex: "session-id"
 bugs:
-  claude: "session-id"
+  myhostname:
+    claude: "session-id"
 ---
 
-# security
+## security
 
 Custom security review instructions here.
 
-# bugs
+## bugs
 
 Custom bugs review instructions here.
 ```
