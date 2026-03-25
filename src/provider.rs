@@ -19,10 +19,9 @@ pub struct ProviderResult {
 
 pub async fn invoke_claude(
     session_id: &str,
-    archetype: &str,
     prompt: &str,
 ) -> ProviderResult {
-    let result = run_claude(session_id, archetype, prompt).await;
+    let result = run_claude(session_id, prompt).await;
     ProviderResult {
         provider: "claude".into(),
         output: result,
@@ -41,7 +40,7 @@ pub async fn invoke_codex(
     }
 }
 
-async fn run_claude(session_id: &str, _archetype: &str, prompt: &str) -> Result<String> {
+async fn run_claude(session_id: &str, prompt: &str) -> Result<String> {
     let mut child = Command::new("claude")
         .args(["--resume", session_id, "--print"])
         .stdin(Stdio::piped())
@@ -98,14 +97,11 @@ async fn run_codex(session_id: &str, archetype: &str, prompt: &str) -> Result<St
         anyhow::bail!("codex exited with error: {}", stderr.trim());
     }
 
-    // Codex writes output to the -o file
-    let result = tokio::fs::read_to_string(&output_path)
-        .await
-        .with_context(|| format!("failed to read codex output from {output_path}"))?;
-
+    // Codex writes output to the -o file; always clean up
+    let result = tokio::fs::read_to_string(&output_path).await;
     let _ = tokio::fs::remove_file(&output_path).await;
 
-    Ok(result)
+    result.with_context(|| format!("failed to read codex output from {output_path}"))
 }
 
 pub fn print_result(result: &ProviderResult) {

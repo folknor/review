@@ -6,11 +6,10 @@ rust-version = "1.92"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
-shellexpand = "3"
+yaml-front-matter = "0.1.0"
 
 [lints.clippy]
 # Style: modern idiomatic Rust

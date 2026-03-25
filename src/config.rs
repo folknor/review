@@ -1,138 +1,103 @@
-use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use anyhow::{Result, bail};
+use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use yaml_front_matter::YamlFrontMatter;
 
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct Config {
-    #[serde(default)]
-    pub global: Global,
-    #[serde(default)]
-    pub projects: BTreeMap<String, Project>,
+const CONFIG_FILENAME: &str = ".review.md";
+
+pub const BUILTIN_ARCHETYPES: &[&str] = &["security", "bugs", "perf", "arch"];
+
+#[derive(Debug, Deserialize)]
+pub struct Frontmatter {
+    #[serde(flatten)]
+    pub archetypes: BTreeMap<String, ArchetypeConfig>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct Global {
-    pub prefix: Option<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct Project {
-    pub path: String,
-    #[serde(default)]
-    pub archetypes: BTreeMap<String, Archetype>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Archetype {
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArchetypeConfig {
     pub claude: Option<String>,
     pub codex: Option<String>,
-    pub prompt: Option<String>,
 }
 
-impl Archetype {
+impl ArchetypeConfig {
     pub fn has_sessions(&self) -> bool {
         self.claude.is_some() || self.codex.is_some()
     }
 }
 
-fn config_path() -> PathBuf {
-    dirs_or_default().join("config.toml")
+#[derive(Debug)]
+pub struct ReviewConfig {
+    pub frontmatter: Frontmatter,
+    pub archetype_prompts: BTreeMap<String, String>,
 }
 
-fn dirs_or_default() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").expect("HOME not set");
-            PathBuf::from(home).join(".config")
-        });
-    base.join("review")
+pub fn load() -> Result<ReviewConfig> {
+    let path = std::env::current_dir()
+        .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?
+        .join(CONFIG_FILENAME);
+
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|_| anyhow::anyhow!("no {CONFIG_FILENAME} found in current directory"))?;
+
+    parse(&raw)
 }
 
-pub fn load() -> Result<Config> {
-    let path = config_path();
-    let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("failed to read config at {}", path.display()))?;
-    let config: Config =
-        toml::from_str(&contents).with_context(|| "failed to parse config.toml")?;
-    Ok(config)
-}
+pub fn parse(raw: &str) -> Result<ReviewConfig> {
+    let document = YamlFrontMatter::parse::<Frontmatter>(raw).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to parse {CONFIG_FILENAME}: {e}\n  \
+             frontmatter keys must be archetype names ({}) with claude/codex sub-keys",
+            BUILTIN_ARCHETYPES.join(", ")
+        )
+    })?;
 
-pub fn save(config: &Config) -> Result<()> {
-    let path = config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    // Validate archetype names
+    for name in document.metadata.archetypes.keys() {
+        if !BUILTIN_ARCHETYPES.contains(&name.as_str()) {
+            bail!(
+                "unknown archetype '{name}' in frontmatter\n  supported: {}",
+                BUILTIN_ARCHETYPES.join(", ")
+            );
+        }
     }
-    let contents = toml::to_string_pretty(config).context("failed to serialize config")?;
 
-    // Atomic write: write to temp file in same directory, then rename
-    let tmp_path = path.with_extension("toml.tmp");
-    std::fs::write(&tmp_path, &contents).context("failed to write temp config")?;
-    std::fs::rename(&tmp_path, &path).context("failed to rename temp config into place")?;
-    Ok(())
+    let archetype_prompts = parse_archetype_sections(&document.content);
+
+    Ok(ReviewConfig {
+        frontmatter: document.metadata,
+        archetype_prompts,
+    })
 }
 
-pub fn expand_path(p: &str) -> PathBuf {
-    PathBuf::from(shellexpand::tilde(p).into_owned())
-}
+fn parse_archetype_sections(body: &str) -> BTreeMap<String, String> {
+    let mut sections = BTreeMap::new();
+    let mut current_name: Option<String> = None;
+    let mut current_content = String::new();
 
-/// Best-effort canonicalization: resolves symlinks if possible, falls back to the original path.
-fn canonicalize_best_effort(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
-}
-
-/// Resolve the current directory to a registered project. Returns (project_name, project).
-pub fn resolve_project(config: &Config) -> Result<(String, &Project)> {
-    let cwd = std::env::current_dir().context("failed to get current directory")?;
-    resolve_project_from(config, &cwd)
-}
-
-pub fn resolve_project_from<'a>(config: &'a Config, cwd: &Path) -> Result<(String, &'a Project)> {
-    let cwd = canonicalize_best_effort(cwd);
-    let mut best: Option<(String, &Project, usize)> = None;
-    for (name, project) in &config.projects {
-        let project_path = canonicalize_best_effort(&expand_path(&project.path));
-        if cwd.starts_with(&project_path) {
-            let depth = project_path.components().count();
-            if best.as_ref().is_none_or(|(_, _, d)| depth > *d) {
-                best = Some((name.clone(), project, depth));
+    for line in body.lines() {
+        if let Some(heading) = line.strip_prefix("# ") {
+            if let Some(name) = current_name.take() {
+                let trimmed = current_content.trim().to_string();
+                if !trimmed.is_empty() {
+                    sections.insert(name, trimmed);
+                }
             }
+            current_name = Some(heading.trim().to_lowercase());
+            current_content = String::new();
+        } else if current_name.is_some() {
+            current_content.push_str(line);
+            current_content.push('\n');
         }
     }
-    match best {
-        Some((name, project, _)) => Ok((name, project)),
-        None => bail!(
-            "current directory is not a registered project\n  cwd: {}\n  hint: add a [projects.<name>] entry in ~/.config/review/config.toml",
-            cwd.display()
-        ),
-    }
-}
 
-/// Resolve project mutably for config updates.
-pub fn resolve_project_mut(config: &mut Config) -> Result<(String, &mut Project)> {
-    let cwd = std::env::current_dir().context("failed to get current directory")?;
-    let cwd = canonicalize_best_effort(&cwd);
-    let mut best: Option<(String, usize)> = None;
-    for (name, project) in &config.projects {
-        let project_path = canonicalize_best_effort(&expand_path(&project.path));
-        if cwd.starts_with(&project_path) {
-            let depth = project_path.components().count();
-            if best.as_ref().is_none_or(|(_, d)| depth > *d) {
-                best = Some((name.clone(), depth));
-            }
+    if let Some(name) = current_name {
+        let trimmed = current_content.trim().to_string();
+        if !trimmed.is_empty() {
+            sections.insert(name, trimmed);
         }
     }
-    match best {
-        Some((name, _)) => {
-            let project = config.projects.get_mut(&name).expect("project disappeared from map");
-            Ok((name, project))
-        }
-        None => bail!(
-            "current directory is not a registered project\n  cwd: {}\n  hint: add a [projects.<name>] entry in ~/.config/review/config.toml",
-            cwd.display()
-        ),
-    }
+
+    sections
 }
 
 #[cfg(test)]
@@ -140,92 +105,91 @@ pub fn resolve_project_mut(config: &mut Config) -> Result<(String, &mut Project)
 mod tests {
     use super::*;
 
-    fn test_config() -> Config {
-        let mut projects = BTreeMap::new();
-        projects.insert(
-            "repo".to_string(),
-            Project {
-                path: "/home/user/repo".to_string(),
-                archetypes: BTreeMap::new(),
-            },
+    #[test]
+    fn parses_frontmatter_and_sections() {
+        let raw = "\
+---
+security:
+  claude: \"sess-1\"
+bugs:
+  claude: \"sess-2\"
+  codex: \"sess-3\"
+---
+
+# security
+
+Check for auth issues and injection vectors.
+
+# bugs
+
+Look for logic errors and edge cases.
+";
+        let cfg = parse(raw).unwrap();
+        assert_eq!(cfg.frontmatter.archetypes.len(), 2);
+        assert_eq!(
+            cfg.frontmatter.archetypes["security"].claude.as_deref(),
+            Some("sess-1")
         );
-        projects.insert(
-            "subproject".to_string(),
-            Project {
-                path: "/home/user/repo/subproject".to_string(),
-                archetypes: BTreeMap::new(),
-            },
-        );
-        projects.insert(
-            "other".to_string(),
-            Project {
-                path: "/home/user/other".to_string(),
-                archetypes: BTreeMap::new(),
-            },
-        );
-        Config {
-            global: Global {
-                prefix: None,
-            },
-            projects,
-        }
+        assert!(cfg.frontmatter.archetypes["security"].codex.is_none());
+        assert!(cfg.frontmatter.archetypes["bugs"].codex.is_some());
+
+        assert_eq!(cfg.archetype_prompts.len(), 2);
+        assert!(cfg.archetype_prompts["security"].contains("auth issues"));
+        assert!(cfg.archetype_prompts["bugs"].contains("logic errors"));
     }
 
     #[test]
-    fn resolves_exact_project_path() {
-        let cfg = test_config();
-        let (name, _) = resolve_project_from(&cfg, Path::new("/home/user/other")).unwrap();
-        assert_eq!(name, "other");
+    fn rejects_unknown_archetype() {
+        let raw = "\
+---
+foobar:
+  claude: \"sess-1\"
+---
+";
+        let result = parse(raw);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("unknown archetype 'foobar'"));
     }
 
     #[test]
-    fn resolves_subdirectory_to_project() {
-        let cfg = test_config();
-        let (name, _) =
-            resolve_project_from(&cfg, Path::new("/home/user/other/src/lib")).unwrap();
-        assert_eq!(name, "other");
-    }
-
-    #[test]
-    fn longest_prefix_wins_for_nested_projects() {
-        let cfg = test_config();
-        let (name, _) =
-            resolve_project_from(&cfg, Path::new("/home/user/repo/subproject/src")).unwrap();
-        assert_eq!(name, "subproject");
-    }
-
-    #[test]
-    fn parent_project_still_matches_outside_subproject() {
-        let cfg = test_config();
-        let (name, _) =
-            resolve_project_from(&cfg, Path::new("/home/user/repo/other_dir")).unwrap();
-        assert_eq!(name, "repo");
-    }
-
-    #[test]
-    fn no_match_returns_error() {
-        let cfg = test_config();
-        let result = resolve_project_from(&cfg, Path::new("/home/user/unknown"));
+    fn missing_frontmatter_errors() {
+        let raw = "# security\n\nSome content\n";
+        let result = parse(raw);
         assert!(result.is_err());
     }
 
     #[test]
+    fn empty_sections_not_included() {
+        let raw = "\
+---
+security:
+  claude: \"sess-1\"
+---
+
+# security
+
+# bugs
+";
+        let cfg = parse(raw).unwrap();
+        assert!(cfg.archetype_prompts.is_empty());
+    }
+
+    #[test]
     fn has_sessions_both() {
-        let arch = Archetype {
+        let cfg = ArchetypeConfig {
             claude: Some("c".into()),
             codex: Some("x".into()),
-            prompt: None,
         };
-        assert!(arch.has_sessions());
+        assert!(cfg.has_sessions());
     }
 
     #[test]
     fn has_sessions_none() {
-        let arch = Archetype {
+        let cfg = ArchetypeConfig {
             claude: None,
             codex: None,
-            prompt: None,
         };
-        assert!(!arch.has_sessions());
+        assert!(!cfg.has_sessions());
     }
 }

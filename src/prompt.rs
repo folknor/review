@@ -1,6 +1,4 @@
-use anyhow::{Context, Result};
-
-use crate::config::{self, Archetype};
+use crate::config::ReviewConfig;
 
 const DEFAULT_PREFIX: &str = include_str!("../prompts/prefix.md");
 const DEFAULT_PROMPT: &str = include_str!("../prompts/default.md");
@@ -20,30 +18,18 @@ fn builtin_prompt(archetype_name: &str) -> &'static str {
 }
 
 pub fn assemble(
-    prefix_override: &Option<String>,
+    config: &ReviewConfig,
     archetype_name: &str,
-    project_name: &str,
-    archetype: &Archetype,
+    context: &str,
     stdin_instructions: &str,
-    content: &str,
-) -> Result<String> {
-    let prefix_template = match prefix_override {
-        Some(path) => std::fs::read_to_string(config::expand_path(path))
-            .with_context(|| format!("failed to read prefix prompt: {path}"))?,
-        None => DEFAULT_PREFIX.to_string(),
-    };
+) -> String {
+    let prefix = DEFAULT_PREFIX;
 
-    let prefix = prefix_template
-        .replace("{archetype}", archetype_name)
-        .replace("{project}", project_name);
+    let archetype_prompt = config
+        .archetype_prompts
+        .get(archetype_name)
+        .map(String::as_str)
+        .unwrap_or_else(|| builtin_prompt(archetype_name));
 
-    let archetype_prompt = match &archetype.prompt {
-        Some(path) => std::fs::read_to_string(config::expand_path(path))
-            .with_context(|| format!("failed to read archetype prompt: {path}"))?,
-        None => builtin_prompt(archetype_name).to_string(),
-    };
-
-    Ok(format!(
-        "{prefix}\n\n{archetype_prompt}\n\n{stdin_instructions}\n\n{content}"
-    ))
+    format!("{prefix}\n\n{archetype_prompt}\n\n{context}\n\n{stdin_instructions}")
 }
