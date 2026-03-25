@@ -50,7 +50,7 @@ pub async fn invoke_codex(
 
 async fn run_claude(session_id: &str, prompt: &str, project_root: &Path) -> Result<String> {
     let mut child = Command::new("claude")
-        .args(["--resume", session_id, "--print", "--permission-mode", "plan"])
+        .args(["--resume", session_id, "--print", "--permission-mode", "dontAsk"])
         .current_dir(project_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

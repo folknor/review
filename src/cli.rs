@@ -1,11 +1,25 @@
 use clap::{Parser, Subcommand};
 
 const AFTER_HELP: &str = "\
-Quick start:
+Built-in archetypes (with tailored prompts):
+  security    Auth boundaries, injection, secrets, trust assumptions
+  bugs        Logic errors, edge cases, error handling, crashes
+  perf        Allocations, complexity, hot paths, async blocking
+  arch        Coupling, abstractions, API design, consistency
+
+Custom archetypes are also supported — use any name configured in .review.md.
+Groups fan out to multiple archetypes at once (defined under _groups in .review.md).
+Use \"all\" to fan out to every configured archetype.
+
+Instructions are piped via stdin. The agents fetch code themselves —
+flags just tell them what to look at.
+
+Examples:
   review init                                                Create a .review.md
-  echo \"check for auth issues\" | review security --staged    Run a review
-  echo \"full review\" | review all --staged                   Review with all archetypes
-  echo \"check logging\" | review logging --general            Custom archetype";
+  echo \"check for auth issues\" | review security --staged    Security review of staged changes
+  echo \"full review\" | review all --general                  All archetypes, entire codebase
+  echo \"check logging\" | review logging --general            Custom archetype
+  echo \"how to handle X?\" | review competitors --general     Fan out to a group";
 
 #[derive(Parser)]
 #[command(
@@ -18,8 +32,12 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Archetype name (e.g. security, bugs, perf, arch, or custom) or "all"
+    /// Archetype, group, or "all"
     pub archetype: Option<String>,
+
+    /// Print the assembled prompt instead of sending it
+    #[arg(long)]
+    pub dry_run: bool,
 
     #[command(flatten)]
     pub input: InputSource,

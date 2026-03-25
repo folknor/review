@@ -93,6 +93,21 @@ async fn main() -> Result<()> {
         eprintln!("warning: skipping '{name}' (no sessions for host '{hostname}' in .review.md)");
     }
 
+    // Dry run: print assembled prompts and exit
+    if cli.dry_run {
+        for arch_name in &runnable {
+            let assembled = prompt::assemble(&cfg, arch_name, &context, &stdin_instructions);
+            if runnable.len() > 1 {
+                println!("=== {arch_name} ===\n");
+            }
+            println!("{assembled}");
+            if runnable.len() > 1 {
+                println!();
+            }
+        }
+        return Ok(());
+    }
+
     // Check which providers are needed and available
     let needs_claude = runnable.iter().any(|name| {
         cfg.frontmatter
