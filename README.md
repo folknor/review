@@ -82,8 +82,16 @@ Use `all` to fan out to every configured archetype, or define **groups** to fan 
 | `--range <a..b>` | "You are reviewing commits \<a..b\>." |
 | `--document <path>` | "You are reviewing the file \<path\>." |
 | `--general` | "You are reviewing the entire codebase." |
+| `--raw` | No prefix, archetype prompt, or context line — stdin only |
+| `--dry-run` | Print the assembled prompt instead of sending it |
 
 The agents fetch the actual content themselves using their project context.
+
+Use `--raw` for follow-up questions or when you want full control over the prompt:
+
+```
+echo "what did you mean by finding #3?" | review bugs --raw
+```
 
 ### Output format
 

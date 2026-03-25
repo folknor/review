@@ -39,6 +39,10 @@ pub struct Cli {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Send only the piped stdin — no prefix, archetype prompt, or context line
+    #[arg(long)]
+    pub raw: bool,
+
     #[command(flatten)]
     pub input: InputSource,
 }

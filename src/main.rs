@@ -21,15 +21,15 @@ async fn main() -> Result<()> {
         anyhow::anyhow!("no archetype specified\n  Usage: review <archetype> <flags>")
     })?;
 
-    if !cli.input.is_specified() {
+    if !cli.raw && !cli.input.is_specified() {
         bail!(
             "no input source specified\n\n\
-             Provide one of: --unstaged, --staged, --commit, --range, --document, --general"
+             Provide one of: --unstaged, --staged, --commit, --range, --document, --general\n\
+             Or use --raw to send only piped stdin"
         );
     }
 
     let (cfg, project_root) = config::load()?;
-    let context = input::context_line(&cli.input);
     let stdin_instructions = input::read_stdin()?;
 
     let hostname = config::hostname();
@@ -96,7 +96,12 @@ async fn main() -> Result<()> {
     // Dry run: print assembled prompts and exit
     if cli.dry_run {
         for arch_name in &runnable {
-            let assembled = prompt::assemble(&cfg, arch_name, &context, &stdin_instructions);
+            let assembled = if cli.raw {
+                stdin_instructions.clone()
+            } else {
+                let context = input::context_line(&cli.input);
+                prompt::assemble(&cfg, arch_name, &context, &stdin_instructions)
+            };
             if runnable.len() > 1 {
                 println!("=== {arch_name} ===\n");
             }
@@ -138,7 +143,12 @@ async fn main() -> Result<()> {
     let mut handles: Vec<(String, tokio::task::JoinHandle<provider::ProviderResult>)> = Vec::new();
 
     for arch_name in &runnable {
-        let assembled = prompt::assemble(&cfg, arch_name, &context, &stdin_instructions);
+        let assembled = if cli.raw {
+            stdin_instructions.clone()
+        } else {
+            let context = input::context_line(&cli.input);
+            prompt::assemble(&cfg, arch_name, &context, &stdin_instructions)
+        };
         let arch_cfg = cfg.frontmatter.archetypes.get(*arch_name).expect("filtered above");
         let host_cfg = arch_cfg.resolve_host(&hostname).expect("filtered above");
 
