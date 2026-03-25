@@ -5,8 +5,6 @@ use yaml_front_matter::YamlFrontMatter;
 
 const CONFIG_FILENAME: &str = ".review.md";
 
-pub const BUILTIN_ARCHETYPES: &[&str] = &["security", "bugs", "perf", "arch"];
-
 #[derive(Debug, Deserialize)]
 pub struct Frontmatter {
     #[serde(flatten)]
@@ -90,20 +88,9 @@ pub fn parse(raw: &str) -> Result<ReviewConfig> {
     let document = YamlFrontMatter::parse::<Frontmatter>(raw).map_err(|e| {
         anyhow::anyhow!(
             "failed to parse {CONFIG_FILENAME}: {e}\n  \
-             frontmatter keys must be archetype names ({}) with claude/codex sub-keys",
-            BUILTIN_ARCHETYPES.join(", ")
+             frontmatter keys must be archetype names with hostname/provider sub-keys"
         )
     })?;
-
-    // Validate archetype names
-    for name in document.metadata.archetypes.keys() {
-        if !BUILTIN_ARCHETYPES.contains(&name.as_str()) {
-            bail!(
-                "unknown archetype '{name}' in frontmatter\n  supported: {}",
-                BUILTIN_ARCHETYPES.join(", ")
-            );
-        }
-    }
 
     let archetype_prompts = parse_archetype_sections(&document.content);
 
@@ -241,7 +228,7 @@ Look for logic errors and edge cases.
     }
 
     #[test]
-    fn rejects_unknown_archetype() {
+    fn allows_custom_archetype() {
         let raw = "\
 ---
 foobar:
@@ -249,10 +236,9 @@ foobar:
     claude: \"sess-1\"
 ---
 ";
-        let result = parse(raw);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("unknown archetype 'foobar'"));
+        let cfg = parse(raw).unwrap();
+        assert!(cfg.frontmatter.archetypes.contains_key("foobar"));
+        assert!(cfg.frontmatter.archetypes["foobar"].has_sessions_for_host("myhost"));
     }
 
     #[test]

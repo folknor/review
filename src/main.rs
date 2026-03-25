@@ -7,27 +7,41 @@ mod provider;
 use anyhow::{Result, bail};
 use clap::Parser;
 
-use cli::{Cli, Command};
+use cli::Cli;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if matches!(cli.command, Command::Init) {
+    if cli.is_init() {
         return config::init();
     }
 
+    let archetype_name = cli.archetype_name().ok_or_else(|| {
+        anyhow::anyhow!("no archetype specified\n  Use a subcommand (security, bugs, perf, arch, all) or --type <name>")
+    })?;
+
+    let input = cli.input_source().expect("not init");
+    if !input.is_specified() {
+        bail!(
+            "no input source specified\n\n\
+             Provide one of: --unstaged, --staged, --commit, --range, --document, --general"
+        );
+    }
+
     let (cfg, project_root) = config::load()?;
-    let input = cli.command.input_source().expect("not init");
     let context = input::context_line(input);
     let stdin_instructions = input::read_stdin()?;
-
-    let archetype_name = cli.command.archetype_name();
 
     let hostname = config::hostname();
 
     let archetypes_to_run: Vec<&str> = if archetype_name == "all" {
-        config::BUILTIN_ARCHETYPES.to_vec()
+        // "all" runs all archetypes that have sessions, not just built-ins
+        cfg.frontmatter
+            .archetypes
+            .keys()
+            .map(String::as_str)
+            .collect()
     } else {
         vec![archetype_name]
     };
@@ -49,15 +63,16 @@ async fn main() -> Result<()> {
         .collect();
 
     if runnable.is_empty() {
-        let missing = skipped.join(", ");
+        let name = if skipped.len() == 1 { skipped[0] } else { "archetype" };
         bail!(
-            "no sessions configured for host '{hostname}': {missing}\n\n\
+            "no sessions configured for host '{hostname}': {}\n\n\
              Add session IDs to your .review.md frontmatter, e.g.:\n\
              ---\n\
-             {missing}:\n  \
+             {name}:\n  \
                {hostname}:\n    \
                  claude: \"your-session-id\"\n\
-             ---"
+             ---",
+            skipped.join(", ")
         );
     }
 
@@ -83,29 +98,29 @@ async fn main() -> Result<()> {
         let arch_cfg = cfg.frontmatter.archetypes.get(*arch_name).expect("filtered above");
         let host_cfg = arch_cfg.resolve_host(&hostname).expect("filtered above");
 
-        if claude_available {
-            if let Some(ref session_id) = host_cfg.claude {
-                let sid = session_id.clone();
-                let prompt = assembled.clone();
-                let root = project_root.clone();
-                handles.push((
-                    (*arch_name).to_string(),
-                    tokio::spawn(async move { provider::invoke_claude(&sid, &prompt, &root).await }),
-                ));
-            }
+        if claude_available
+            && let Some(ref session_id) = host_cfg.claude
+        {
+            let sid = session_id.clone();
+            let prompt = assembled.clone();
+            let root = project_root.clone();
+            handles.push((
+                (*arch_name).to_string(),
+                tokio::spawn(async move { provider::invoke_claude(&sid, &prompt, &root).await }),
+            ));
         }
 
-        if codex_available {
-            if let Some(ref session_id) = host_cfg.codex {
-                let sid = session_id.clone();
-                let aname = (*arch_name).to_string();
-                let prompt = assembled.clone();
-                let root = project_root.clone();
-                handles.push((
-                    (*arch_name).to_string(),
-                    tokio::spawn(async move { provider::invoke_codex(&sid, &aname, &prompt, &root).await }),
-                ));
-            }
+        if codex_available
+            && let Some(ref session_id) = host_cfg.codex
+        {
+            let sid = session_id.clone();
+            let aname = (*arch_name).to_string();
+            let prompt = assembled.clone();
+            let root = project_root.clone();
+            handles.push((
+                (*arch_name).to_string(),
+                tokio::spawn(async move { provider::invoke_codex(&sid, &aname, &prompt, &root).await }),
+            ));
         }
     }
 

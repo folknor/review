@@ -4,7 +4,8 @@ const AFTER_HELP: &str = "\
 Quick start:
   review init                                                Create a .review.md
   echo \"check for auth issues\" | review security --staged    Run a review
-  echo \"full review\" | review all --staged                   Review with all archetypes";
+  echo \"full review\" | review all --staged                   Review with all archetypes
+  echo \"check logging\" | review --type logging --general     Custom archetype";
 
 #[derive(Parser)]
 #[command(
@@ -14,7 +15,14 @@ Quick start:
 )]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
+
+    /// Custom archetype name (use instead of a subcommand)
+    #[arg(long = "type", global = false)]
+    pub archetype_type: Option<String>,
+
+    #[command(flatten)]
+    pub input: InputSource,
 }
 
 #[derive(Subcommand)]
@@ -53,32 +61,42 @@ pub enum Command {
     },
 }
 
-impl Command {
-    pub fn archetype_name(&self) -> &'static str {
-        match self {
-            Self::Security { .. } => "security",
-            Self::Bugs { .. } => "bugs",
-            Self::Perf { .. } => "perf",
-            Self::Arch { .. } => "arch",
-            Self::All { .. } => "all",
-            Self::Init => unreachable!(),
+impl Cli {
+    pub fn archetype_name(&self) -> Option<&str> {
+        if let Some(ref cmd) = self.command {
+            return match cmd {
+                Command::Security { .. } => Some("security"),
+                Command::Bugs { .. } => Some("bugs"),
+                Command::Perf { .. } => Some("perf"),
+                Command::Arch { .. } => Some("arch"),
+                Command::All { .. } => Some("all"),
+                Command::Init => None,
+            };
         }
+        self.archetype_type.as_deref()
     }
 
     pub fn input_source(&self) -> Option<&InputSource> {
-        match self {
-            Self::Security { input }
-            | Self::Bugs { input }
-            | Self::Perf { input }
-            | Self::Arch { input }
-            | Self::All { input } => Some(input),
-            Self::Init => None,
+        if let Some(ref cmd) = self.command {
+            return match cmd {
+                Command::Security { input }
+                | Command::Bugs { input }
+                | Command::Perf { input }
+                | Command::Arch { input }
+                | Command::All { input } => Some(input),
+                Command::Init => None,
+            };
         }
+        Some(&self.input)
+    }
+
+    pub fn is_init(&self) -> bool {
+        matches!(self.command, Some(Command::Init))
     }
 }
 
 #[derive(clap::Args)]
-#[group(required = true, multiple = false)]
+#[group(required = false, multiple = false)]
 pub struct InputSource {
     /// Review unstaged changes
     #[arg(long)]
@@ -103,4 +121,15 @@ pub struct InputSource {
     /// Review the entire codebase
     #[arg(long)]
     pub general: bool,
+}
+
+impl InputSource {
+    pub fn is_specified(&self) -> bool {
+        self.unstaged
+            || self.staged
+            || self.commit.is_some()
+            || self.range.is_some()
+            || self.document.is_some()
+            || self.general
+    }
 }
