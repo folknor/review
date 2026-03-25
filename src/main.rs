@@ -21,6 +21,10 @@ async fn main() -> Result<()> {
         anyhow::anyhow!("no archetype specified\n  Use a subcommand (security, bugs, perf, arch, all) or --type <name>")
     })?;
 
+    if archetype_name == "all" && cli.archetype_type.is_some() {
+        bail!("'all' is reserved and cannot be used as a custom archetype name");
+    }
+
     let input = cli.input_source().expect("not init");
     if !input.is_specified() {
         bail!(
@@ -36,13 +40,24 @@ async fn main() -> Result<()> {
     let hostname = config::hostname();
 
     let archetypes_to_run: Vec<&str> = if archetype_name == "all" {
-        // "all" runs all archetypes that have sessions, not just built-ins
         cfg.frontmatter
             .archetypes
             .keys()
             .map(String::as_str)
             .collect()
     } else {
+        if !cfg.frontmatter.archetypes.contains_key(archetype_name) {
+            let available: Vec<_> = cfg.frontmatter.archetypes.keys().map(String::as_str).collect();
+            bail!(
+                "archetype '{archetype_name}' not found in .review.md\n  \
+                 configured: {}",
+                if available.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    available.join(", ")
+                }
+            );
+        }
         vec![archetype_name]
     };
 
@@ -80,18 +95,34 @@ async fn main() -> Result<()> {
         eprintln!("warning: skipping '{name}' (no sessions for host '{hostname}' in .review.md)");
     }
 
-    // Assemble prompts and spawn all providers in parallel
-    let mut handles: Vec<(String, tokio::task::JoinHandle<provider::ProviderResult>)> = Vec::new();
+    // Check which providers are needed and available
+    let needs_claude = runnable.iter().any(|name| {
+        cfg.frontmatter
+            .archetypes
+            .get(*name)
+            .and_then(|a| a.resolve_host(&hostname))
+            .is_some_and(|h| h.claude.is_some())
+    });
+    let needs_codex = runnable.iter().any(|name| {
+        cfg.frontmatter
+            .archetypes
+            .get(*name)
+            .and_then(|a| a.resolve_host(&hostname))
+            .is_some_and(|h| h.codex.is_some())
+    });
 
-    let claude_available = provider::is_available("claude");
-    let codex_available = provider::is_available("codex");
+    let claude_available = !needs_claude || provider::is_available("claude");
+    let codex_available = !needs_codex || provider::is_available("codex");
 
-    if !claude_available {
+    if needs_claude && !claude_available {
         eprintln!("warning: 'claude' not found on PATH, skipping claude sessions");
     }
-    if !codex_available {
+    if needs_codex && !codex_available {
         eprintln!("warning: 'codex' not found on PATH, skipping codex sessions");
     }
+
+    // Assemble prompts and spawn all providers in parallel
+    let mut handles: Vec<(String, tokio::task::JoinHandle<provider::ProviderResult>)> = Vec::new();
 
     for arch_name in &runnable {
         let assembled = prompt::assemble(&cfg, arch_name, &context, &stdin_instructions);
@@ -125,10 +156,18 @@ async fn main() -> Result<()> {
     }
 
     if handles.is_empty() {
+        let mut missing = Vec::new();
+        if needs_claude && !claude_available {
+            missing.push("claude");
+        }
+        if needs_codex && !codex_available {
+            missing.push("codex");
+        }
         bail!(
             "no providers available to run\n\n\
-             Sessions are configured but the provider binaries are not on PATH.\n\
-             Install 'claude' and/or 'codex' to proceed."
+             Required but not found on PATH: {}\n\
+             Install the missing provider(s) to proceed.",
+            missing.join(", ")
         );
     }
 

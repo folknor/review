@@ -92,6 +92,11 @@ pub fn parse(raw: &str) -> Result<ReviewConfig> {
         )
     })?;
 
+    // "all" is reserved
+    if document.metadata.archetypes.contains_key("all") {
+        bail!("'all' is a reserved name and cannot be used as an archetype in {CONFIG_FILENAME}");
+    }
+
     let archetype_prompts = parse_archetype_sections(&document.content);
 
     Ok(ReviewConfig {
@@ -173,7 +178,7 @@ pub fn init() -> Result<()> {
     }
 
     let host = hostname();
-    let content = INIT_TEMPLATE_PREFIX.replacen("myhostname", &host, 2);
+    let content = INIT_TEMPLATE_PREFIX.replace("myhostname", &host);
     std::fs::write(&path, content)
         .map_err(|e| anyhow::anyhow!("failed to write {CONFIG_FILENAME}: {e}"))?;
 

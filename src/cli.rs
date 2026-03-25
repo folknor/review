@@ -83,7 +83,16 @@ impl Cli {
                 | Command::Bugs { input }
                 | Command::Perf { input }
                 | Command::Arch { input }
-                | Command::All { input } => Some(input),
+                | Command::All { input } => {
+                    // If flags were placed before the subcommand, clap routes them
+                    // to the top-level Cli.input. Fall back to that if the subcommand's
+                    // input is empty.
+                    if input.is_specified() {
+                        Some(input)
+                    } else {
+                        Some(&self.input)
+                    }
+                }
                 Command::Init => None,
             };
         }
