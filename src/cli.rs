@@ -37,6 +37,7 @@ pub struct Cli {
     /// Prepend grounding prefix to stdin
     #[arg(long)]
     pub anchor: bool,
+
 }
 
 impl Cli {

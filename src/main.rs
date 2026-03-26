@@ -18,6 +18,7 @@ async fn main() -> Result<()> {
         return config::init();
     }
 
+
     let archetype_name = match cli.archetype.as_deref() {
         Some(name) => name,
         None => {
