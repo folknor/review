@@ -54,7 +54,6 @@ pub fn hostname() -> String {
 #[derive(Debug)]
 pub struct ReviewConfig {
     pub frontmatter: Frontmatter,
-    pub archetype_prompts: BTreeMap<String, String>,
 }
 
 pub fn load() -> Result<(ReviewConfig, std::path::PathBuf)> {
@@ -141,46 +140,12 @@ pub fn parse(raw: &str) -> Result<ReviewConfig> {
         }
     }
 
-    let archetype_prompts = parse_archetype_sections(&document.content);
-
     Ok(ReviewConfig {
         frontmatter: Frontmatter {
             archetypes: raw_fm.archetypes,
             groups: raw_fm.groups,
         },
-        archetype_prompts,
     })
-}
-
-fn parse_archetype_sections(body: &str) -> BTreeMap<String, String> {
-    let mut sections = BTreeMap::new();
-    let mut current_name: Option<String> = None;
-    let mut current_content = String::new();
-
-    for line in body.lines() {
-        if let Some(heading) = line.strip_prefix("## ") {
-            if let Some(name) = current_name.take() {
-                let trimmed = current_content.trim().to_string();
-                if !trimmed.is_empty() {
-                    sections.insert(name, trimmed);
-                }
-            }
-            current_name = Some(heading.trim().to_lowercase());
-            current_content = String::new();
-        } else if current_name.is_some() {
-            current_content.push_str(line);
-            current_content.push('\n');
-        }
-    }
-
-    if let Some(name) = current_name {
-        let trimmed = current_content.trim().to_string();
-        if !trimmed.is_empty() {
-            sections.insert(name, trimmed);
-        }
-    }
-
-    sections
 }
 
 const INIT_TEMPLATE_PREFIX: &str = "\
@@ -201,14 +166,6 @@ const INIT_TEMPLATE_PREFIX: &str = "\
 # _groups:
 #   sweep: [security, bugs, perf]
 ---
-
-## security
-
-## bugs
-
-## perf
-
-## arch
 ";
 
 pub fn init() -> Result<()> {
@@ -249,7 +206,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_frontmatter_and_sections() {
+    fn parses_frontmatter() {
         let raw = "\
 ---
 security:
@@ -260,14 +217,6 @@ bugs:
     claude: \"sess-2\"
     codex: \"sess-3\"
 ---
-
-## security
-
-Check for auth issues and injection vectors.
-
-## bugs
-
-Look for logic errors and edge cases.
 ";
         let cfg = parse(raw).unwrap();
         assert_eq!(cfg.frontmatter.archetypes.len(), 2);
@@ -278,10 +227,6 @@ Look for logic errors and edge cases.
 
         let bugs_host = cfg.frontmatter.archetypes["bugs"].resolve_host("myhost").unwrap();
         assert!(bugs_host.codex.is_some());
-
-        assert_eq!(cfg.archetype_prompts.len(), 2);
-        assert!(cfg.archetype_prompts["security"].contains("auth issues"));
-        assert!(cfg.archetype_prompts["bugs"].contains("logic errors"));
     }
 
     #[test]
@@ -303,23 +248,6 @@ foobar:
         let raw = "# security\n\nSome content\n";
         let result = parse(raw);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn empty_sections_not_included() {
-        let raw = "\
----
-security:
-  myhost:
-    claude: \"sess-1\"
----
-
-## security
-
-## bugs
-";
-        let cfg = parse(raw).unwrap();
-        assert!(cfg.archetype_prompts.is_empty());
     }
 
     #[test]

@@ -1,5 +1,3 @@
-use crate::config::ReviewConfig;
-
 const DEFAULT_PREFIX: &str = include_str!("../prompts/prefix.md");
 const DEFAULT_PROMPT: &str = include_str!("../prompts/default.md");
 const SECURITY_PROMPT: &str = include_str!("../prompts/security.md");
@@ -18,18 +16,12 @@ fn builtin_prompt(archetype_name: &str) -> &'static str {
 }
 
 pub fn assemble(
-    config: &ReviewConfig,
     archetype_name: &str,
     context: &str,
     stdin_instructions: &str,
 ) -> String {
     let prefix = DEFAULT_PREFIX;
-
-    let archetype_prompt = config
-        .archetype_prompts
-        .get(archetype_name)
-        .map(String::as_str)
-        .unwrap_or_else(|| builtin_prompt(archetype_name));
+    let archetype_prompt = builtin_prompt(archetype_name);
 
     format!("{prefix}\n\n{archetype_prompt}\n\n{stdin_instructions}\n\n{context}")
 }

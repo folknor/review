@@ -37,10 +37,10 @@ Single binary crate, no workspace.
 ## Architecture
 
 - `src/cli.rs` — Clap CLI. Archetype is a positional arg, `init` is the only subcommand.
-- `src/config.rs` — Parses `.review.md` in cwd. YAML frontmatter for host-scoped sessions (archetype → hostname → provider), markdown `## headings` for archetype prompts, `_groups` for named archetype sets. Uses `yaml-front-matter` and `gethostname` crates.
+- `src/config.rs` — Parses `.review.md` in cwd. YAML frontmatter for host-scoped sessions (archetype → hostname → provider), `_groups` for named archetype sets. Uses `yaml-front-matter` and `gethostname` crates.
 - `src/input.rs` — Builds context line from flags (e.g. "You are reviewing staged changes."). Reads stdin instructions (required, 20KB limit).
 - `src/prompt.rs` — Assembles: compiled prefix + archetype prompt (from .review.md or built-in) + stdin instructions + context line. Built-in prompts for security, bugs, perf, arch.
-- `src/provider.rs` — Async provider invocation. Prompts piped via stdin. Claude uses `--permission-mode plan`, Codex uses `--sandbox read-only`.
+- `src/provider.rs` — Async provider invocation. Prompts piped via stdin. Claude uses `--permission-mode dontAsk`, Codex uses `--sandbox read-only`.
 - `src/main.rs` — Wires CLI to config, prompt assembly, and provider dispatch.
 - `prompts/` — Default prompt templates compiled into the binary via `include_str!`.
 
@@ -49,7 +49,7 @@ Single binary crate, no workspace.
 - The tool is a **prompt builder**, not a content fetcher. Flags like `--staged` add context hints; agents fetch the actual code themselves.
 - Providers get prompts via **stdin pipe**, not CLI args, to avoid shell argument length limits.
 - Claude runs with `--permission-mode dontAsk` (uses pre-approved permissions, rejects interactive prompts). Codex runs with `--sandbox read-only`.
-- All prompt templates are compiled into the binary. `.review.md` headings override built-in archetype prompts.
+- All prompt templates are compiled into the binary. No config-based prompt overrides.
 - No global config — `.review.md` lives in the project root.
 
 ## Config format
@@ -67,12 +67,4 @@ bugs:
 _groups:
   sweep: [security, bugs]
 ---
-
-## security
-
-Custom security review instructions here.
-
-## bugs
-
-Custom bugs review instructions here.
 ```

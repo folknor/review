@@ -141,18 +141,9 @@ _groups:
   sweep: [security, bugs]
   competitors: [tilemaker, tippecanoe]
 ---
-
-## security
-
-Custom security review instructions here.
-Overrides the built-in security prompt.
-
-## bugs
-
-Custom bugs review instructions here.
 ```
 
-Session IDs are scoped by hostname, so the same `.review.md` works across machines with different sessions. Markdown `## headings` optionally override the built-in archetype prompts.
+Session IDs are scoped by hostname, so the same `.review.md` works across machines with different sessions.
 
 ### Groups
 
@@ -170,10 +161,10 @@ Define groups in the `_groups` key of the frontmatter. Group names must not conf
 ### Claude Code
 
 ```
-claude --resume <session-id> --print --permission-mode plan
+claude --resume <session-id> --print --permission-mode dontAsk
 ```
 
-Runs in `plan` mode (read-only). Prompt piped via stdin, output captured from stdout.
+Runs in `dontAsk` mode (uses pre-approved permissions, rejects interactive prompts). Prompt piped via stdin, output captured from stdout.
 
 ### Codex
 

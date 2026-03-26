@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
                 stdin_instructions.clone()
             } else {
                 let context = input::context_line(&cli.input);
-                prompt::assemble(&cfg, arch_name, &context, &stdin_instructions)
+                prompt::assemble(arch_name, &context, &stdin_instructions)
             };
             if runnable.len() > 1 {
                 println!("=== {arch_name} ===\n");
@@ -175,7 +175,7 @@ async fn main() -> Result<()> {
             stdin_instructions.clone()
         } else {
             let context = input::context_line(&cli.input);
-            prompt::assemble(&cfg, arch_name, &context, &stdin_instructions)
+            prompt::assemble(arch_name, &context, &stdin_instructions)
         };
         let arch_cfg = cfg.frontmatter.archetypes.get(*arch_name).expect("filtered above");
         let host_cfg = arch_cfg.resolve_host(&hostname).expect("filtered above");
