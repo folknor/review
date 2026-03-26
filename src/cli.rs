@@ -34,7 +34,7 @@ pub struct Cli {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Prepend grounding prefix and archetype prompt to stdin
+    /// Prepend grounding prefix to stdin
     #[arg(long)]
     pub anchor: bool,
 }

@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
         Some(name) => name,
         None => {
             Cli::print_help();
-            std::process::exit(0);
+            std::process::exit(2);
         }
     };
 
@@ -80,18 +80,17 @@ async fn main() -> Result<()> {
         if skipped.is_empty() {
             bail!(
                 "no archetypes configured in .review.toml\n\n\
-                 Run `review init` to create a starter config."
+                 Add session IDs to your .review.toml, e.g.:\n\n\
+                 [security.{hostname}]\n\
+                 claude = \"your-session-id\""
             );
         }
         let example = skipped[0];
         bail!(
             "no sessions configured for host '{hostname}': {}\n\n\
-             Add session IDs to your .review.toml frontmatter, e.g.:\n\
-             ---\n\
-             {example}:\n  \
-               {hostname}:\n    \
-                 claude: \"your-session-id\"\n\
-             ---",
+             Add session IDs to your .review.toml, e.g.:\n\n\
+             [{example}.{hostname}]\n\
+             claude = \"your-session-id\"",
             skipped.join(", ")
         );
     }
