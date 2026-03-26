@@ -147,3 +147,7 @@ codex exec --sandbox read-only resume <session-id> -o <file>
 Runs in read-only sandbox. Prompt piped via stdin, output captured from the `-o` file.
 
 Both providers run in parallel. If one fails, the other's results are still shown. Providers whose binaries aren't installed are skipped with a warning.
+
+## License
+
+[MIT](LICENSE)

@@ -2,6 +2,7 @@
 name = "review"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 rust-version = "1.92"
 
 [dependencies]
@@ -9,9 +10,9 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
-toml = "0.8"
-gethostname = "0.5"
-which = "7"
+toml = "1"
+gethostname = "1"
+which = "8"
 
 [lints.clippy]
 # Style: modern idiomatic Rust
