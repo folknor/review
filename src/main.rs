@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod input;
+mod prompt;
 mod provider;
 
 use anyhow::{Result, bail};
@@ -102,10 +103,15 @@ async fn main() -> Result<()> {
     // Dry run: print what would be sent and exit
     if cli.dry_run {
         for arch_name in &runnable {
+            let prompt = if cli.anchor {
+                prompt::assemble(arch_name, &stdin_instructions)
+            } else {
+                stdin_instructions.clone()
+            };
             if runnable.len() > 1 {
                 println!("=== {arch_name} ===\n");
             }
-            println!("{stdin_instructions}");
+            println!("{prompt}");
             if runnable.len() > 1 {
                 println!();
             }
@@ -143,6 +149,11 @@ async fn main() -> Result<()> {
     let mut handles: Vec<(String, tokio::task::JoinHandle<provider::ProviderResult>)> = Vec::new();
 
     for arch_name in &runnable {
+        let assembled = if cli.anchor {
+            prompt::assemble(arch_name, &stdin_instructions)
+        } else {
+            stdin_instructions.clone()
+        };
         let arch_cfg = cfg.archetypes.get(*arch_name).expect("filtered above");
         let host_cfg = arch_cfg.resolve_host(&hostname).expect("filtered above");
 
@@ -150,7 +161,7 @@ async fn main() -> Result<()> {
             && let Some(ref session_id) = host_cfg.claude
         {
             let sid = session_id.clone();
-            let prompt = stdin_instructions.clone();
+            let prompt = assembled.clone();
             let root = project_root.clone();
             handles.push((
                 (*arch_name).to_string(),
@@ -163,7 +174,7 @@ async fn main() -> Result<()> {
         {
             let sid = session_id.clone();
             let aname = (*arch_name).to_string();
-            let prompt = stdin_instructions.clone();
+            let prompt = assembled.clone();
             let root = project_root.clone();
             handles.push((
                 (*arch_name).to_string(),

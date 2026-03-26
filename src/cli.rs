@@ -38,6 +38,10 @@ pub struct Cli {
     /// Print the assembled prompt instead of sending it
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Prepend grounding prefix and archetype prompt to stdin
+    #[arg(long)]
+    pub anchor: bool,
 }
 
 impl Cli {

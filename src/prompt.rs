@@ -15,13 +15,9 @@ fn builtin_prompt(archetype_name: &str) -> &'static str {
     }
 }
 
-pub fn assemble(
-    archetype_name: &str,
-    context: &str,
-    stdin_instructions: &str,
-) -> String {
+pub fn assemble(archetype_name: &str, stdin_instructions: &str) -> String {
     let prefix = DEFAULT_PREFIX;
     let archetype_prompt = builtin_prompt(archetype_name);
 
-    format!("{prefix}\n\n{archetype_prompt}\n\n{stdin_instructions}\n\n{context}")
+    format!("{prefix}\n\n{archetype_prompt}\n\n{stdin_instructions}")
 }
