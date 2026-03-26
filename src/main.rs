@@ -1,7 +1,6 @@
 mod cli;
 mod config;
 mod input;
-mod prompt;
 mod provider;
 
 use anyhow::{Result, bail};
@@ -17,7 +16,6 @@ async fn main() -> Result<()> {
         return config::init();
     }
 
-    // #1/#2: No archetype → print help
     let archetype_name = match cli.archetype.as_deref() {
         Some(name) => name,
         None => {
@@ -26,30 +24,11 @@ async fn main() -> Result<()> {
         }
     };
 
-    if cli.raw && cli.input.is_specified() {
-        bail!(
-            "--raw cannot be combined with review scope flags\n\n\
-             With --raw you need to provide the entire context yourself;\n\
-             pointers to documents, git hashes, whatever."
-        );
-    }
-
-    // #3: "review scope" not "input source"
-    if !cli.raw && !cli.input.is_specified() {
-        bail!(
-            "no review scope specified\n\n\
-             Tell the agent what to look at:\n  \
-             --unstaged, --staged, --commit, --range, --document, --general\n\
-             Or use --raw to send only piped stdin"
-        );
-    }
-
     let (cfg, project_root) = config::load()?;
     let stdin_instructions = input::read_stdin()?;
 
     let hostname = config::hostname();
 
-    // #9/#10: Show config path and hostname in dry-run
     if cli.dry_run {
         eprintln!("config: {}", project_root.join(".review.md").display());
         eprintln!("hostname: {hostname}");
@@ -96,7 +75,6 @@ async fn main() -> Result<()> {
         .copied()
         .collect();
 
-    // #6: Better error for empty results
     if runnable.is_empty() {
         if skipped.is_empty() {
             bail!(
@@ -121,19 +99,13 @@ async fn main() -> Result<()> {
         eprintln!("warning: skipping '{name}' (no sessions for host '{hostname}' in .review.md)");
     }
 
-    // Dry run: print assembled prompts and exit
+    // Dry run: print what would be sent and exit
     if cli.dry_run {
         for arch_name in &runnable {
-            let assembled = if cli.raw {
-                stdin_instructions.clone()
-            } else {
-                let context = input::context_line(&cli.input);
-                prompt::assemble(arch_name, &context, &stdin_instructions)
-            };
             if runnable.len() > 1 {
                 println!("=== {arch_name} ===\n");
             }
-            println!("{assembled}");
+            println!("{stdin_instructions}");
             if runnable.len() > 1 {
                 println!();
             }
@@ -167,16 +139,10 @@ async fn main() -> Result<()> {
         eprintln!("warning: 'codex' not found on PATH, skipping codex sessions");
     }
 
-    // Assemble prompts and spawn all providers in parallel
+    // Spawn all providers in parallel
     let mut handles: Vec<(String, tokio::task::JoinHandle<provider::ProviderResult>)> = Vec::new();
 
     for arch_name in &runnable {
-        let assembled = if cli.raw {
-            stdin_instructions.clone()
-        } else {
-            let context = input::context_line(&cli.input);
-            prompt::assemble(arch_name, &context, &stdin_instructions)
-        };
         let arch_cfg = cfg.frontmatter.archetypes.get(*arch_name).expect("filtered above");
         let host_cfg = arch_cfg.resolve_host(&hostname).expect("filtered above");
 
@@ -184,7 +150,7 @@ async fn main() -> Result<()> {
             && let Some(ref session_id) = host_cfg.claude
         {
             let sid = session_id.clone();
-            let prompt = assembled.clone();
+            let prompt = stdin_instructions.clone();
             let root = project_root.clone();
             handles.push((
                 (*arch_name).to_string(),
@@ -197,7 +163,7 @@ async fn main() -> Result<()> {
         {
             let sid = session_id.clone();
             let aname = (*arch_name).to_string();
-            let prompt = assembled.clone();
+            let prompt = stdin_instructions.clone();
             let root = project_root.clone();
             handles.push((
                 (*arch_name).to_string(),
@@ -235,7 +201,7 @@ async fn main() -> Result<()> {
         grouped.push((arch_name, result));
     }
 
-    // Print results (#11: errors to stderr)
+    // Print results
     let multi = runnable.len() > 1;
     let mut current_arch = "";
     for (arch_name, result) in &grouped {
@@ -249,7 +215,6 @@ async fn main() -> Result<()> {
         provider::print_result(result);
     }
 
-    // #5: Non-zero exit when all providers failed
     let all_failed = grouped.iter().all(|(_, r)| r.output.is_err());
     if all_failed {
         std::process::exit(1);
