@@ -55,16 +55,7 @@ Instructions are piped via stdin (required, 20KB limit). The archetype routes to
 
 ### Archetypes
 
-Built-in archetypes have tailored prompts (used with `--anchor`):
-
-| Archetype | Focus |
-|-----------|-------|
-| `security` | Auth boundaries, injection, secrets, trust assumptions |
-| `bugs` | Logic errors, edge cases, error handling, crashes |
-| `perf` | Allocations, complexity, hot paths, async blocking |
-| `arch` | Coupling, abstractions, API design, consistency |
-
-Custom archetype names are also supported — any name works.
+Archetypes are named reviewer sessions defined in `.review.toml`. Any name works — use whatever fits your project (security, bugs, perf, tilemaker, planetiler, etc.).
 
 Use `all` to fan out to every configured archetype, or define **groups** to fan out to a named subset.
 

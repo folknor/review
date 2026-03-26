@@ -104,7 +104,7 @@ async fn main() -> Result<()> {
     if cli.dry_run {
         for arch_name in &runnable {
             let prompt = if cli.anchor {
-                prompt::assemble(arch_name, &stdin_instructions)
+                prompt::assemble(&stdin_instructions)
             } else {
                 stdin_instructions.clone()
             };
@@ -150,7 +150,7 @@ async fn main() -> Result<()> {
 
     for arch_name in &runnable {
         let assembled = if cli.anchor {
-            prompt::assemble(arch_name, &stdin_instructions)
+            prompt::assemble(&stdin_instructions)
         } else {
             stdin_instructions.clone()
         };

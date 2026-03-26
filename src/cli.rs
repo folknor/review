@@ -1,14 +1,8 @@
 use clap::{CommandFactory, Parser, Subcommand};
 
 const AFTER_HELP: &str = "\
-Built-in archetypes (with tailored prompts when using --anchor):
-  security    Auth boundaries, injection, secrets, trust assumptions
-  bugs        Logic errors, edge cases, error handling, crashes
-  perf        Allocations, complexity, hot paths, async blocking
-  arch        Coupling, abstractions, API design, consistency
-
-Custom archetypes are also supported — use any name configured in .review.toml.
-Groups fan out to multiple archetypes at once (defined under _groups in .review.toml).
+Archetypes are named reviewer sessions defined in .review.toml.
+Groups fan out to multiple archetypes (defined under [_groups]).
 Use \"all\" to fan out to every configured archetype.
 
 Pipe instructions via stdin. Sessions are persistent — the agents
@@ -19,6 +13,7 @@ Examples:
   echo \"review staged changes for auth issues\" | review security   Send to security sessions
   echo \"full review please\" | review all                           Fan out to all archetypes
   echo \"how to handle X?\" | review competitors                     Fan out to a group
+  echo \"re-anchor please\" | review bugs --anchor                   Prepend grounding prefix
   echo \"check for issues\" | review bugs --dry-run                  Preview the prompt";
 
 #[derive(Parser)]
