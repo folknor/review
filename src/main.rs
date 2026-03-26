@@ -30,26 +30,26 @@ async fn main() -> Result<()> {
     let hostname = config::hostname();
 
     if cli.dry_run {
-        eprintln!("config: {}", project_root.join(".review.md").display());
+        eprintln!("config: {}", project_root.join(".review.toml").display());
         eprintln!("hostname: {hostname}");
     }
 
     let archetypes_to_run: Vec<&str> = if archetype_name == "all" {
-        cfg.frontmatter
+        cfg
             .archetypes
             .keys()
             .map(String::as_str)
             .collect()
-    } else if let Some(group) = cfg.frontmatter.groups.get(archetype_name) {
+    } else if let Some(group) = cfg.groups.get(archetype_name) {
         group.iter().map(String::as_str).collect()
-    } else if cfg.frontmatter.archetypes.contains_key(archetype_name) {
+    } else if cfg.archetypes.contains_key(archetype_name) {
         vec![archetype_name]
     } else {
-        let mut available: Vec<&str> = cfg.frontmatter.archetypes.keys().map(String::as_str).collect();
-        let groups: Vec<&str> = cfg.frontmatter.groups.keys().map(String::as_str).collect();
+        let mut available: Vec<&str> = cfg.archetypes.keys().map(String::as_str).collect();
+        let groups: Vec<&str> = cfg.groups.keys().map(String::as_str).collect();
         available.extend(groups);
         bail!(
-            "'{archetype_name}' not found in .review.md\n  \
+            "'{archetype_name}' not found in .review.toml\n  \
              configured: {}",
             if available.is_empty() {
                 "(none)".to_string()
@@ -64,7 +64,7 @@ async fn main() -> Result<()> {
     let runnable: Vec<&str> = archetypes_to_run
         .iter()
         .filter(|name| {
-            if let Some(arch) = cfg.frontmatter.archetypes.get(**name)
+            if let Some(arch) = cfg.archetypes.get(**name)
                 && arch.has_sessions_for_host(&hostname)
             {
                 return true;
@@ -78,14 +78,14 @@ async fn main() -> Result<()> {
     if runnable.is_empty() {
         if skipped.is_empty() {
             bail!(
-                "no archetypes configured in .review.md\n\n\
+                "no archetypes configured in .review.toml\n\n\
                  Run `review init` to create a starter config."
             );
         }
         let example = skipped[0];
         bail!(
             "no sessions configured for host '{hostname}': {}\n\n\
-             Add session IDs to your .review.md frontmatter, e.g.:\n\
+             Add session IDs to your .review.toml frontmatter, e.g.:\n\
              ---\n\
              {example}:\n  \
                {hostname}:\n    \
@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
     }
 
     for name in &skipped {
-        eprintln!("warning: skipping '{name}' (no sessions for host '{hostname}' in .review.md)");
+        eprintln!("warning: skipping '{name}' (no sessions for host '{hostname}' in .review.toml)");
     }
 
     // Dry run: print what would be sent and exit
@@ -115,14 +115,14 @@ async fn main() -> Result<()> {
 
     // Check which providers are needed and available
     let needs_claude = runnable.iter().any(|name| {
-        cfg.frontmatter
+        cfg
             .archetypes
             .get(*name)
             .and_then(|a| a.resolve_host(&hostname))
             .is_some_and(|h| h.claude.is_some())
     });
     let needs_codex = runnable.iter().any(|name| {
-        cfg.frontmatter
+        cfg
             .archetypes
             .get(*name)
             .and_then(|a| a.resolve_host(&hostname))
@@ -143,7 +143,7 @@ async fn main() -> Result<()> {
     let mut handles: Vec<(String, tokio::task::JoinHandle<provider::ProviderResult>)> = Vec::new();
 
     for arch_name in &runnable {
-        let arch_cfg = cfg.frontmatter.archetypes.get(*arch_name).expect("filtered above");
+        let arch_cfg = cfg.archetypes.get(*arch_name).expect("filtered above");
         let host_cfg = arch_cfg.resolve_host(&hostname).expect("filtered above");
 
         if claude_available

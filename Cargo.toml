@@ -9,7 +9,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
-yaml-front-matter = "0.1.0"
+toml = "0.8"
 gethostname = "0.5"
 which = "7"
 

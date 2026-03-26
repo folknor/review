@@ -7,15 +7,15 @@ Built-in archetypes (with tailored prompts when using --anchor):
   perf        Allocations, complexity, hot paths, async blocking
   arch        Coupling, abstractions, API design, consistency
 
-Custom archetypes are also supported — use any name configured in .review.md.
-Groups fan out to multiple archetypes at once (defined under _groups in .review.md).
+Custom archetypes are also supported — use any name configured in .review.toml.
+Groups fan out to multiple archetypes at once (defined under _groups in .review.toml).
 Use \"all\" to fan out to every configured archetype.
 
 Pipe instructions via stdin. Sessions are persistent — the agents
 already have project context from previous interactions.
 
 Examples:
-  review init                                              Create a .review.md
+  review init                                              Create a .review.toml
   echo \"review staged changes for auth issues\" | review security   Send to security sessions
   echo \"full review please\" | review all                           Fan out to all archetypes
   echo \"how to handle X?\" | review competitors                     Fan out to a group
@@ -49,6 +49,6 @@ impl Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Create a starter .review.md in the current directory
+    /// Create a starter .review.toml in the current directory
     Init,
 }

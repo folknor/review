@@ -1,12 +1,11 @@
 use anyhow::{Result, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use yaml_front_matter::YamlFrontMatter;
 
-const CONFIG_FILENAME: &str = ".review.md";
+const CONFIG_FILENAME: &str = ".review.toml";
 
 #[derive(Debug, Deserialize)]
-pub struct RawFrontmatter {
+pub struct RawConfig {
     #[serde(default, rename = "_groups")]
     pub groups: BTreeMap<String, Vec<String>>,
     #[serde(flatten)]
@@ -14,7 +13,7 @@ pub struct RawFrontmatter {
 }
 
 #[derive(Debug)]
-pub struct Frontmatter {
+pub struct ReviewConfig {
     pub archetypes: BTreeMap<String, ArchetypeConfig>,
     pub groups: BTreeMap<String, Vec<String>>,
 }
@@ -33,7 +32,6 @@ pub struct HostConfig {
 }
 
 impl ArchetypeConfig {
-    /// Resolve config for the current hostname. Returns None if this host has no entry.
     pub fn resolve_host(&self, hostname: &str) -> Option<&HostConfig> {
         self.hosts.get(hostname)
     }
@@ -49,11 +47,6 @@ pub fn hostname() -> String {
     gethostname::gethostname()
         .to_string_lossy()
         .to_string()
-}
-
-#[derive(Debug)]
-pub struct ReviewConfig {
-    pub frontmatter: Frontmatter,
 }
 
 pub fn load() -> Result<(ReviewConfig, std::path::PathBuf)> {
@@ -74,7 +67,6 @@ fn find_config() -> Result<std::path::PathBuf> {
         if candidate.exists() {
             return Ok(candidate);
         }
-        // Stop at git root — don't walk above the repository
         if dir.join(".git").exists() {
             bail!(
                 "no {CONFIG_FILENAME} found (searched up to git root: {})\n\n\
@@ -92,42 +84,36 @@ fn find_config() -> Result<std::path::PathBuf> {
 }
 
 pub fn parse(raw: &str) -> Result<ReviewConfig> {
-    let document = YamlFrontMatter::parse::<RawFrontmatter>(raw).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to parse {CONFIG_FILENAME}: {e}\n  \
-             frontmatter keys must be archetype names with hostname/provider sub-keys"
-        )
-    })?;
-
-    let raw_fm = document.metadata;
+    let raw_cfg: RawConfig = toml::from_str(raw)
+        .map_err(|e| anyhow::anyhow!("failed to parse {CONFIG_FILENAME}: {e}"))?;
 
     // Reserved names
     for reserved in ["all", "init"] {
-        if raw_fm.archetypes.contains_key(reserved) {
+        if raw_cfg.archetypes.contains_key(reserved) {
             bail!("'{reserved}' is a reserved name and cannot be used as an archetype in {CONFIG_FILENAME}");
         }
     }
 
     // Validate group names
-    for name in raw_fm.groups.keys() {
+    for name in raw_cfg.groups.keys() {
         for reserved in ["all", "init"] {
             if name == reserved {
                 bail!("'{reserved}' is a reserved name and cannot be used as a group in {CONFIG_FILENAME}");
             }
         }
-        if raw_fm.archetypes.contains_key(name) {
+        if raw_cfg.archetypes.contains_key(name) {
             bail!("group '{name}' conflicts with an archetype of the same name in {CONFIG_FILENAME}");
         }
     }
 
     // Validate group members: must exist, no duplicates, not empty
-    for (group_name, members) in &raw_fm.groups {
+    for (group_name, members) in &raw_cfg.groups {
         if members.is_empty() {
             bail!("group '{group_name}' is empty in {CONFIG_FILENAME}");
         }
         let mut seen = std::collections::HashSet::new();
         for member in members {
-            if !raw_fm.archetypes.contains_key(member) {
+            if !raw_cfg.archetypes.contains_key(member) {
                 bail!(
                     "group '{group_name}' references unknown archetype '{member}' in {CONFIG_FILENAME}"
                 );
@@ -141,31 +127,26 @@ pub fn parse(raw: &str) -> Result<ReviewConfig> {
     }
 
     Ok(ReviewConfig {
-        frontmatter: Frontmatter {
-            archetypes: raw_fm.archetypes,
-            groups: raw_fm.groups,
-        },
+        archetypes: raw_cfg.archetypes,
+        groups: raw_cfg.groups,
     })
 }
 
 const INIT_TEMPLATE_PREFIX: &str = "\
----
 # Session IDs are scoped by hostname.
 # Archetypes with built-in prompts: security, bugs, perf, arch
 # Custom archetype names are also supported.
 #
-# security:
-#   myhostname:
-#     claude: \"your-claude-session-id\"
-#     codex: \"your-codex-session-id\"
-# bugs:
-#   myhostname:
-#     claude: \"your-claude-session-id\"
+# [security.myhostname]
+# claude = \"your-claude-session-id\"
+# codex = \"your-codex-session-id\"
+#
+# [bugs.myhostname]
+# claude = \"your-claude-session-id\"
 #
 # Groups fan out to multiple archetypes:
-# _groups:
-#   sweep: [security, bugs, perf]
----
+# [_groups]
+# sweep = [\"security\", \"bugs\", \"perf\"]
 ";
 
 pub fn init() -> Result<()> {
@@ -177,7 +158,6 @@ pub fn init() -> Result<()> {
         bail!("{CONFIG_FILENAME} already exists in current directory");
     }
 
-    // Warn if a parent directory already has one
     if let Ok(existing) = find_config() {
         bail!(
             "{CONFIG_FILENAME} already exists at {}\n  \
@@ -194,9 +174,8 @@ pub fn init() -> Result<()> {
     println!("Created {CONFIG_FILENAME}");
     println!();
     println!("Next steps:");
-    println!("  1. Add your session IDs under your hostname ({host}) in the frontmatter");
-    println!("  2. Optionally add review instructions under each ## heading");
-    println!("  3. Run: echo \"check for issues\" | review security --staged");
+    println!("  1. Add your session IDs under [archetype.{host}] tables");
+    println!("  2. Run: echo \"check for issues\" | review security");
     Ok(())
 }
 
@@ -206,48 +185,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_frontmatter() {
+    fn parses_config() {
         let raw = "\
----
-security:
-  myhost:
-    claude: \"sess-1\"
-bugs:
-  myhost:
-    claude: \"sess-2\"
-    codex: \"sess-3\"
----
+[security.myhost]
+claude = \"sess-1\"
+
+[bugs.myhost]
+claude = \"sess-2\"
+codex = \"sess-3\"
 ";
         let cfg = parse(raw).unwrap();
-        assert_eq!(cfg.frontmatter.archetypes.len(), 2);
+        assert_eq!(cfg.archetypes.len(), 2);
 
-        let sec_host = cfg.frontmatter.archetypes["security"].resolve_host("myhost").unwrap();
+        let sec_host = cfg.archetypes["security"].resolve_host("myhost").unwrap();
         assert_eq!(sec_host.claude.as_deref(), Some("sess-1"));
         assert!(sec_host.codex.is_none());
 
-        let bugs_host = cfg.frontmatter.archetypes["bugs"].resolve_host("myhost").unwrap();
+        let bugs_host = cfg.archetypes["bugs"].resolve_host("myhost").unwrap();
         assert!(bugs_host.codex.is_some());
     }
 
     #[test]
     fn allows_custom_archetype() {
         let raw = "\
----
-foobar:
-  myhost:
-    claude: \"sess-1\"
----
+[foobar.myhost]
+claude = \"sess-1\"
 ";
         let cfg = parse(raw).unwrap();
-        assert!(cfg.frontmatter.archetypes.contains_key("foobar"));
-        assert!(cfg.frontmatter.archetypes["foobar"].has_sessions_for_host("myhost"));
+        assert!(cfg.archetypes.contains_key("foobar"));
+        assert!(cfg.archetypes["foobar"].has_sessions_for_host("myhost"));
     }
 
     #[test]
-    fn missing_frontmatter_errors() {
-        let raw = "# security\n\nSome content\n";
-        let result = parse(raw);
-        assert!(result.is_err());
+    fn empty_config_parses() {
+        let raw = "";
+        let cfg = parse(raw).unwrap();
+        assert!(cfg.archetypes.is_empty());
     }
 
     #[test]
@@ -271,16 +244,14 @@ foobar:
     #[test]
     fn multiple_hosts() {
         let raw = "\
----
-security:
-  host-a:
-    claude: \"sess-a\"
-  host-b:
-    codex: \"sess-b\"
----
+[security.host-a]
+claude = \"sess-a\"
+
+[security.host-b]
+codex = \"sess-b\"
 ";
         let cfg = parse(raw).unwrap();
-        let sec = &cfg.frontmatter.archetypes["security"];
+        let sec = &cfg.archetypes["security"];
         assert!(sec.has_sessions_for_host("host-a"));
         assert!(sec.has_sessions_for_host("host-b"));
         assert!(!sec.has_sessions_for_host("host-c"));
@@ -291,36 +262,32 @@ security:
     #[test]
     fn parses_groups() {
         let raw = "\
----
-security:
-  myhost:
-    claude: \"sess-1\"
-bugs:
-  myhost:
-    claude: \"sess-2\"
-perf:
-  myhost:
-    claude: \"sess-3\"
-_groups:
-  sweep: [security, bugs, perf]
----
+[security.myhost]
+claude = \"sess-1\"
+
+[bugs.myhost]
+claude = \"sess-2\"
+
+[perf.myhost]
+claude = \"sess-3\"
+
+[_groups]
+sweep = [\"security\", \"bugs\", \"perf\"]
 ";
         let cfg = parse(raw).unwrap();
-        assert_eq!(cfg.frontmatter.groups.len(), 1);
-        assert_eq!(cfg.frontmatter.groups["sweep"], vec!["security", "bugs", "perf"]);
-        assert!(!cfg.frontmatter.archetypes.contains_key("_groups"));
+        assert_eq!(cfg.groups.len(), 1);
+        assert_eq!(cfg.groups["sweep"], vec!["security", "bugs", "perf"]);
+        assert!(!cfg.archetypes.contains_key("_groups"));
     }
 
     #[test]
     fn group_with_unknown_member_errors() {
         let raw = "\
----
-security:
-  myhost:
-    claude: \"sess-1\"
-_groups:
-  sweep: [security, nonexistent]
----
+[security.myhost]
+claude = \"sess-1\"
+
+[_groups]
+sweep = [\"security\", \"nonexistent\"]
 ";
         let result = parse(raw);
         assert!(result.is_err());
@@ -331,13 +298,11 @@ _groups:
     #[test]
     fn group_name_conflicts_with_archetype() {
         let raw = "\
----
-security:
-  myhost:
-    claude: \"sess-1\"
-_groups:
-  security: [security]
----
+[security.myhost]
+claude = \"sess-1\"
+
+[_groups]
+security = [\"security\"]
 ";
         let result = parse(raw);
         assert!(result.is_err());
