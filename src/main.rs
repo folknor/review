@@ -79,11 +79,12 @@ async fn main() -> Result<()> {
         .collect();
 
     if runnable.is_empty() {
+        let host_key = config::toml_key(&hostname);
         if skipped.is_empty() {
             bail!(
                 "no archetypes configured in .review.toml\n\n\
                  Add session IDs to your .review.toml, e.g.:\n\n\
-                 [security.{hostname}]\n\
+                 [security.{host_key}]\n\
                  claude = \"your-session-id\""
             );
         }
@@ -91,7 +92,7 @@ async fn main() -> Result<()> {
         bail!(
             "no sessions configured for host '{hostname}': {}\n\n\
              Add session IDs to your .review.toml, e.g.:\n\n\
-             [{example}.{hostname}]\n\
+             [{example}.{host_key}]\n\
              claude = \"your-session-id\"",
             skipped.join(", ")
         );

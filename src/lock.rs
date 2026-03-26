@@ -12,13 +12,19 @@ pub fn acquire_blocking(file: &File) -> Result<()> {
         return Ok(());
     }
 
+    // Check if it's actually contention
+    let err = std::io::Error::last_os_error();
+    if err.kind() != std::io::ErrorKind::WouldBlock {
+        bail!("failed to acquire lock: {err}");
+    }
+
     // Lock is held by another process — wait
     eprintln!("Waiting for another review to finish...");
     let start = std::time::Instant::now();
 
     let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
     if ret != 0 {
-        bail!("failed to acquire global lock: {}", std::io::Error::last_os_error());
+        bail!("failed to acquire lock: {}", std::io::Error::last_os_error());
     }
 
     let elapsed = start.elapsed();

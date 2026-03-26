@@ -148,6 +148,12 @@ Runs in read-only sandbox. Prompt piped via stdin, output captured from the `-o`
 
 Both providers run in parallel. If one fails, the other's results are still shown. Providers whose binaries aren't installed are skipped with a warning.
 
+## Concurrency
+
+A global file lock (`/tmp/review.lock`) ensures only one `review` invocation runs providers at a time. Additional invocations queue and wait automatically. This prevents thrashing when multiple projects or terminals launch reviews simultaneously.
+
+Note: the lock is shared across all users on the machine. On shared dev machines, one user's review will block another's.
+
 ## License
 
 [MIT](LICENSE)

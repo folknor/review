@@ -49,6 +49,15 @@ pub fn hostname() -> String {
         .to_string()
 }
 
+/// Format a hostname as a TOML key, quoting only if it contains dots.
+pub fn toml_key(key: &str) -> String {
+    if key.contains('.') {
+        format!("\"{key}\"")
+    } else {
+        key.to_string()
+    }
+}
+
 pub fn load() -> Result<(ReviewConfig, std::path::PathBuf)> {
     let path = find_config()?;
     let project_root = path.parent().expect("config file has parent dir").to_path_buf();
@@ -167,14 +176,15 @@ pub fn init() -> Result<()> {
     }
 
     let host = hostname();
-    let content = INIT_TEMPLATE_PREFIX.replace("myhostname", &host);
+    let content = INIT_TEMPLATE_PREFIX.replace("myhostname", &toml_key(&host));
     std::fs::write(&path, content)
         .map_err(|e| anyhow::anyhow!("failed to write {CONFIG_FILENAME}: {e}"))?;
 
     println!("Created {CONFIG_FILENAME}");
     println!();
     println!("Next steps:");
-    println!("  1. Add your session IDs under [archetype.{host}] tables");
+    let host_key = toml_key(&host);
+    println!("  1. Add your session IDs under [archetype.{host_key}] tables");
     println!("  2. Run: echo \"check for issues\" | review security");
     Ok(())
 }
