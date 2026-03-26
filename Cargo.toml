@@ -10,6 +10,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
+libc = "0.2"
 toml = "1"
 gethostname = "1"
 which = "8"

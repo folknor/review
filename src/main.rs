@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod input;
+mod lock;
 mod prompt;
 mod provider;
 
@@ -117,6 +118,13 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+
+    // Global lock — one review invocation at a time across all projects.
+    // Uses flock(2) advisory lock; released automatically when lock_file is dropped.
+    let lock_path = std::env::temp_dir().join("review.lock");
+    let lock_file = std::fs::File::create(&lock_path)
+        .map_err(|e| anyhow::anyhow!("failed to create lock file: {e}"))?;
+    lock::acquire_blocking(&lock_file)?;
 
     // Check which providers are needed and available
     let needs_claude = runnable.iter().any(|name| {

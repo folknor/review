@@ -277,6 +277,7 @@ dependencies = [
  "anyhow",
  "clap",
  "gethostname",
+ "libc",
  "serde",
  "tokio",
  "toml",
