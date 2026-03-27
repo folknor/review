@@ -18,7 +18,6 @@ async fn main() -> Result<()> {
         return config::init();
     }
 
-
     let archetype_name = match cli.archetype.as_deref() {
         Some(name) => name,
         None => {
@@ -32,17 +31,18 @@ async fn main() -> Result<()> {
 
     let hostname = config::hostname();
 
+    // Provider filter from --provider flag
+    let provider_filter: Option<Vec<&str>> = cli.provider.as_ref().map(|v| {
+        v.iter().map(String::as_str).collect()
+    });
+
     if cli.dry_run {
         eprintln!("config: {}", project_root.join(".review.toml").display());
         eprintln!("hostname: {hostname}");
     }
 
     let archetypes_to_run: Vec<&str> = if archetype_name == "all" {
-        cfg
-            .archetypes
-            .keys()
-            .map(String::as_str)
-            .collect()
+        cfg.archetypes.keys().map(String::as_str).collect()
     } else if let Some(group) = cfg.groups.get(archetype_name) {
         group.iter().map(String::as_str).collect()
     } else if cfg.archetypes.contains_key(archetype_name) {
@@ -121,26 +121,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Global lock — one review invocation at a time across all projects.
-    // Uses flock(2) advisory lock; released automatically when lock_file is dropped.
+    // Global lock
     let lock_path = std::env::temp_dir().join("review.lock");
     let lock_file = std::fs::File::create(&lock_path)
         .map_err(|e| anyhow::anyhow!("failed to create lock file: {e}"))?;
     lock::acquire_blocking(&lock_file)?;
-
-    // Determine which providers to use
-    let use_claude = !cli.codex;
-    let use_codex = !cli.claude;
-
-    let claude_available = use_claude && provider::is_available("claude");
-    let codex_available = use_codex && provider::is_available("codex");
-
-    if use_claude && !claude_available {
-        eprintln!("warning: 'claude' not found on PATH, skipping claude sessions");
-    }
-    if use_codex && !codex_available {
-        eprintln!("warning: 'codex' not found on PATH, skipping codex sessions");
-    }
 
     // Spawn all providers in parallel
     let mut handles: Vec<(String, tokio::task::JoinHandle<provider::ProviderResult>)> = Vec::new();
@@ -154,45 +139,39 @@ async fn main() -> Result<()> {
         let arch_cfg = cfg.archetypes.get(*arch_name).expect("filtered above");
         let host_cfg = arch_cfg.resolve_host(&hostname).expect("filtered above");
 
-        if claude_available
-            && let Some(ref session_id) = host_cfg.claude
-        {
-            let sid = session_id.clone();
-            let prompt = assembled.clone();
-            let root = project_root.clone();
-            handles.push((
-                (*arch_name).to_string(),
-                tokio::spawn(async move { provider::invoke_claude(&sid, &prompt, &root).await }),
-            ));
-        }
+        for (prov_name, entry) in &host_cfg.providers {
+            // Skip if --provider filter is set and this provider isn't in it
+            if let Some(ref filter) = provider_filter
+                && !filter.contains(&prov_name.as_str())
+            {
+                continue;
+            }
 
-        if codex_available
-            && let Some(ref session_id) = host_cfg.codex
-        {
-            let sid = session_id.clone();
+            if !provider::is_available(prov_name) {
+                eprintln!("warning: '{prov_name}' not found on PATH, skipping");
+                continue;
+            }
+
+            let prov = prov_name.clone();
+            let sid = entry.session().to_string();
+            let model = entry.model().map(String::from);
             let aname = (*arch_name).to_string();
             let prompt = assembled.clone();
             let root = project_root.clone();
+
             handles.push((
                 (*arch_name).to_string(),
-                tokio::spawn(async move { provider::invoke_codex(&sid, &aname, &prompt, &root).await }),
+                tokio::spawn(async move {
+                    provider::invoke(&prov, &sid, model.as_deref(), &aname, &prompt, &root).await
+                }),
             ));
         }
     }
 
     if handles.is_empty() {
-        let mut missing = Vec::new();
-        if use_claude && !claude_available {
-            missing.push("claude");
-        }
-        if use_codex && !codex_available {
-            missing.push("codex");
-        }
         bail!(
             "no providers available to run\n\n\
-             Required but not found on PATH: {}\n\
-             Install the missing provider(s) to proceed.",
-            missing.join(", ")
+             Check that provider binaries are on PATH and --provider filter matches."
         );
     }
 

@@ -18,17 +18,42 @@ pub struct ReviewConfig {
     pub groups: BTreeMap<String, Vec<String>>,
 }
 
-/// Per-archetype config: maps hostname → provider sessions.
+/// Per-archetype config: maps hostname → host config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ArchetypeConfig {
     #[serde(flatten)]
     pub hosts: BTreeMap<String, HostConfig>,
 }
 
+/// Per-host config: maps provider name → provider entry.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HostConfig {
-    pub claude: Option<String>,
-    pub codex: Option<String>,
+    #[serde(flatten)]
+    pub providers: BTreeMap<String, ProviderEntry>,
+}
+
+/// A provider entry: either just a session ID string, or a table with session + model.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ProviderEntry {
+    SessionOnly(String),
+    Full { session: String, model: Option<String> },
+}
+
+impl ProviderEntry {
+    pub fn session(&self) -> &str {
+        match self {
+            Self::SessionOnly(s) => s,
+            Self::Full { session, .. } => session,
+        }
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        match self {
+            Self::SessionOnly(_) => None,
+            Self::Full { model, .. } => model.as_deref(),
+        }
+    }
 }
 
 impl ArchetypeConfig {
@@ -38,7 +63,7 @@ impl ArchetypeConfig {
 
     pub fn has_sessions_for_host(&self, hostname: &str) -> bool {
         self.resolve_host(hostname)
-            .map(|h| h.claude.is_some() || h.codex.is_some())
+            .map(|h| !h.providers.is_empty())
             .unwrap_or(false)
     }
 }
@@ -143,19 +168,16 @@ pub fn parse(raw: &str) -> Result<ReviewConfig> {
 
 const INIT_TEMPLATE_PREFIX: &str = "\
 # Session IDs are scoped by hostname.
-# Archetypes with built-in prompts: security, bugs, perf, arch
-# Custom archetype names are also supported.
+# Any archetype name works. Provider options: claude, codex, kilo, opencode
 #
 # [security.myhostname]
-# claude = \"your-claude-session-id\"
-# codex = \"your-codex-session-id\"
-#
-# [bugs.myhostname]
-# claude = \"your-claude-session-id\"
+# claude = \"your-session-id\"
+# codex = { session = \"your-session-id\", model = \"o3\" }
+# kilo = { session = \"your-session-id\", model = \"anthropic/claude-sonnet-4.6\" }
 #
 # Groups fan out to multiple archetypes:
 # [_groups]
-# sweep = [\"security\", \"bugs\", \"perf\"]
+# sweep = [\"security\", \"bugs\"]
 ";
 
 pub fn init() -> Result<()> {
@@ -180,10 +202,10 @@ pub fn init() -> Result<()> {
     std::fs::write(&path, content)
         .map_err(|e| anyhow::anyhow!("failed to write {CONFIG_FILENAME}: {e}"))?;
 
+    let host_key = toml_key(&host);
     println!("Created {CONFIG_FILENAME}");
     println!();
     println!("Next steps:");
-    let host_key = toml_key(&host);
     println!("  1. Add your session IDs under [archetype.{host_key}] tables");
     println!("  2. Run: echo \"check for issues\" | review security");
     Ok(())
@@ -208,11 +230,42 @@ codex = \"sess-3\"
         assert_eq!(cfg.archetypes.len(), 2);
 
         let sec_host = cfg.archetypes["security"].resolve_host("myhost").unwrap();
-        assert_eq!(sec_host.claude.as_deref(), Some("sess-1"));
-        assert!(sec_host.codex.is_none());
+        assert_eq!(sec_host.providers["claude"].session(), "sess-1");
 
         let bugs_host = cfg.archetypes["bugs"].resolve_host("myhost").unwrap();
-        assert!(bugs_host.codex.is_some());
+        assert_eq!(bugs_host.providers["codex"].session(), "sess-3");
+    }
+
+    #[test]
+    fn parses_full_provider_entry() {
+        let raw = "\
+[bugs.myhost]
+claude = { session = \"sess-1\", model = \"opus\" }
+kilo = { session = \"sess-2\", model = \"anthropic/claude-sonnet-4.6\" }
+";
+        let cfg = parse(raw).unwrap();
+        let host = cfg.archetypes["bugs"].resolve_host("myhost").unwrap();
+
+        assert_eq!(host.providers["claude"].session(), "sess-1");
+        assert_eq!(host.providers["claude"].model(), Some("opus"));
+        assert_eq!(host.providers["kilo"].session(), "sess-2");
+        assert_eq!(host.providers["kilo"].model(), Some("anthropic/claude-sonnet-4.6"));
+    }
+
+    #[test]
+    fn mixed_string_and_table_entries() {
+        let raw = "\
+[bugs.myhost]
+claude = \"sess-1\"
+codex = { session = \"sess-2\", model = \"o3\" }
+";
+        let cfg = parse(raw).unwrap();
+        let host = cfg.archetypes["bugs"].resolve_host("myhost").unwrap();
+
+        assert_eq!(host.providers["claude"].session(), "sess-1");
+        assert!(host.providers["claude"].model().is_none());
+        assert_eq!(host.providers["codex"].session(), "sess-2");
+        assert_eq!(host.providers["codex"].model(), Some("o3"));
     }
 
     #[test]
@@ -235,20 +288,13 @@ claude = \"sess-1\"
 
     #[test]
     fn has_sessions_for_matching_host() {
-        let mut hosts = BTreeMap::new();
-        hosts.insert("myhost".to_string(), HostConfig {
-            claude: Some("c".into()),
-            codex: Some("x".into()),
-        });
-        let cfg = ArchetypeConfig { hosts };
-        assert!(cfg.has_sessions_for_host("myhost"));
-        assert!(!cfg.has_sessions_for_host("otherhost"));
-    }
-
-    #[test]
-    fn no_sessions_for_any_host() {
-        let cfg = ArchetypeConfig { hosts: BTreeMap::new() };
-        assert!(!cfg.has_sessions_for_host("myhost"));
+        let raw = "\
+[bugs.myhost]
+claude = \"sess-1\"
+";
+        let cfg = parse(raw).unwrap();
+        assert!(cfg.archetypes["bugs"].has_sessions_for_host("myhost"));
+        assert!(!cfg.archetypes["bugs"].has_sessions_for_host("otherhost"));
     }
 
     #[test]
@@ -265,8 +311,6 @@ codex = \"sess-b\"
         assert!(sec.has_sessions_for_host("host-a"));
         assert!(sec.has_sessions_for_host("host-b"));
         assert!(!sec.has_sessions_for_host("host-c"));
-        assert_eq!(sec.resolve_host("host-a").unwrap().claude.as_deref(), Some("sess-a"));
-        assert_eq!(sec.resolve_host("host-b").unwrap().codex.as_deref(), Some("sess-b"));
     }
 
     #[test]
@@ -278,16 +322,12 @@ claude = \"sess-1\"
 [bugs.myhost]
 claude = \"sess-2\"
 
-[perf.myhost]
-claude = \"sess-3\"
-
 [_groups]
-sweep = [\"security\", \"bugs\", \"perf\"]
+sweep = [\"security\", \"bugs\"]
 ";
         let cfg = parse(raw).unwrap();
         assert_eq!(cfg.groups.len(), 1);
-        assert_eq!(cfg.groups["sweep"], vec!["security", "bugs", "perf"]);
-        assert!(!cfg.archetypes.contains_key("_groups"));
+        assert_eq!(cfg.groups["sweep"], vec!["security", "bugs"]);
     }
 
     #[test]

@@ -5,15 +5,19 @@ Archetypes are named reviewer sessions defined in .review.toml.
 Groups fan out to multiple archetypes (defined under [_groups]).
 Use \"all\" to fan out to every configured archetype.
 
+Providers: claude, codex, kilo, opencode. Use --provider to limit
+which providers are used (e.g. --provider claude,kilo).
+
 Pipe instructions via stdin. Sessions are persistent — the agents
 already have project context from previous interactions.
 
 Examples:
   review init                                              Create a .review.toml
-  echo \"review staged changes for auth issues\" | review security   Send to security sessions
+  echo \"review staged changes\" | review security                   Send to security sessions
   echo \"full review please\" | review all                           Fan out to all archetypes
   echo \"how to handle X?\" | review competitors                     Fan out to a group
   echo \"re-anchor please\" | review bugs --anchor                   Prepend grounding prefix
+  echo \"just claude\" | review bugs --provider claude               Only use claude
   echo \"check for issues\" | review bugs --dry-run                  Preview the prompt";
 
 #[derive(Parser)]
@@ -38,13 +42,9 @@ pub struct Cli {
     #[arg(long)]
     pub anchor: bool,
 
-    /// Only use Claude sessions
-    #[arg(long, conflicts_with = "codex")]
-    pub claude: bool,
-
-    /// Only use Codex sessions
-    #[arg(long, conflicts_with = "claude")]
-    pub codex: bool,
+    /// Limit to specific providers (comma-separated, e.g. claude,kilo)
+    #[arg(long, value_delimiter = ',')]
+    pub provider: Option<Vec<String>>,
 }
 
 impl Cli {
