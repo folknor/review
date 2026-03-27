@@ -129,6 +129,7 @@ async fn main() -> Result<()> {
 
     // Spawn all providers in parallel
     let mut handles: Vec<(String, tokio::task::JoinHandle<provider::ProviderResult>)> = Vec::new();
+    let mut warned_unavailable = std::collections::HashSet::new();
 
     for arch_name in &runnable {
         let assembled = if cli.anchor {
@@ -148,7 +149,9 @@ async fn main() -> Result<()> {
             }
 
             if !provider::is_available(prov_name) {
-                eprintln!("warning: '{prov_name}' not found on PATH, skipping");
+                if warned_unavailable.insert(prov_name.clone()) {
+                    eprintln!("warning: '{prov_name}' not found on PATH, skipping");
+                }
                 continue;
             }
 
@@ -169,10 +172,17 @@ async fn main() -> Result<()> {
     }
 
     if handles.is_empty() {
-        bail!(
-            "no providers available to run\n\n\
-             Check that provider binaries are on PATH and --provider filter matches."
-        );
+        let msg = if let Some(ref filter) = provider_filter {
+            format!(
+                "no providers matched --provider {}\n  \
+                 Check spelling and that the provider binary is on PATH.",
+                filter.join(",")
+            )
+        } else {
+            "no providers available to run\n  \
+             Check that provider binaries are on PATH.".to_string()
+        };
+        bail!("{msg}");
     }
 
     // Collect results

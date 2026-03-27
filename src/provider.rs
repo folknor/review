@@ -6,15 +6,7 @@ use tokio::process::Command;
 
 /// Check whether a provider binary is available on PATH.
 pub fn is_available(provider: &str) -> bool {
-    which::which(binary_name(provider)).is_ok()
-}
-
-/// Map provider name to binary name (kilo's binary is "kilo", etc.)
-fn binary_name(provider: &str) -> &str {
-    match provider {
-        "kilo" => "kilo",
-        _ => provider,
-    }
+    which::which(provider).is_ok()
 }
 
 fn temp_path(archetype: &str, provider: &str) -> String {
@@ -179,9 +171,9 @@ async fn run_stdout_provider(
     args.push("--dir".to_string());
     args.push(dir);
 
-    let binary = binary_name(provider);
-    let child = Command::new(binary)
+    let child = Command::new(provider)
         .args(&args)
+        .current_dir(project_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

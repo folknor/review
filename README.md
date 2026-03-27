@@ -111,6 +111,9 @@ opencode = { session = "session-pqr678", model = "openai/gpt-5" }
 [tilemaker.myhostname]
 claude = "session-stu901"
 
+[tippecanoe.myhostname]
+claude = "session-vwx234"
+
 [_groups]
 sweep = ["security", "bugs"]
 competitors = ["tilemaker", "tippecanoe"]

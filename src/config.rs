@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 const CONFIG_FILENAME: &str = ".review.toml";
+const KNOWN_PROVIDERS: &[&str] = &["claude", "codex", "kilo", "opencode"];
 
 #[derive(Debug, Deserialize)]
 pub struct RawConfig {
@@ -156,6 +157,21 @@ pub fn parse(raw: &str) -> Result<ReviewConfig> {
                 bail!(
                     "group '{group_name}' contains duplicate archetype '{member}' in {CONFIG_FILENAME}"
                 );
+            }
+        }
+    }
+
+    // Validate provider names
+    for (arch_name, arch) in &raw_cfg.archetypes {
+        for (hostname, host) in &arch.hosts {
+            for prov_name in host.providers.keys() {
+                if !KNOWN_PROVIDERS.contains(&prov_name.as_str()) {
+                    bail!(
+                        "unknown provider '{prov_name}' in [{arch_name}.{hostname}]\n  \
+                         supported: {}",
+                        KNOWN_PROVIDERS.join(", ")
+                    );
+                }
             }
         }
     }
