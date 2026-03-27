@@ -19,9 +19,9 @@
 
 ## What this project is
 
-A Rust CLI (`review`) that fans out code reviews to persistent AI sessions across multiple providers (Claude Code, Codex). It's a prompt builder that knows about sessions — the agents fetch code themselves.
+A Rust CLI (`review`) that fans out code reviews to persistent AI sessions across multiple providers (Claude Code, Codex, Kilo, OpenCode). It's a prompt builder that knows about sessions — the agents fetch code themselves.
 
-Fixed archetypes: security, bugs, perf, arch. Per-project config via `.review.toml` (YAML frontmatter for host-scoped session IDs, markdown `## headings` for archetype prompts). Custom archetypes and groups also supported.
+Per-project config via `.review.toml` (host-scoped session IDs, optional model overrides). Custom archetypes and groups also supported.
 
 ## Build and run
 
@@ -60,6 +60,9 @@ codex = "session-id"
 
 [bugs.myhostname]
 claude = "session-id"
+codex = { session = "session-id", model = "o3" }
+kilo = { session = "session-id", model = "anthropic/claude-sonnet-4.6" }
+opencode = { session = "session-id", model = "openai/gpt-5" }
 
 [_groups]
 sweep = ["security", "bugs"]

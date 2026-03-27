@@ -1,10 +1,10 @@
 # review
 
-A Rust CLI that fans out code reviews to persistent AI sessions across multiple providers (Claude Code, Codex), each cultivated with a specific reviewer perspective.
+A Rust CLI that fans out code reviews to persistent AI sessions across multiple providers (Claude Code, Codex, Kilo, OpenCode), each cultivated with a specific reviewer perspective.
 
 ## How it works
 
-You configure **archetypes** -- reviewer perspectives like `security`, `bugs`, `perf`, `arch`, or any custom name -- each backed by long-lived sessions in one or more AI providers. When you run a review, you pipe your instructions via stdin. The tool sends them to all providers for that archetype in parallel. Sessions are persistent — the agents already have project context from previous interactions.
+You configure **archetypes** -- reviewer perspectives like `security`, `bugs`, `perf`, or any custom name -- each backed by long-lived sessions in one or more AI providers. When you run a review, you pipe your instructions via stdin. The tool sends them to all providers for that archetype in parallel. Sessions are persistent — the agents already have project context from previous interactions.
 
 ## Install
 
@@ -55,7 +55,7 @@ Instructions are piped via stdin (required, 20KB limit). The archetype routes to
 
 ### Archetypes
 
-Archetypes are named reviewer sessions defined in `.review.toml`. Any name works — use whatever fits your project (security, bugs, perf, tilemaker, planetiler, etc.).
+Archetypes are named reviewer sessions defined in `.review.toml`. Any name works — use whatever fits your project.
 
 Use `all` to fan out to every configured archetype, or define **groups** to fan out to a named subset.
 
@@ -63,8 +63,9 @@ Use `all` to fan out to every configured archetype, or define **groups** to fan 
 
 | Flag | Description |
 |------|-------------|
-| `--anchor` | Prepend grounding prefix and archetype prompt to stdin |
+| `--anchor` | Prepend grounding prefix to stdin |
 | `--dry-run` | Print what would be sent instead of sending it |
+| `--provider <list>` | Limit to specific providers (comma-separated) |
 
 By default, stdin goes directly to the provider sessions. Use `--anchor` for the first review in a session or to re-anchor a stale session.
 
@@ -103,12 +104,12 @@ codex = "session-def456"
 
 [bugs.myhostname]
 claude = "session-ghi789"
+codex = { session = "session-jkl012", model = "o3" }
+kilo = { session = "session-mno345", model = "anthropic/claude-sonnet-4.6" }
+opencode = { session = "session-pqr678", model = "openai/gpt-5" }
 
 [tilemaker.myhostname]
-claude = "session-jkl012"
-
-[tippecanoe.myhostname]
-claude = "session-mno345"
+claude = "session-stu901"
 
 [_groups]
 sweep = ["security", "bugs"]
@@ -116,6 +117,30 @@ competitors = ["tilemaker", "tippecanoe"]
 ```
 
 Session IDs are scoped by hostname, so the same `.review.toml` works across machines with different sessions.
+
+Provider entries can be a simple session ID string or a table with session + model:
+
+```toml
+claude = "session-id"                                        # default model
+codex = { session = "session-id", model = "o3" }             # explicit model
+kilo = { session = "session-id", model = "anthropic/claude-sonnet-4.6" }
+```
+
+### Providers
+
+| Provider | Binary | Non-interactive | Resume | Model flag |
+|----------|--------|----------------|--------|------------|
+| claude | `claude` | `--print` | `--resume <id>` | `--model <name>` |
+| codex | `codex` | `exec` | `exec resume <id>` | `-m <model>` |
+| kilo | `kilo` | `run` | `run -s <id>` | `-m <provider/model>` |
+| opencode | `opencode` | `run` | `run -s <id>` | `-m <provider/model>` |
+
+Use `--provider` to limit which providers run:
+
+```
+echo "just claude" | review bugs --provider claude
+echo "claude and kilo" | review bugs --provider claude,kilo
+```
 
 ### Groups
 
@@ -127,26 +152,6 @@ echo "full sweep" | review sweep
 ```
 
 Define groups in the `[_groups]` table. Group names must not conflict with archetype names. `all` is reserved and runs every configured archetype.
-
-## Providers
-
-### Claude Code
-
-```
-claude --resume <session-id> --print --permission-mode dontAsk
-```
-
-Runs in `dontAsk` mode (uses pre-approved permissions, rejects interactive prompts). Prompt piped via stdin, output captured from stdout.
-
-### Codex
-
-```
-codex exec --sandbox read-only resume <session-id> -o <file>
-```
-
-Runs in read-only sandbox. Prompt piped via stdin, output captured from the `-o` file.
-
-Both providers run in parallel. If one fails, the other's results are still shown. Providers whose binaries aren't installed are skipped with a warning.
 
 ## Concurrency
 
