@@ -128,29 +128,17 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to create lock file: {e}"))?;
     lock::acquire_blocking(&lock_file)?;
 
-    // Check which providers are needed and available
-    let needs_claude = runnable.iter().any(|name| {
-        cfg
-            .archetypes
-            .get(*name)
-            .and_then(|a| a.resolve_host(&hostname))
-            .is_some_and(|h| h.claude.is_some())
-    });
-    let needs_codex = runnable.iter().any(|name| {
-        cfg
-            .archetypes
-            .get(*name)
-            .and_then(|a| a.resolve_host(&hostname))
-            .is_some_and(|h| h.codex.is_some())
-    });
+    // Determine which providers to use
+    let use_claude = !cli.codex;
+    let use_codex = !cli.claude;
 
-    let claude_available = !needs_claude || provider::is_available("claude");
-    let codex_available = !needs_codex || provider::is_available("codex");
+    let claude_available = use_claude && provider::is_available("claude");
+    let codex_available = use_codex && provider::is_available("codex");
 
-    if needs_claude && !claude_available {
+    if use_claude && !claude_available {
         eprintln!("warning: 'claude' not found on PATH, skipping claude sessions");
     }
-    if needs_codex && !codex_available {
+    if use_codex && !codex_available {
         eprintln!("warning: 'codex' not found on PATH, skipping codex sessions");
     }
 
@@ -194,10 +182,10 @@ async fn main() -> Result<()> {
 
     if handles.is_empty() {
         let mut missing = Vec::new();
-        if needs_claude && !claude_available {
+        if use_claude && !claude_available {
             missing.push("claude");
         }
-        if needs_codex && !codex_available {
+        if use_codex && !codex_available {
             missing.push("codex");
         }
         bail!(

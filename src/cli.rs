@@ -38,6 +38,13 @@ pub struct Cli {
     #[arg(long)]
     pub anchor: bool,
 
+    /// Only use Claude sessions
+    #[arg(long, conflicts_with = "codex")]
+    pub claude: bool,
+
+    /// Only use Codex sessions
+    #[arg(long, conflicts_with = "claude")]
+    pub codex: bool,
 }
 
 impl Cli {
