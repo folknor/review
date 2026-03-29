@@ -59,16 +59,23 @@ echo "how should we handle polygon clipping?" | review competitors
 ## Usage
 
 ```
-echo "<instructions>" | review <archetype>
+echo "<instructions>" | review <archetype[,archetype,...]>
 ```
 
-Instructions are piped via stdin (required, 20KB limit). The archetype routes to the right sessions.
+Instructions are piped via stdin (required, 20KB limit). The archetype routes to the right sessions. Multiple archetypes and groups can be comma-separated:
+
+```
+echo "review please" | review security,bugs,arch
+echo "review please" | review bugs,competitors
+```
+
+Duplicates are removed automatically (e.g. if a group overlaps with an explicit archetype).
 
 ### Archetypes
 
 Archetypes are named reviewer sessions defined in `.review.toml`. Any name works — use whatever fits your project.
 
-Use `all` to fan out to every configured archetype, or define **groups** to fan out to a named subset.
+Use `all` to fan out to every configured archetype, or define **groups** to fan out to a named subset. Groups and individual archetypes can be mixed freely.
 
 ### Options
 

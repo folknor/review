@@ -21,7 +21,7 @@
 
 A Rust CLI (`review`) that fans out code reviews to persistent AI sessions across multiple providers (Claude Code, Codex, Kilo, OpenCode). It's a prompt builder that knows about sessions — the agents fetch code themselves.
 
-Per-project config via `.review.toml` (host-scoped session IDs, optional model overrides). Custom archetypes and groups also supported.
+Per-project config via `.review.toml` (host-scoped session IDs, optional model overrides). Custom archetypes and groups also supported. Comma-separated archetypes/groups can be mixed freely, with deduplication.
 
 ## Build and run
 
