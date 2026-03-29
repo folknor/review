@@ -189,6 +189,13 @@ async fn main() -> Result<()> {
         }
     }
 
+    // Wait one final stagger interval so the next invocation's first launch
+    // doesn't collide with our last launch, then release the global lock.
+    if launch_count > 0 && !stagger.is_zero() {
+        tokio::time::sleep(stagger).await;
+    }
+    drop(lock_file);
+
     if pending.is_empty() {
         let msg = if let Some(ref filter) = provider_filter {
             format!(

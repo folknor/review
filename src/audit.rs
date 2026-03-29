@@ -14,21 +14,23 @@ struct AuditEntry {
     error: Option<String>,
 }
 
-fn audit_dir(project_root: &Path) -> std::path::PathBuf {
+fn audit_dir(project_root: &Path) -> Option<std::path::PathBuf> {
     let data_dir = std::env::var("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").expect("HOME not set");
-            std::path::PathBuf::from(home).join(".local/share")
-        });
+        .or_else(|_| {
+            std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
+        })
+        .ok()?;
 
-    // Use the project root's directory name as the project identifier
-    let project_name = project_root
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+    // Use a sanitized version of the full path to avoid collisions
+    // between projects with the same directory name
+    let project_key = project_root
+        .to_string_lossy()
+        .replace('/', "-")
+        .trim_start_matches('-')
+        .to_string();
 
-    data_dir.join("review").join(project_name)
+    Some(data_dir.join("review").join(project_key))
 }
 
 pub fn log_result(
@@ -39,7 +41,13 @@ pub fn log_result(
     prompt: &str,
     result: &Result<String>,
 ) {
-    let dir = audit_dir(project_root);
+    let dir = match audit_dir(project_root) {
+        Some(d) => d,
+        None => {
+            eprintln!("warning: could not determine audit directory (HOME not set)");
+            return;
+        }
+    };
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("warning: failed to create audit dir: {e}");
         return;
@@ -49,10 +57,7 @@ pub fn log_result(
 
     let entry = AuditEntry {
         timestamp: chrono_now(),
-        project: project_root
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
+        project: project_root.to_string_lossy().to_string(),
         archetype: archetype.to_string(),
         provider: provider.to_string(),
         session: session.to_string(),
