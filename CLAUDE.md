@@ -36,11 +36,13 @@ Single binary crate, no workspace.
 
 ## Architecture
 
-- `src/cli.rs` — Clap CLI. Archetype is a positional arg, `init` is the only subcommand.
+- `src/cli.rs` — Clap CLI. Archetype is a positional arg, `init` and `prime` are subcommands.
 - `src/config.rs` — Parses `.review.toml` in cwd. TOML config for host-scoped sessions (archetype → hostname → provider), `_groups` for named archetype sets. Uses `toml` and `gethostname` crates.
 - `src/input.rs` — Reads stdin instructions (required, 20KB limit).
 - `src/prompt.rs` — Assembles: compiled prefix + stdin instructions. Used only with `--anchor`.
 - `src/provider.rs` — Async provider invocation. Prompts piped via stdin. Claude uses `--permission-mode dontAsk`, Codex uses `--sandbox read-only`.
+- `src/prime.rs` — Session creation for `review prime`. Claude uses `--session-id`, Codex uses `--json` to capture `thread_id`.
+- `src/config_write.rs` — Appends session entries to `.review.toml`.
 - `src/main.rs` — Wires CLI to config, prompt assembly, and provider dispatch.
 - `prompts/` — Grounding prefix compiled into the binary via `include_str!`.
 

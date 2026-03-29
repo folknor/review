@@ -28,7 +28,7 @@ review init
 
 ### 2. Add session IDs
 
-Edit `.review.toml` and add your provider session IDs:
+Add session IDs to `.review.toml`. Either edit the file manually:
 
 ```toml
 [security.myhostname]
@@ -38,6 +38,14 @@ codex = "your-codex-session-id"
 [bugs.myhostname]
 claude = "your-claude-session-id"
 ```
+
+Or use `review prime` to create sessions and register them automatically:
+
+```
+echo "You are a security expert for this project. Read the codebase." | review prime security --provider claude,codex
+```
+
+`review prime` creates new sessions, sends the priming prompt, and writes the session IDs to `.review.toml` automatically.
 
 ### 3. Run reviews
 

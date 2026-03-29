@@ -13,6 +13,7 @@ already have project context from previous interactions.
 
 Examples:
   review init                                              Create a .review.toml
+  echo \"You are a bugs expert\" | review prime bugs --provider claude  Create a session
   echo \"review staged changes\" | review security                   Send to security sessions
   echo \"full review please\" | review all                           Fan out to all archetypes
   echo \"how to handle X?\" | review competitors                     Fan out to a group

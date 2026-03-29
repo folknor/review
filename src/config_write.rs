@@ -21,20 +21,22 @@ pub fn append_sessions(
     let host_key = config::toml_key(hostname);
     let section_header = format!("[{archetype}.{host_key}]");
 
-    if content.contains(&section_header) {
+    if let Some(section_start) = find_uncommented_section(&content, &section_header) {
         // Section exists — check for conflicts and append new providers
         for (provider, session_id) in sessions {
-            // Check if this provider already has an entry
-            if has_provider_in_section(&content, &section_header, provider) {
+            if has_provider_in_section(&content, section_start, &section_header, provider) {
                 bail!(
                     "provider '{provider}' already configured in {section_header}\n  \
                      Remove it first or edit .review.toml manually."
                 );
             }
 
-            // Find the end of the section (next section header or EOF)
-            let insert_pos = find_section_end(&content, &section_header);
-            let entry = format!("{provider} = \"{session_id}\"\n");
+            let insert_pos = find_section_end(&content, section_start, &section_header);
+            let mut entry = format!("{provider} = \"{session_id}\"\n");
+            // Ensure we're on a new line
+            if insert_pos > 0 && !content[..insert_pos].ends_with('\n') {
+                entry.insert(0, '\n');
+            }
             content.insert_str(insert_pos, &entry);
         }
     } else {
@@ -55,33 +57,69 @@ pub fn append_sessions(
     Ok(())
 }
 
-fn has_provider_in_section(content: &str, section_header: &str, provider: &str) -> bool {
-    let Some(section_start) = content.find(section_header) else {
-        return false;
-    };
+/// Find a section header that is NOT inside a comment.
+/// Returns the byte offset of the `[` if found.
+fn find_uncommented_section(content: &str, section_header: &str) -> Option<usize> {
+    let mut search_from = 0;
+    while let Some(pos) = content[search_from..].find(section_header) {
+        let abs_pos = search_from + pos;
+
+        // Check if this is at the start of a line (not inside a comment)
+        let line_start = content[..abs_pos].rfind('\n').map_or(0, |p| p + 1);
+        let before_bracket = content[line_start..abs_pos].trim();
+
+        if before_bracket.is_empty() {
+            // The `[` is at the start of the line (possibly after whitespace) — real section
+            return Some(abs_pos);
+        }
+
+        // This match is inside a comment or other content — skip it
+        search_from = abs_pos + section_header.len();
+    }
+    None
+}
+
+fn has_provider_in_section(
+    content: &str,
+    section_start: usize,
+    section_header: &str,
+    provider: &str,
+) -> bool {
     let after_header = section_start + section_header.len();
     let section_body = &content[after_header..];
 
-    // Find end of section (next [...] or EOF)
-    let section_end = section_body
-        .find("\n[")
-        .unwrap_or(section_body.len());
-
+    let section_end = find_next_section(section_body);
     let section_text = &section_body[..section_end];
+
     section_text.lines().any(|line| {
         let trimmed = line.trim();
         trimmed.starts_with(provider) && trimmed[provider.len()..].trim_start().starts_with('=')
     })
 }
 
-fn find_section_end(content: &str, section_header: &str) -> usize {
-    let section_start = content.find(section_header).expect("section must exist");
+fn find_section_end(content: &str, section_start: usize, section_header: &str) -> usize {
     let after_header = section_start + section_header.len();
     let section_body = &content[after_header..];
 
-    // Find end of section (next [...] or EOF)
-    match section_body.find("\n[") {
-        Some(pos) => after_header + pos + 1, // insert before the next section's [
-        None => content.len(), // append at EOF
+    let end_offset = find_next_section(section_body);
+    after_header + end_offset
+}
+
+/// Find the start of the next uncommented section header, or return the length of the input.
+fn find_next_section(body: &str) -> usize {
+    for (i, line) in body.split('\n').scan(0usize, |offset, line| {
+        let start = *offset;
+        *offset += line.len() + 1; // +1 for the \n
+        Some((start, line))
+    }) {
+        // Skip the first line (it's the rest of the current section header line)
+        if i == 0 {
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && !trimmed.starts_with('#') {
+            return i;
+        }
     }
+    body.len()
 }
