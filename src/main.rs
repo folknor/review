@@ -33,10 +33,24 @@ async fn main() -> Result<()> {
         }
     };
 
-    let (cfg, project_root) = config::load()?;
+    let (mut cfg, project_root) = config::load()?;
     let stdin_instructions = input::read_stdin()?;
 
     let hostname = config::hostname();
+
+    // Ensure audit ID exists — generate and persist if missing
+    let audit_id = match cfg.audit.id {
+        Some(ref id) => id.clone(),
+        None => {
+            let id = config::generate_short_id();
+            let config_path = project_root.join(".review.toml");
+            if let Err(e) = config_write::append_audit_id(&config_path, &id) {
+                eprintln!("warning: failed to write audit id to .review.toml: {e}");
+            }
+            cfg.audit.id = Some(id.clone());
+            id
+        }
+    };
 
     // Provider filter from --provider flag
     let provider_filter: Option<Vec<&str>> = cli.provider.as_ref().map(|v| {
@@ -240,6 +254,7 @@ async fn main() -> Result<()> {
         audit::log_result(
             &project_root,
             cfg.audit.private,
+            &audit_id,
             &p.archetype,
             &result.provider,
             &p.session,

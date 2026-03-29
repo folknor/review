@@ -105,6 +105,34 @@ fn find_section_end(content: &str, section_start: usize, section_header: &str) -
     after_header + end_offset
 }
 
+/// Append an [_audit] section with the given id to .review.toml.
+/// If [_audit] already exists, appends the id field to it.
+pub fn append_audit_id(config_path: &Path, id: &str) -> Result<()> {
+    let mut content = std::fs::read_to_string(config_path)
+        .unwrap_or_default();
+
+    let section_header = "[_audit]";
+
+    if let Some(section_start) = find_uncommented_section(&content, section_header) {
+        // Section exists — append id field
+        let insert_pos = find_section_end(&content, section_start, section_header);
+        let mut entry = format!("id = \"{id}\"\n");
+        if insert_pos > 0 && !content[..insert_pos].ends_with('\n') {
+            entry.insert(0, '\n');
+        }
+        content.insert_str(insert_pos, &entry);
+    } else {
+        // New section
+        if !content.ends_with('\n') && !content.is_empty() {
+            content.push('\n');
+        }
+        content.push_str(&format!("\n[_audit]\nid = \"{id}\"\n"));
+    }
+
+    std::fs::write(config_path, content)?;
+    Ok(())
+}
+
 /// Find the start of the next uncommented section header, or return the length of the input.
 fn find_next_section(body: &str) -> usize {
     for (i, line) in body.split('\n').scan(0usize, |offset, line| {

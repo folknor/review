@@ -9,6 +9,7 @@ pub const KNOWN_PROVIDERS: &[&str] = &["claude", "codex", "kilo", "opencode"];
 pub struct AuditConfig {
     #[serde(default)]
     pub private: bool,
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,6 +92,19 @@ pub fn toml_key(key: &str) -> String {
     } else {
         key.to_string()
     }
+}
+
+/// Generate a short 4-character hex ID for audit directory naming.
+pub fn generate_short_id() -> String {
+    let bytes = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| {
+            use std::io::Read;
+            let mut buf = [0u8; 2];
+            f.read_exact(&mut buf)?;
+            Ok(buf)
+        })
+        .unwrap_or([0x42, 0x42]);
+    format!("{:02x}{:02x}", bytes[0], bytes[1])
 }
 
 pub fn load() -> Result<(ReviewConfig, std::path::PathBuf)> {
@@ -224,7 +238,9 @@ pub fn init() -> Result<()> {
     }
 
     let host = hostname();
-    let content = INIT_TEMPLATE_PREFIX.replace("myhostname", &toml_key(&host));
+    let audit_id = generate_short_id();
+    let mut content = INIT_TEMPLATE_PREFIX.replace("myhostname", &toml_key(&host));
+    content.push_str(&format!("\n[_audit]\nid = \"{audit_id}\"\n"));
     std::fs::write(&path, content)
         .map_err(|e| anyhow::anyhow!("failed to write {CONFIG_FILENAME}: {e}"))?;
 

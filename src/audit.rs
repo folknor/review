@@ -14,7 +14,7 @@ struct AuditEntry {
     error: Option<String>,
 }
 
-fn audit_dir(project_root: &Path, private: bool) -> Option<std::path::PathBuf> {
+fn audit_dir(project_root: &Path, private: bool, audit_id: &str) -> Option<std::path::PathBuf> {
     let data_dir = std::env::var("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|_| {
@@ -22,33 +22,35 @@ fn audit_dir(project_root: &Path, private: bool) -> Option<std::path::PathBuf> {
         })
         .ok()?;
 
-    // Use a sanitized version of the full path to avoid collisions
-    // between projects with the same directory name
-    let project_key = project_root
-        .to_string_lossy()
-        .replace('/', "-")
-        .trim_start_matches('-')
-        .to_string();
+    let hostname = crate::config::hostname();
+    let project_name = project_root
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let dir_name = format!("{hostname}-{project_name}-{audit_id}");
 
     let base = if private {
-        data_dir.join("review").join("private")
+        data_dir.join("review").join("audit-private")
     } else {
-        data_dir.join("review")
+        data_dir.join("review").join("audit")
     };
 
-    Some(base.join(project_key))
+    Some(base.join(dir_name))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn log_result(
     project_root: &Path,
     private: bool,
+    audit_id: &str,
     archetype: &str,
     provider: &str,
     session: &str,
     prompt: &str,
     result: &Result<String>,
 ) {
-    let dir = match audit_dir(project_root, private) {
+    let dir = match audit_dir(project_root, private, audit_id) {
         Some(d) => d,
         None => {
             eprintln!("warning: could not determine audit directory (HOME not set)");
