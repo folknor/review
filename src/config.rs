@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 const CONFIG_FILENAME: &str = ".review.toml";
-const KNOWN_PROVIDERS: &[&str] = &["claude", "codex", "kilo", "opencode"];
+pub const KNOWN_PROVIDERS: &[&str] = &["claude", "codex", "kilo", "opencode"];
 
 #[derive(Debug, Deserialize)]
 pub struct RawConfig {

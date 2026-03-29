@@ -1,8 +1,10 @@
 mod audit;
 mod cli;
 mod config;
+mod config_write;
 mod input;
 mod lock;
+mod prime;
 mod prompt;
 mod provider;
 
@@ -17,6 +19,10 @@ async fn main() -> Result<()> {
 
     if matches!(cli.command, Some(cli::Command::Init)) {
         return config::init();
+    }
+
+    if let Some(cli::Command::Prime { archetype, provider }) = &cli.command {
+        return run_prime(archetype, provider).await;
     }
 
     let archetype_name = match cli.archetype.as_deref() {
@@ -250,6 +256,70 @@ async fn main() -> Result<()> {
     let all_failed = results.iter().all(|(_, r)| r.output.is_err());
     if all_failed {
         std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+async fn run_prime(archetype: &str, providers: &[String]) -> Result<()> {
+    // Validate provider names
+    for p in providers {
+        if !config::KNOWN_PROVIDERS.contains(&p.as_str()) {
+            bail!(
+                "unknown provider '{p}'\n  supported: {}",
+                config::KNOWN_PROVIDERS.join(", ")
+            );
+        }
+    }
+
+    // Find .review.toml (or note that we'll create entries anyway)
+    let (_, project_root) = config::load().or_else(|_| {
+        // Config might not exist yet — that's fine for prime
+        let cwd = std::env::current_dir()?;
+        Ok::<_, anyhow::Error>((
+            config::ReviewConfig {
+                archetypes: std::collections::BTreeMap::new(),
+                groups: std::collections::BTreeMap::new(),
+            },
+            cwd,
+        ))
+    })?;
+
+    let config_path = project_root.join(".review.toml");
+    let stdin_prompt = input::read_stdin()?;
+    let hostname = config::hostname();
+
+    eprintln!("Priming archetype '{archetype}' for host '{hostname}'");
+    eprintln!();
+
+    let mut sessions: Vec<(String, String)> = Vec::new();
+
+    for provider in providers {
+        let result = prime::prime_provider(provider, &stdin_prompt, &project_root).await;
+        match result {
+            Ok(primed) => {
+                eprintln!();
+                sessions.push((primed.provider, primed.session_id));
+            }
+            Err(e) => {
+                eprintln!("error priming {provider}: {e}");
+            }
+        }
+    }
+
+    if sessions.is_empty() {
+        bail!("no sessions were created");
+    }
+
+    // Write to .review.toml
+    config_write::append_sessions(&config_path, archetype, &hostname, &sessions)?;
+
+    eprintln!();
+    eprintln!("Added to .review.toml:");
+    let host_key = config::toml_key(&hostname);
+    eprintln!("  [{archetype}.{host_key}]");
+    for (prov, sid) in &sessions {
+        eprintln!("  {prov} = \"{sid}\"");
     }
 
     Ok(())

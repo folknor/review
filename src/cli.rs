@@ -62,4 +62,14 @@ impl Cli {
 pub enum Command {
     /// Create a starter .review.toml in the current directory
     Init,
+
+    /// Create new provider sessions for an archetype and add them to .review.toml
+    Prime {
+        /// Archetype name to create sessions for
+        archetype: String,
+
+        /// Providers to create sessions for (comma-separated, e.g. claude,codex)
+        #[arg(long, value_delimiter = ',', required = true)]
+        provider: Vec<String>,
+    },
 }
