@@ -239,6 +239,7 @@ async fn main() -> Result<()> {
 
         audit::log_result(
             &project_root,
+            cfg.audit.private,
             &p.archetype,
             &result.provider,
             &p.session,
@@ -290,6 +291,7 @@ async fn run_prime(archetype: &str, providers: &[String]) -> Result<()> {
             config::ReviewConfig {
                 archetypes: std::collections::BTreeMap::new(),
                 groups: std::collections::BTreeMap::new(),
+                audit: config::AuditConfig::default(),
             },
             cwd,
         ))

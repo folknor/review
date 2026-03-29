@@ -5,10 +5,18 @@ use std::collections::BTreeMap;
 const CONFIG_FILENAME: &str = ".review.toml";
 pub const KNOWN_PROVIDERS: &[&str] = &["claude", "codex", "kilo", "opencode"];
 
+#[derive(Debug, Default, Deserialize)]
+pub struct AuditConfig {
+    #[serde(default)]
+    pub private: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RawConfig {
     #[serde(default, rename = "_groups")]
     pub groups: BTreeMap<String, Vec<String>>,
+    #[serde(default, rename = "_audit")]
+    pub audit: AuditConfig,
     #[serde(flatten)]
     pub archetypes: BTreeMap<String, ArchetypeConfig>,
 }
@@ -17,6 +25,7 @@ pub struct RawConfig {
 pub struct ReviewConfig {
     pub archetypes: BTreeMap<String, ArchetypeConfig>,
     pub groups: BTreeMap<String, Vec<String>>,
+    pub audit: AuditConfig,
 }
 
 /// Per-archetype config: maps hostname → host config.
@@ -179,6 +188,7 @@ pub fn parse(raw: &str) -> Result<ReviewConfig> {
     Ok(ReviewConfig {
         archetypes: raw_cfg.archetypes,
         groups: raw_cfg.groups,
+        audit: raw_cfg.audit,
     })
 }
 

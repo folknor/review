@@ -14,7 +14,7 @@ struct AuditEntry {
     error: Option<String>,
 }
 
-fn audit_dir(project_root: &Path) -> Option<std::path::PathBuf> {
+fn audit_dir(project_root: &Path, private: bool) -> Option<std::path::PathBuf> {
     let data_dir = std::env::var("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|_| {
@@ -30,18 +30,25 @@ fn audit_dir(project_root: &Path) -> Option<std::path::PathBuf> {
         .trim_start_matches('-')
         .to_string();
 
-    Some(data_dir.join("review").join(project_key))
+    let base = if private {
+        data_dir.join("review").join("private")
+    } else {
+        data_dir.join("review")
+    };
+
+    Some(base.join(project_key))
 }
 
 pub fn log_result(
     project_root: &Path,
+    private: bool,
     archetype: &str,
     provider: &str,
     session: &str,
     prompt: &str,
     result: &Result<String>,
 ) {
-    let dir = match audit_dir(project_root) {
+    let dir = match audit_dir(project_root, private) {
         Some(d) => d,
         None => {
             eprintln!("warning: could not determine audit directory (HOME not set)");
