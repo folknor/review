@@ -127,9 +127,11 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to create lock file: {e}"))?;
     lock::acquire_blocking(&lock_file)?;
 
-    // Spawn all providers in parallel
+    // Spawn all providers with staggered launches to avoid rate limits
+    let stagger = std::time::Duration::from_secs(30);
     let mut handles: Vec<(String, tokio::task::JoinHandle<provider::ProviderResult>)> = Vec::new();
     let mut warned_unavailable = std::collections::HashSet::new();
+    let mut launch_count = 0u32;
 
     for arch_name in &runnable {
         let assembled = if cli.anchor {
@@ -161,13 +163,18 @@ async fn main() -> Result<()> {
             let aname = (*arch_name).to_string();
             let prompt = assembled.clone();
             let root = project_root.clone();
+            let delay = stagger * launch_count;
 
             handles.push((
                 (*arch_name).to_string(),
                 tokio::spawn(async move {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
                     provider::invoke(&prov, &sid, model.as_deref(), &aname, &prompt, &root).await
                 }),
             ));
+            launch_count += 1;
         }
     }
 
