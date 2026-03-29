@@ -38,20 +38,6 @@ async fn main() -> Result<()> {
 
     let hostname = config::hostname();
 
-    // Ensure audit ID exists — generate and persist if missing
-    let audit_id = match cfg.audit.id {
-        Some(ref id) => id.clone(),
-        None => {
-            let id = config::generate_short_id();
-            let config_path = project_root.join(".review.toml");
-            if let Err(e) = config_write::append_audit_id(&config_path, &id) {
-                eprintln!("warning: failed to write audit id to .review.toml: {e}");
-            }
-            cfg.audit.id = Some(id.clone());
-            id
-        }
-    };
-
     // Provider filter from --provider flag
     let provider_filter: Option<Vec<&str>> = cli.provider.as_ref().map(|v| {
         v.iter().map(String::as_str).collect()
@@ -157,6 +143,20 @@ async fn main() -> Result<()> {
     let lock_file = std::fs::File::create(&lock_path)
         .map_err(|e| anyhow::anyhow!("failed to create lock file: {e}"))?;
     lock::acquire_blocking(&lock_file)?;
+
+    // Ensure audit ID exists — generate and persist if missing (after lock to prevent races)
+    let audit_id = match cfg.audit.id {
+        Some(ref id) => id.clone(),
+        None => {
+            let id = config::generate_short_id();
+            let config_path = project_root.join(".review.toml");
+            if let Err(e) = config_write::append_audit_id(&config_path, &id) {
+                eprintln!("warning: failed to write audit id to .review.toml: {e}");
+            }
+            cfg.audit.id = Some(id.clone());
+            id
+        }
+    };
 
     // Spawn all providers with staggered launches to avoid rate limits
     let stagger = std::time::Duration::from_secs(cli.stagger);
