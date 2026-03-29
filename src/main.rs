@@ -48,26 +48,36 @@ async fn main() -> Result<()> {
         eprintln!("hostname: {hostname}");
     }
 
-    let archetypes_to_run: Vec<&str> = if archetype_name == "all" {
-        cfg.archetypes.keys().map(String::as_str).collect()
-    } else if let Some(group) = cfg.groups.get(archetype_name) {
-        group.iter().map(String::as_str).collect()
-    } else if cfg.archetypes.contains_key(archetype_name) {
-        vec![archetype_name]
-    } else {
-        let mut available: Vec<&str> = cfg.archetypes.keys().map(String::as_str).collect();
-        let groups: Vec<&str> = cfg.groups.keys().map(String::as_str).collect();
-        available.extend(groups);
-        bail!(
-            "'{archetype_name}' not found in .review.toml\n  \
-             configured: {}",
-            if available.is_empty() {
-                "(none)".to_string()
-            } else {
-                available.join(", ")
-            }
-        );
-    };
+    // Resolve archetype(s) — supports "all", groups, comma-separated, or single names
+    let names: Vec<&str> = archetype_name.split(',').collect();
+    let mut archetypes_to_run: Vec<&str> = Vec::new();
+
+    for name in &names {
+        if *name == "all" {
+            archetypes_to_run.extend(cfg.archetypes.keys().map(String::as_str));
+        } else if let Some(group) = cfg.groups.get(*name) {
+            archetypes_to_run.extend(group.iter().map(String::as_str));
+        } else if cfg.archetypes.contains_key(*name) {
+            archetypes_to_run.push(name);
+        } else {
+            let mut available: Vec<&str> = cfg.archetypes.keys().map(String::as_str).collect();
+            let groups: Vec<&str> = cfg.groups.keys().map(String::as_str).collect();
+            available.extend(groups);
+            bail!(
+                "'{name}' not found in .review.toml\n  \
+                 configured: {}",
+                if available.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    available.join(", ")
+                }
+            );
+        }
+    }
+
+    // Deduplicate (e.g. "all" + a specific archetype, or overlapping groups)
+    let mut seen = std::collections::HashSet::new();
+    archetypes_to_run.retain(|name| seen.insert(*name));
 
     // Filter to archetypes that have sessions configured for this host
     let mut skipped: Vec<&str> = Vec::new();

@@ -16,6 +16,7 @@ Examples:
   echo \"You are a bugs expert\" | review prime bugs --provider claude  Create a session
   echo \"review staged changes\" | review security                   Send to security sessions
   echo \"full review please\" | review all                           Fan out to all archetypes
+  echo \"review please\" | review security,bugs,arch                 Multiple archetypes
   echo \"how to handle X?\" | review competitors                     Fan out to a group
   echo \"re-anchor please\" | review bugs --anchor                   Prepend grounding prefix
   echo \"just claude\" | review bugs --provider claude               Only use claude
@@ -25,6 +26,7 @@ Examples:
 #[command(
     name = "review",
     about = "Fan out code reviews to persistent AI sessions",
+    override_usage = "review [ARCHETYPE|COMMAND] [OPTIONS]",
     after_help = AFTER_HELP,
     subcommand_precedence_over_arg = true
 )]
@@ -33,6 +35,7 @@ pub struct Cli {
     pub command: Option<Command>,
 
     /// Archetype, group, or "all"
+    #[arg(help_heading = "Archetype")]
     pub archetype: Option<String>,
 
     /// Print the assembled prompt instead of sending it
