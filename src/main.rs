@@ -1,3 +1,4 @@
+mod audit;
 mod cli;
 mod config;
 mod input;
@@ -129,7 +130,13 @@ async fn main() -> Result<()> {
 
     // Spawn all providers with staggered launches to avoid rate limits
     let stagger = std::time::Duration::from_secs(cli.stagger);
-    let mut handles: Vec<(String, tokio::task::JoinHandle<provider::ProviderResult>)> = Vec::new();
+    struct PendingResult {
+        archetype: String,
+        session: String,
+        prompt: String,
+        handle: tokio::task::JoinHandle<provider::ProviderResult>,
+    }
+    let mut pending: Vec<PendingResult> = Vec::new();
     let mut warned_unavailable = std::collections::HashSet::new();
     let mut launch_count = 0u32;
 
@@ -165,20 +172,24 @@ async fn main() -> Result<()> {
             let root = project_root.clone();
             let delay = stagger * launch_count;
 
-            handles.push((
-                (*arch_name).to_string(),
-                tokio::spawn(async move {
+            let session_for_audit = sid.clone();
+            let prompt_for_audit = prompt.clone();
+            pending.push(PendingResult {
+                archetype: (*arch_name).to_string(),
+                session: session_for_audit,
+                prompt: prompt_for_audit,
+                handle: tokio::spawn(async move {
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
                     }
                     provider::invoke(&prov, &sid, model.as_deref(), &aname, &prompt, &root).await
                 }),
-            ));
+            });
             launch_count += 1;
         }
     }
 
-    if handles.is_empty() {
+    if pending.is_empty() {
         let msg = if let Some(ref filter) = provider_filter {
             format!(
                 "no providers matched --provider {}\n  \
@@ -193,22 +204,32 @@ async fn main() -> Result<()> {
     }
 
     // Collect results
-    let mut grouped: Vec<(String, provider::ProviderResult)> = Vec::new();
-    for (arch_name, handle) in handles {
-        let result = match handle.await {
+    let mut results: Vec<(String, provider::ProviderResult)> = Vec::new();
+    for p in pending {
+        let result = match p.handle.await {
             Ok(r) => r,
             Err(err) => provider::ProviderResult {
                 provider: "unknown".into(),
                 output: Err(anyhow::anyhow!("task panicked: {err}")),
             },
         };
-        grouped.push((arch_name, result));
+
+        audit::log_result(
+            &project_root,
+            &p.archetype,
+            &result.provider,
+            &p.session,
+            &p.prompt,
+            &result.output,
+        );
+
+        results.push((p.archetype, result));
     }
 
     // Print results
     let multi = runnable.len() > 1;
     let mut current_arch = "";
-    for (arch_name, result) in &grouped {
+    for (arch_name, result) in &results {
         if multi && arch_name.as_str() != current_arch {
             if !current_arch.is_empty() {
                 println!();
@@ -219,7 +240,7 @@ async fn main() -> Result<()> {
         provider::print_result(result);
     }
 
-    let all_failed = grouped.iter().all(|(_, r)| r.output.is_err());
+    let all_failed = results.iter().all(|(_, r)| r.output.is_err());
     if all_failed {
         std::process::exit(1);
     }
