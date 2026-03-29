@@ -45,6 +45,10 @@ pub struct Cli {
     /// Limit to specific providers (comma-separated, e.g. claude,kilo)
     #[arg(long, value_delimiter = ',')]
     pub provider: Option<Vec<String>>,
+
+    /// Seconds between each provider launch to avoid rate limits (default: 30, 0 to disable)
+    #[arg(long, default_value = "30")]
+    pub stagger: u64,
 }
 
 impl Cli {

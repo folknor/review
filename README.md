@@ -69,6 +69,7 @@ Use `all` to fan out to every configured archetype, or define **groups** to fan 
 | `--anchor` | Prepend grounding prefix to stdin |
 | `--dry-run` | Print what would be sent instead of sending it |
 | `--provider <list>` | Limit to specific providers (comma-separated) |
+| `--stagger <secs>` | Seconds between each provider launch (default: 30, 0 to disable) |
 
 By default, stdin goes directly to the provider sessions. Use `--anchor` for the first review in a session or to re-anchor a stale session.
 
@@ -158,6 +159,22 @@ echo "full sweep" | review sweep
 ```
 
 Define groups in the `[_groups]` table. Group names must not conflict with archetype names. `all` is reserved and runs every configured archetype.
+
+## Rate limits and staggering
+
+Provider APIs enforce rate limits across multiple dimensions — requests per minute (RPM), input tokens per minute (ITPM), and rolling usage quotas. The exact limits are not publicly documented for subscription plans, but in practice, firing multiple provider sessions simultaneously (e.g. a group of 5 claude sessions) will trigger RPM limits.
+
+A single Claude Code invocation generates 8-12 internal API calls through its tool-use architecture. Five concurrent sessions means 40-60 API calls hitting at once — enough to blow past most RPM budgets.
+
+To avoid this, provider launches are staggered by default. The first provider starts immediately; each subsequent one waits 30 seconds. All run concurrently once launched.
+
+```
+echo "review" | review sweep                    # 30s stagger (default)
+echo "review" | review sweep --stagger 10       # 10s stagger
+echo "review" | review sweep --stagger 0        # no stagger (risk rate limits)
+```
+
+If you're hitting rate limits, increase the stagger. If you're only running 1-2 providers, `--stagger 0` is fine.
 
 ## Concurrency
 

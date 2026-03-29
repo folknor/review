@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
     lock::acquire_blocking(&lock_file)?;
 
     // Spawn all providers with staggered launches to avoid rate limits
-    let stagger = std::time::Duration::from_secs(30);
+    let stagger = std::time::Duration::from_secs(cli.stagger);
     let mut handles: Vec<(String, tokio::task::JoinHandle<provider::ProviderResult>)> = Vec::new();
     let mut warned_unavailable = std::collections::HashSet::new();
     let mut launch_count = 0u32;
