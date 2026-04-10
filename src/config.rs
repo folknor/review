@@ -43,12 +43,16 @@ pub struct HostConfig {
     pub providers: BTreeMap<String, ProviderEntry>,
 }
 
-/// A provider entry: either just a session ID string, or a table with session + model.
+/// A provider entry: either just a session ID string, or a table with session + model + env.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum ProviderEntry {
     SessionOnly(String),
-    Full { session: String, model: Option<String> },
+    Full {
+        session: String,
+        model: Option<String>,
+        env: Option<BTreeMap<String, String>>,
+    },
 }
 
 impl ProviderEntry {
@@ -63,6 +67,13 @@ impl ProviderEntry {
         match self {
             Self::SessionOnly(_) => None,
             Self::Full { model, .. } => model.as_deref(),
+        }
+    }
+
+    pub fn env(&self) -> Option<&BTreeMap<String, String>> {
+        match self {
+            Self::SessionOnly(_) => None,
+            Self::Full { env, .. } => env.as_ref(),
         }
     }
 }
@@ -292,6 +303,24 @@ kilo = { session = \"sess-2\", model = \"anthropic/claude-sonnet-4.6\" }
         assert_eq!(host.providers["claude"].model(), Some("opus"));
         assert_eq!(host.providers["kilo"].session(), "sess-2");
         assert_eq!(host.providers["kilo"].model(), Some("anthropic/claude-sonnet-4.6"));
+    }
+
+    #[test]
+    fn parses_env_vars() {
+        let raw = "\
+[bugs.myhost]
+claude = { session = \"sess-1\", env = { ANTHROPIC_BASE_URL = \"http://localhost:8787\", FOO = \"bar\" } }
+codex = { session = \"sess-2\", model = \"o3\" }
+";
+        let cfg = parse(raw).unwrap();
+        let host = cfg.archetypes["bugs"].resolve_host("myhost").unwrap();
+
+        let env = host.providers["claude"].env().unwrap();
+        assert_eq!(env.len(), 2);
+        assert_eq!(env["ANTHROPIC_BASE_URL"], "http://localhost:8787");
+        assert_eq!(env["FOO"], "bar");
+
+        assert!(host.providers["codex"].env().is_none());
     }
 
     #[test]

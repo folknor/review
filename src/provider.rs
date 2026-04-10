@@ -27,15 +27,16 @@ pub async fn invoke(
     provider: &str,
     session_id: &str,
     model: Option<&str>,
+    env: Option<&std::collections::BTreeMap<String, String>>,
     archetype: &str,
     prompt: &str,
     project_root: &Path,
 ) -> ProviderResult {
     let result = match provider {
-        "claude" => run_claude(session_id, model, prompt, project_root).await,
-        "codex" => run_codex(session_id, model, archetype, prompt, project_root).await,
-        "kilo" => run_stdout_provider("kilo", session_id, model, prompt, project_root).await,
-        "opencode" => run_stdout_provider("opencode", session_id, model, prompt, project_root).await,
+        "claude" => run_claude(session_id, model, env, prompt, project_root).await,
+        "codex" => run_codex(session_id, model, env, archetype, prompt, project_root).await,
+        "kilo" => run_stdout_provider("kilo", session_id, model, env, prompt, project_root).await,
+        "opencode" => run_stdout_provider("opencode", session_id, model, env, prompt, project_root).await,
         other => Err(anyhow::anyhow!("unknown provider: {other}")),
     };
     ProviderResult {
@@ -84,7 +85,7 @@ async fn run_with_stdout(mut child: tokio::process::Child, prompt: &str, provide
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-async fn run_claude(session_id: &str, model: Option<&str>, prompt: &str, project_root: &Path) -> Result<String> {
+async fn run_claude(session_id: &str, model: Option<&str>, env: Option<&std::collections::BTreeMap<String, String>>, prompt: &str, project_root: &Path) -> Result<String> {
     let mut args = vec!["--resume", session_id, "--print", "--permission-mode", "dontAsk"];
     let model_owned;
     if let Some(m) = model {
@@ -93,14 +94,16 @@ async fn run_claude(session_id: &str, model: Option<&str>, prompt: &str, project
         args.push(&model_owned);
     }
 
-    let child = Command::new("claude")
-        .args(&args)
+    let mut cmd = Command::new("claude");
+    cmd.args(&args)
         .current_dir(project_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn claude")?;
+        .stderr(Stdio::piped());
+    if let Some(vars) = env {
+        cmd.envs(vars);
+    }
+    let child = cmd.spawn().context("failed to spawn claude")?;
 
     run_with_stdout(child, prompt, "claude").await
 }
@@ -108,6 +111,7 @@ async fn run_claude(session_id: &str, model: Option<&str>, prompt: &str, project
 async fn run_codex(
     session_id: &str,
     model: Option<&str>,
+    env: Option<&std::collections::BTreeMap<String, String>>,
     archetype: &str,
     prompt: &str,
     project_root: &Path,
@@ -121,14 +125,16 @@ async fn run_codex(
     }
     args.extend(["resume".to_string(), session_id.to_string(), "-o".to_string(), output_path.clone()]);
 
-    let mut child = Command::new("codex")
-        .args(&args)
+    let mut cmd = Command::new("codex");
+    cmd.args(&args)
         .current_dir(project_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn codex")?;
+        .stderr(Stdio::piped());
+    if let Some(vars) = env {
+        cmd.envs(vars);
+    }
+    let mut child = cmd.spawn().context("failed to spawn codex")?;
 
     let stdin = child.stdin.take().context("failed to open codex stdin")?;
     let write_result = write_stdin(stdin, prompt.as_bytes().to_vec());
@@ -159,6 +165,7 @@ async fn run_stdout_provider(
     provider: &str,
     session_id: &str,
     model: Option<&str>,
+    env: Option<&std::collections::BTreeMap<String, String>>,
     prompt: &str,
     project_root: &Path,
 ) -> Result<String> {
@@ -171,13 +178,16 @@ async fn run_stdout_provider(
     args.push("--dir".to_string());
     args.push(dir);
 
-    let child = Command::new(provider)
-        .args(&args)
+    let mut cmd = Command::new(provider);
+    cmd.args(&args)
         .current_dir(project_root)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    if let Some(vars) = env {
+        cmd.envs(vars);
+    }
+    let child = cmd.spawn()
         .with_context(|| format!("failed to spawn {provider}"))?;
 
     run_with_stdout(child, prompt, provider).await

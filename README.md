@@ -140,12 +140,15 @@ competitors = ["tilemaker", "tippecanoe"]
 
 Session IDs are scoped by hostname, so the same `.review.toml` works across machines with different sessions.
 
-Provider entries can be a simple session ID string or a table with session + model:
+Provider entries can be a simple session ID string or a table with session, model, and env:
 
 ```toml
 claude = "session-id"                                        # default model
 codex = { session = "session-id", model = "o3" }             # explicit model
 kilo = { session = "session-id", model = "anthropic/claude-sonnet-4.6" }
+
+# environment variables passed to the provider process
+claude = { session = "session-id", env = { ANTHROPIC_BASE_URL = "http://localhost:8787" } }
 ```
 
 ### Providers

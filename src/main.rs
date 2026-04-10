@@ -197,6 +197,7 @@ async fn main() -> Result<()> {
             let prov = prov_name.clone();
             let sid = entry.session().to_string();
             let model = entry.model().map(String::from);
+            let env = entry.env().cloned();
             let aname = (*arch_name).to_string();
             let prompt = assembled.clone();
             let root = project_root.clone();
@@ -212,7 +213,7 @@ async fn main() -> Result<()> {
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
                     }
-                    provider::invoke(&prov, &sid, model.as_deref(), &aname, &prompt, &root).await
+                    provider::invoke(&prov, &sid, model.as_deref(), env.as_ref(), &aname, &prompt, &root).await
                 }),
             });
             launch_count += 1;

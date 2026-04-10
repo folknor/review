@@ -65,6 +65,7 @@ claude = "session-id"
 codex = { session = "session-id", model = "o3" }
 kilo = { session = "session-id", model = "anthropic/claude-sonnet-4.6" }
 opencode = { session = "session-id", model = "openai/gpt-5" }
+claude = { session = "session-id", env = { ANTHROPIC_BASE_URL = "http://localhost:8787" } }
 
 [_groups]
 sweep = ["security", "bugs"]
