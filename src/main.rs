@@ -315,8 +315,33 @@ async fn run_prime(archetype: &str, providers: &[String]) -> Result<()> {
     })?;
 
     let config_path = project_root.join(".review.toml");
+
+    // Read stdin before taking the lock (can block on a slow pipe).
     let piped = input::read_stdin_optional()?;
+
+    // Global lock: serialize against other `review` invocations so config
+    // reads and writes stay consistent. Held through provider priming.
+    let lock_path = std::env::temp_dir().join("review.lock");
+    let lock_file = std::fs::File::create(&lock_path)
+        .map_err(|e| anyhow::anyhow!("failed to create lock file: {e}"))?;
+    lock::acquire_blocking(&lock_file)?;
+
+    // Re-load config under the lock so we see any concurrent writer's changes.
+    let cfg = match config::load() {
+        Ok((c, _)) => c,
+        Err(_) => cfg,
+    };
+
     let stored = cfg.prime.get(archetype).cloned();
+    if let Some(ref s) = stored
+        && s.len() > input::MAX_STDIN_BYTES
+    {
+        bail!(
+            "stored prime prompt for '{archetype}' exceeds {} byte limit (found {})",
+            input::MAX_STDIN_BYTES,
+            s.len()
+        );
+    }
 
     let (stdin_prompt, save_prompt) = match (piped, stored) {
         (Some(_), Some(_)) => bail!(
@@ -360,12 +385,17 @@ async fn run_prime(archetype: &str, providers: &[String]) -> Result<()> {
         bail!("no sessions were created");
     }
 
-    // Write to .review.toml
-    config_write::append_sessions(&config_path, archetype, &hostname, &sessions)?;
+    // Atomic single-pass write: sessions and (optionally) the stored prompt
+    // land together, or not at all.
+    config_write::write_prime_result(
+        &config_path,
+        archetype,
+        &hostname,
+        &sessions,
+        if save_prompt { Some(stdin_prompt.as_str()) } else { None },
+    )?;
 
-    if save_prompt {
-        config_write::insert_prime_prompt(&config_path, archetype, &stdin_prompt)?;
-    }
+    drop(lock_file);
 
     eprintln!();
     eprintln!("Added to .review.toml:");

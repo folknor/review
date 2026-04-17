@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use std::io::{IsTerminal, Read};
 
-const MAX_STDIN_BYTES: usize = 20_000;
+pub const MAX_STDIN_BYTES: usize = 20_000;
 
 pub fn read_stdin() -> Result<String> {
     match read_stdin_optional()? {

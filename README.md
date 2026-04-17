@@ -45,7 +45,13 @@ Or use `review prime` to create sessions and register them automatically:
 echo "You are a security expert for this project. Read the codebase." | review prime security --provider claude,codex
 ```
 
-`review prime` creates new sessions, sends the priming prompt, and writes the session IDs to `.review.toml` automatically.
+`review prime` creates new sessions, sends the priming prompt, and writes the session IDs to `.review.toml` automatically. The prompt is stored under `[_prime]` so if a session later breaks you can re-prime with a fresh session without retyping it:
+
+```
+review prime security --provider claude    # stdin omitted; reuses stored prompt
+```
+
+Re-priming replaces the stale session ID in place. Manually-added `model` and `env` overrides on a provider entry are preserved.
 
 ### 3. Run reviews
 
