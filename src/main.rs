@@ -300,7 +300,7 @@ async fn run_prime(archetype: &str, providers: &[String]) -> Result<()> {
     }
 
     // Find .review.toml (or note that we'll create entries anyway)
-    let (_, project_root) = config::load().or_else(|_| {
+    let (cfg, project_root) = config::load().or_else(|_| {
         // Config might not exist yet — that's fine for prime
         let cwd = std::env::current_dir()?;
         Ok::<_, anyhow::Error>((
@@ -308,13 +308,34 @@ async fn run_prime(archetype: &str, providers: &[String]) -> Result<()> {
                 archetypes: std::collections::BTreeMap::new(),
                 groups: std::collections::BTreeMap::new(),
                 audit: config::AuditConfig::default(),
+                prime: std::collections::BTreeMap::new(),
             },
             cwd,
         ))
     })?;
 
     let config_path = project_root.join(".review.toml");
-    let stdin_prompt = input::read_stdin()?;
+    let piped = input::read_stdin_optional()?;
+    let stored = cfg.prime.get(archetype).cloned();
+
+    let (stdin_prompt, save_prompt) = match (piped, stored) {
+        (Some(_), Some(_)) => bail!(
+            "a prime prompt for '{archetype}' is already stored in .review.toml\n  \
+             Remove [_prime].{archetype} manually if you want to replace it,\n  \
+             or omit stdin to reuse the stored prompt."
+        ),
+        (Some(s), None) => (s, true),
+        (None, Some(s)) => {
+            eprintln!("Using stored prime prompt from .review.toml");
+            (s, false)
+        }
+        (None, None) => bail!(
+            "no instructions provided on stdin and no stored prompt for '{archetype}'\n\n\
+             Pipe instructions via stdin, e.g.:\n  \
+             echo \"you are a bugs expert\" | review prime {archetype} --provider claude"
+        ),
+    };
+
     let hostname = config::hostname();
 
     eprintln!("Priming archetype '{archetype}' for host '{hostname}'");
@@ -341,6 +362,10 @@ async fn run_prime(archetype: &str, providers: &[String]) -> Result<()> {
 
     // Write to .review.toml
     config_write::append_sessions(&config_path, archetype, &hostname, &sessions)?;
+
+    if save_prompt {
+        config_write::insert_prime_prompt(&config_path, archetype, &stdin_prompt)?;
+    }
 
     eprintln!();
     eprintln!("Added to .review.toml:");

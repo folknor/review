@@ -1,5 +1,23 @@
 use clap::{CommandFactory, Parser, Subcommand};
 
+const PRIME_LONG_ABOUT: &str = "\
+Create new provider sessions for an archetype and add them to .review.toml.
+
+The priming prompt is stored in .review.toml under [_prime] on first use,
+so if a session later breaks you can re-prime without retyping it:
+
+  First prime (stdin required — prompt gets stored):
+    echo \"you are a bugs expert\" | review prime bugs --provider claude
+
+  Re-prime later (stdin omitted — stored prompt is reused, new session created):
+    review prime bugs --provider claude
+
+Re-priming replaces stale session IDs in-place. Manually-added `model` and
+`env` overrides on a provider entry are preserved.
+
+Passing stdin while a stored prompt already exists is an error, to avoid
+silently overwriting it. Remove the entry from [_prime] to replace it.";
+
 const AFTER_HELP: &str = "\
 Archetypes are named reviewer sessions defined in .review.toml.
 Groups fan out to multiple archetypes (defined under [_groups]).
@@ -13,7 +31,8 @@ already have project context from previous interactions.
 
 Examples:
   review init                                              Create a .review.toml
-  echo \"You are a bugs expert\" | review prime bugs --provider claude  Create a session
+  echo \"You are a bugs expert\" | review prime bugs --provider claude  Create a session (prompt stored)
+  review prime bugs --provider claude                      Re-prime using the stored prompt
   echo \"review staged changes\" | review security                   Send to security sessions
   echo \"full review please\" | review all                           Fan out to all archetypes
   echo \"review please\" | review security,bugs,arch                 Multiple archetypes
@@ -68,6 +87,7 @@ pub enum Command {
     Init,
 
     /// Create new provider sessions for an archetype and add them to .review.toml
+    #[command(long_about = PRIME_LONG_ABOUT)]
     Prime {
         /// Archetype name to create sessions for
         archetype: String,

@@ -15,6 +15,7 @@ libc = "0.2"
 toml = "1"
 gethostname = "1"
 which = "8"
+toml_edit = "0.25.11"
 
 [lints.clippy]
 # Style: modern idiomatic Rust

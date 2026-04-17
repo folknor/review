@@ -18,6 +18,8 @@ pub struct RawConfig {
     pub groups: BTreeMap<String, Vec<String>>,
     #[serde(default, rename = "_audit")]
     pub audit: AuditConfig,
+    #[serde(default, rename = "_prime")]
+    pub prime: BTreeMap<String, String>,
     #[serde(flatten)]
     pub archetypes: BTreeMap<String, ArchetypeConfig>,
 }
@@ -27,6 +29,7 @@ pub struct ReviewConfig {
     pub archetypes: BTreeMap<String, ArchetypeConfig>,
     pub groups: BTreeMap<String, Vec<String>>,
     pub audit: AuditConfig,
+    pub prime: BTreeMap<String, String>,
 }
 
 /// Per-archetype config: maps hostname → host config.
@@ -214,6 +217,7 @@ pub fn parse(raw: &str) -> Result<ReviewConfig> {
         archetypes: raw_cfg.archetypes,
         groups: raw_cfg.groups,
         audit: raw_cfg.audit,
+        prime: raw_cfg.prime,
     })
 }
 
