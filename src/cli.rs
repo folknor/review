@@ -67,8 +67,9 @@ pub struct Cli {
     #[arg(long)]
     pub anchor: bool,
 
-    /// Skip session resume; start fresh providers and prepend the stored prime prompt.
-    /// Implies --anchor.
+    /// Skip session resume; start a fresh persistable session and prepend the stored prime prompt.
+    /// For claude and codex, the new session ID is printed to stdout (above the response) so it
+    /// can be reused via --session for cache-warm follow-ups. Implies --anchor.
     #[arg(long)]
     pub oneshot: bool,
 

@@ -88,7 +88,8 @@ Use `all` to fan out to every configured archetype, or define **groups** to fan 
 | Flag | Description |
 |------|-------------|
 | `--anchor` | Prepend grounding prefix to stdin |
-| `--oneshot` | Skip session resume; start fresh each call and prepend the stored prime prompt. Implies `--anchor`. |
+| `--oneshot` | Skip session resume; start a fresh persistable session and prepend the stored prime prompt. Emits the new session ID for follow-up via `--session`. Implies `--anchor`. |
+| `--session <id>` | Resume a specific session. Sends raw stdin (no PREFIX, prime, or anchor). Requires a single `--provider`; mutually exclusive with `--oneshot` and `--anchor`. |
 | `--dry-run` | Print what would be sent instead of sending it |
 | `--provider <list>` | Limit to specific providers (comma-separated) |
 | `--stagger <secs>` | Seconds between each provider launch (default: 30, 0 to disable) |
@@ -97,7 +98,7 @@ By default, stdin goes directly to the provider sessions. Use `--anchor` for the
 
 ### Oneshot mode
 
-`--oneshot` skips session resume entirely. Each call starts fresh providers, prepends the priming prompt stored under `[_prime].<archetype>`, and lets the agent fetch code itself.
+`--oneshot` skips session resume entirely. Each call starts a fresh provider session, prepends the priming prompt stored under `[_prime].<archetype>`, and lets the agent fetch code itself.
 
 ```
 echo "check the new auth flow" | review --oneshot security,bugs
@@ -105,16 +106,41 @@ echo "check the new auth flow" | review --oneshot security,bugs
 
 Use this when reviews happen far enough apart that the prompt cache has expired (default 5min, up to 1h with the right env vars). Resuming a long-lived session means reprocessing the entire accumulated prefix on every wake — expensive in API tokens and corrosive to subscription rate-limit windows for once-a-day usage. Oneshot keeps the prefix small and predictable.
 
-`.review.toml` still drives provider selection and `model`/`env` overrides; the session IDs are simply unused. If no `[_prime]` entry exists for the archetype, the prime block is silently skipped.
+`.review.toml` still drives provider selection and `model`/`env` overrides; the session IDs from `[archetype.host]` are simply unused. If no `[_prime]` entry exists for the archetype, the prime block is silently skipped.
+
+The fresh sessions are persistable — for claude and codex, the new session ID is printed above the response so the operator can follow up via `--session <id>` while the cache is warm:
+
+```
+echo "check the new auth flow" | review bugs --oneshot --provider claude
+--- claude ---
+session: 019deabc-0def-7000-8000-abcdef012345
+<findings>
+```
 
 Per-provider behavior in oneshot mode:
 
-| Provider | Oneshot args |
-|----------|--------------|
-| claude | `--print --permission-mode dontAsk --no-session-persistence` |
-| codex | `exec --sandbox read-only --ephemeral` |
-| kilo | `run --auto` (auto-approve permissions; sessions don't carry pre-approval) |
-| opencode | `run` (no auto-approve flag — may prompt; use the regular session flow if it does) |
+| Provider | Oneshot args | Captures session ID? |
+|----------|--------------|----------------------|
+| claude | `--session-id <generated> --print --permission-mode dontAsk` | yes (UUID generated up front) |
+| codex | `exec --sandbox read-only --json` | yes (parsed from `thread.started`) |
+| kilo | `run --auto` (auto-approve permissions; sessions don't carry pre-approval) | not yet |
+| opencode | `run` (no auto-approve flag — may prompt; use the regular session flow if it does) | not yet |
+
+### Follow-up via `--session`
+
+`--session <id>` resumes a specific provider session and sends raw stdin — no PREFIX, no prime, no anchor. The grounding is already in the session's history from the original `--oneshot` (or `prime`) call.
+
+```
+echo "what's the worst of those for a single-account user?" | \
+  review bugs --provider claude --session 019deabc-0def-7000-8000-abcdef012345
+```
+
+Constraints:
+
+- Requires exactly one `--provider`. Session IDs are provider-scoped.
+- Mutually exclusive with `--oneshot` and `--anchor`.
+- Bypasses `.review.toml` entirely — model/env overrides from the config are not applied. If you need a non-default model on a follow-up, switch to the persistent-archetype-session flow.
+- Validation of the session ID is delegated to the provider; an unknown ID produces a provider-specific error, not a `review` error.
 
 ### Output format
 

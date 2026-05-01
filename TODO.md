@@ -11,7 +11,7 @@ Phase 1 (done) implements `review prime` for claude and codex:
 - Codex: parses `thread_id` from `--json` JSONL output
 - Appends session IDs to `.review.toml` (handles existing sections)
 
-Phase 2: kilo and opencode support.
+Phase 2: kilo and opencode support — needed both for `review prime` and for `--oneshot` session-ID emission (currently kilo/opencode oneshots run, but the session is unreachable for follow-up via `--session` because we don't capture the ID).
 
 **Kilo** — `--format json` does not emit a session ID event before task completion (output is buffered). But `kilo session list` shows sessions:
 ```
@@ -20,6 +20,8 @@ ses_2c61344d5ffe61Moxe9A1e3Klk  New session - 2026-03-29T14:08:28.970Z
 Approach: run `kilo session list` before and after priming, diff to find the new one. Note: ID format is `ses_*`, not UUID.
 
 **OpenCode** — same as Kilo (shared codebase). Same buffered JSON, same `session list` approach.
+
+Once kilo/opencode capture is implemented, wire it into `run_stdout_provider` so `--oneshot` can emit their session IDs alongside claude/codex.
 
 ### Open questions
 
