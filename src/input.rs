@@ -14,7 +14,11 @@ pub fn read_stdin() -> Result<String> {
     }
 }
 
-/// Read stdin if piped; return None if stdin is a terminal.
+/// Read stdin if piped; return None if stdin is a terminal or empty.
+///
+/// `is_terminal()` alone is not enough: when invoked from a non-interactive
+/// parent (Claude Code's Bash tool, scripts, CI, xargs), stdin is not a TTY
+/// but also has no data. Treat an empty read as "no input."
 pub fn read_stdin_optional() -> Result<Option<String>> {
     if std::io::stdin().is_terminal() {
         return Ok(None);
@@ -26,6 +30,9 @@ pub fn read_stdin_optional() -> Result<Option<String>> {
         .context("failed to read from stdin")?;
     if buf.len() > MAX_STDIN_BYTES {
         bail!("stdin instructions exceed {MAX_STDIN_BYTES} byte limit");
+    }
+    if buf.is_empty() {
+        return Ok(None);
     }
     Ok(Some(buf))
 }
