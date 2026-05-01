@@ -33,6 +33,22 @@ async fn main() -> Result<()> {
         }
     };
 
+    if let Some(ref session_id) = cli.session {
+        if cli.oneshot {
+            bail!("--session and --oneshot are mutually exclusive");
+        }
+        if cli.anchor {
+            bail!("--session and --anchor are mutually exclusive (resumed sessions already have grounding)");
+        }
+        let providers = cli.provider.as_ref().map(Vec::as_slice).unwrap_or(&[]);
+        let provider_name = match providers {
+            [one] => one.as_str(),
+            [] => bail!("--session requires --provider <name> (single provider)"),
+            _ => bail!("--session requires exactly one --provider, got {}", providers.len()),
+        };
+        return run_session_resume(archetype_name, provider_name, session_id, cli.dry_run).await;
+    }
+
     let (mut cfg, project_root) = config::load()?;
     let stdin_instructions = input::read_stdin()?;
 
@@ -260,16 +276,20 @@ async fn main() -> Result<()> {
             Err(err) => provider::ProviderResult {
                 provider: "unknown".into(),
                 output: Err(anyhow::anyhow!("task panicked: {err}")),
+                session_id: None,
             },
         };
 
+        // Prefer the captured session ID (from --oneshot) over the placeholder
+        // empty string we stored at launch time.
+        let session_for_log = result.session_id.as_deref().unwrap_or(&p.session);
         audit::log_result(
             &project_root,
             cfg.audit.private,
             &audit_id,
             &p.archetype,
             &result.provider,
-            &p.session,
+            session_for_log,
             &p.prompt,
             &result.output,
         );
@@ -296,6 +316,93 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    Ok(())
+}
+
+/// `--session <id>` mode: resume a specific provider session and send raw
+/// stdin. No `.review.toml` lookup, no PREFIX, no prime, no anchor — the
+/// session already has its grounding from the original interaction. Single
+/// provider, single archetype (the archetype is cosmetic context for audit).
+async fn run_session_resume(
+    archetype: &str,
+    provider_name: &str,
+    session_id: &str,
+    dry_run: bool,
+) -> Result<()> {
+    if !config::KNOWN_PROVIDERS.contains(&provider_name) {
+        bail!(
+            "unknown provider '{provider_name}'\n  supported: {}",
+            config::KNOWN_PROVIDERS.join(", ")
+        );
+    }
+
+    let stdin_instructions = input::read_stdin()?;
+    let project_root = config::load()
+        .map(|(_, root)| root)
+        .or_else(|_| std::env::current_dir().map_err(anyhow::Error::from))?;
+
+    if dry_run {
+        eprintln!("session: {session_id}");
+        eprintln!("provider: {provider_name}");
+        eprintln!("archetype: {archetype}");
+        println!("{stdin_instructions}");
+        return Ok(());
+    }
+
+    if !provider::is_available(provider_name) {
+        bail!("'{provider_name}' not found on PATH");
+    }
+
+    // Global lock: serialize against other `review` invocations.
+    let lock_path = std::env::temp_dir().join("review.lock");
+    let lock_file = std::fs::File::create(&lock_path)
+        .map_err(|e| anyhow::anyhow!("failed to create lock file: {e}"))?;
+    lock::acquire_blocking(&lock_file)?;
+
+    let result = provider::invoke(
+        provider_name,
+        session_id,
+        None,
+        None,
+        archetype,
+        &stdin_instructions,
+        &project_root,
+        false,
+    )
+    .await;
+
+    drop(lock_file);
+
+    // Audit log: load config opportunistically for audit_id/private settings;
+    // tolerate the case where .review.toml is absent.
+    if let Ok((mut cfg, root)) = config::load() {
+        let audit_id = match cfg.audit.id {
+            Some(ref id) => id.clone(),
+            None => {
+                let id = config::generate_short_id();
+                let config_path = root.join(".review.toml");
+                let _ = config_write::append_audit_id(&config_path, &id);
+                cfg.audit.id = Some(id.clone());
+                id
+            }
+        };
+        audit::log_result(
+            &root,
+            cfg.audit.private,
+            &audit_id,
+            archetype,
+            &result.provider,
+            session_id,
+            &stdin_instructions,
+            &result.output,
+        );
+    }
+
+    provider::print_result(&result);
+
+    if result.output.is_err() {
+        std::process::exit(1);
+    }
     Ok(())
 }
 

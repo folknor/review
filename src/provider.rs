@@ -21,6 +21,9 @@ fn temp_path(archetype: &str, provider: &str) -> String {
 pub struct ProviderResult {
     pub provider: String,
     pub output: Result<String>,
+    /// Session ID associated with this invocation, when one is known to the
+    /// caller (e.g. `--oneshot` captures the freshly-created session).
+    pub session_id: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -41,9 +44,14 @@ pub async fn invoke(
         "opencode" => run_stdout_provider("opencode", session_id, model, env, prompt, project_root, oneshot).await,
         other => Err(anyhow::anyhow!("unknown provider: {other}")),
     };
+    let (output, captured) = match result {
+        Ok((text, sid)) => (Ok(text), sid),
+        Err(e) => (Err(e), None),
+    };
     ProviderResult {
         provider: provider.to_string(),
-        output: result,
+        output,
+        session_id: captured,
     }
 }
 
@@ -94,9 +102,15 @@ async fn run_claude(
     prompt: &str,
     project_root: &Path,
     oneshot: bool,
-) -> Result<String> {
-    let mut args: Vec<&str> = if oneshot {
-        vec!["--print", "--permission-mode", "dontAsk", "--no-session-persistence"]
+) -> Result<(String, Option<String>)> {
+    // In oneshot mode, generate a UUID up front and pass it via --session-id
+    // so the fresh session is persistable and the operator can follow up via
+    // `--session <id>`. (Previously used --no-session-persistence, which made
+    // the session unreachable.)
+    let oneshot_id = if oneshot { Some(crate::prime::generate_uuid()) } else { None };
+
+    let mut args: Vec<&str> = if let Some(ref id) = oneshot_id {
+        vec!["--session-id", id, "--print", "--permission-mode", "dontAsk"]
     } else {
         vec!["--resume", session_id, "--print", "--permission-mode", "dontAsk"]
     };
@@ -118,7 +132,8 @@ async fn run_claude(
     }
     let child = cmd.spawn().context("failed to spawn claude")?;
 
-    run_with_stdout(child, prompt, "claude").await
+    let text = run_with_stdout(child, prompt, "claude").await?;
+    Ok((text, oneshot_id))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -130,22 +145,19 @@ async fn run_codex(
     prompt: &str,
     project_root: &Path,
     oneshot: bool,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
+    if oneshot {
+        return run_codex_oneshot(model, env, prompt, project_root).await;
+    }
+
     let output_path = temp_path(archetype, "codex");
 
     let mut args: Vec<String> = vec!["exec".to_string(), "--sandbox".to_string(), "read-only".to_string()];
-    if oneshot {
-        args.push("--ephemeral".to_string());
-    }
     if let Some(m) = model {
         args.push("-m".to_string());
         args.push(m.to_string());
     }
-    if oneshot {
-        args.extend(["-o".to_string(), output_path.clone()]);
-    } else {
-        args.extend(["resume".to_string(), session_id.to_string(), "-o".to_string(), output_path.clone()]);
-    }
+    args.extend(["resume".to_string(), session_id.to_string(), "-o".to_string(), output_path.clone()]);
 
     let mut cmd = Command::new("codex");
     cmd.args(&args)
@@ -179,11 +191,88 @@ async fn run_codex(
     let result = tokio::fs::read_to_string(&output_path).await;
     cleanup().await;
 
-    result.with_context(|| format!("failed to read codex output from {output_path}"))
+    let text = result.with_context(|| format!("failed to read codex output from {output_path}"))?;
+    Ok((text, None))
+}
+
+/// Oneshot codex: use `--json` so we can capture the freshly-created
+/// thread_id from the JSONL stream alongside the response text. Drops
+/// `--ephemeral` so the session is persistable for follow-ups via
+/// `--session <id>`.
+async fn run_codex_oneshot(
+    model: Option<&str>,
+    env: Option<&std::collections::BTreeMap<String, String>>,
+    prompt: &str,
+    project_root: &Path,
+) -> Result<(String, Option<String>)> {
+    let mut args: Vec<String> = vec![
+        "exec".to_string(),
+        "--sandbox".to_string(),
+        "read-only".to_string(),
+        "--json".to_string(),
+    ];
+    if let Some(m) = model {
+        args.push("-m".to_string());
+        args.push(m.to_string());
+    }
+
+    let mut cmd = Command::new("codex");
+    cmd.args(&args)
+        .current_dir(project_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(vars) = env {
+        cmd.envs(vars);
+    }
+    let mut child = cmd.spawn().context("failed to spawn codex")?;
+
+    let stdin = child.stdin.take().context("failed to open codex stdin")?;
+    let write_result = write_stdin(stdin, prompt.as_bytes().to_vec());
+    let output = child.wait_with_output();
+
+    let (write_res, output) = tokio::join!(write_result, output);
+    let output = output.context("failed to wait for codex")?;
+
+    if !output.status.success() {
+        if let Err(e) = write_res {
+            anyhow::bail!("failed to write prompt: {e}");
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("codex exited with error: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut session_id: Option<String> = None;
+    let mut response_text: Option<String> = None;
+    for line in stdout.lines() {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+            match val.get("type").and_then(|t| t.as_str()) {
+                Some("thread.started") => {
+                    session_id = val.get("thread_id").and_then(|t| t.as_str()).map(String::from);
+                }
+                Some("item.completed") => {
+                    response_text = val
+                        .get("item")
+                        .and_then(|i| i.get("text"))
+                        .and_then(|t| t.as_str())
+                        .map(String::from);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let text = response_text
+        .ok_or_else(|| anyhow::anyhow!("could not find item.completed in codex output"))?;
+    Ok((text, session_id))
 }
 
 /// Run kilo or opencode — both use `<binary> run [-s <id>] [-m M] --dir <path>` and output to stdout.
 /// In oneshot mode, kilo gets `--auto` to bypass interactive permission prompts; opencode runs plain.
+/// Session-ID capture for these providers is not implemented yet, so the caller gets `None`
+/// back even in `--oneshot` mode (oneshot kilo/opencode follow-ups via `--session` are not
+/// supported until we add per-provider capture).
 async fn run_stdout_provider(
     provider: &str,
     session_id: &str,
@@ -192,7 +281,7 @@ async fn run_stdout_provider(
     prompt: &str,
     project_root: &Path,
     oneshot: bool,
-) -> Result<String> {
+) -> Result<(String, Option<String>)> {
     let mut args: Vec<String> = vec!["run".to_string()];
     if oneshot {
         if provider == "kilo" {
@@ -222,13 +311,17 @@ async fn run_stdout_provider(
     let child = cmd.spawn()
         .with_context(|| format!("failed to spawn {provider}"))?;
 
-    run_with_stdout(child, prompt, provider).await
+    let text = run_with_stdout(child, prompt, provider).await?;
+    Ok((text, None))
 }
 
 pub fn print_result(result: &ProviderResult) {
     match &result.output {
         Ok(text) => {
             println!("--- {} ---", result.provider);
+            if let Some(ref sid) = result.session_id {
+                println!("session: {sid}");
+            }
             println!("{text}");
         }
         Err(err) => {

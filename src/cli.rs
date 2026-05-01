@@ -39,6 +39,7 @@ Examples:
   echo \"how to handle X?\" | review competitors                     Fan out to a group
   echo \"re-anchor please\" | review bugs --anchor                   Prepend grounding prefix
   echo \"check now\" | review --oneshot security,bugs               Fresh sessions, prepend stored prime
+  echo \"follow up\" | review bugs --provider claude --session ID    Resume a specific session
   echo \"just claude\" | review bugs --provider claude               Only use claude
   echo \"check for issues\" | review bugs --dry-run                  Preview the prompt";
 
@@ -70,6 +71,11 @@ pub struct Cli {
     /// Implies --anchor.
     #[arg(long)]
     pub oneshot: bool,
+
+    /// Resume a specific session ID (no prefix, prime, or anchor prepended).
+    /// Requires a single --provider; mutually exclusive with --oneshot and --anchor.
+    #[arg(long, value_name = "ID")]
+    pub session: Option<String>,
 
     /// Limit to specific providers (comma-separated, e.g. claude,kilo)
     #[arg(long, value_delimiter = ',')]

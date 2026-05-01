@@ -137,7 +137,7 @@ async fn prime_codex(prompt: &str, project_root: &Path) -> Result<PrimedSession>
     })
 }
 
-fn generate_uuid() -> String {
+pub fn generate_uuid() -> String {
     // Read from /proc/sys/kernel/random/uuid (Linux)
     std::fs::read_to_string("/proc/sys/kernel/random/uuid")
         .map(|s| s.trim().to_string())
