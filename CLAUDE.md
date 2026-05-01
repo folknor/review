@@ -41,6 +41,7 @@ Single binary crate, no workspace.
 - `src/input.rs` — Reads stdin instructions (required, 20KB limit).
 - `src/prompt.rs` — Assembles: compiled prefix + stdin (`--anchor`), or prefix + `[_prime]` prompt + stdin (`--oneshot`).
 - `src/provider.rs` — Async provider invocation. Prompts piped via stdin. Claude uses `--permission-mode dontAsk`, Codex uses `--sandbox read-only`. In oneshot mode each provider runs a fresh persistable session (claude `--session-id <generated UUID>`, codex `--json` to capture `thread_id`, kilo `--auto`, opencode plain). Claude/codex emit the new session ID via `ProviderResult.session_id` so the operator can follow up via `--session`.
+- `src/sessions.rs` — Append-only sidecar log at `~/.local/share/review/sessions.jsonl` (or `sessions-private.jsonl` if `audit.private`). One row per `--oneshot` that captured a session ID (`kind = "oneshot"`) and one per `--session` resume (`kind = "session"`). Rows carry timestamp, project, hostname, audit_id, provider, archetype, session_id, model, env var *names* (not values — those can carry secrets), operator prompt, assembled prompt, response or error, and review version.
 - `src/prime.rs` — Session creation for `review prime`. Claude uses `--session-id`, Codex uses `--json` to capture `thread_id`.
 - `src/config_write.rs` — Appends session entries to `.review.toml`.
 - `src/main.rs` — Wires CLI to config, prompt assembly, and provider dispatch.

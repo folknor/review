@@ -7,6 +7,7 @@ mod lock;
 mod prime;
 mod prompt;
 mod provider;
+mod sessions;
 
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -183,6 +184,10 @@ async fn main() -> Result<()> {
         archetype: String,
         session: String,
         prompt: String,
+        operator_prompt: String,
+        model: Option<String>,
+        env_keys: Vec<String>,
+        oneshot: bool,
         handle: tokio::task::JoinHandle<provider::ProviderResult>,
     }
     let mut pending: Vec<PendingResult> = Vec::new();
@@ -224,6 +229,10 @@ async fn main() -> Result<()> {
             };
             let model = entry.model().map(String::from);
             let env = entry.env().cloned();
+            let env_keys: Vec<String> = env
+                .as_ref()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
             let aname = (*arch_name).to_string();
             let prompt = assembled.clone();
             let root = project_root.clone();
@@ -232,10 +241,16 @@ async fn main() -> Result<()> {
 
             let session_for_audit = sid.clone();
             let prompt_for_audit = prompt.clone();
+            let model_for_pending = model.clone();
+            let operator_prompt = stdin_instructions.clone();
             pending.push(PendingResult {
                 archetype: (*arch_name).to_string(),
                 session: session_for_audit,
                 prompt: prompt_for_audit,
+                operator_prompt,
+                model: model_for_pending,
+                env_keys,
+                oneshot,
                 handle: tokio::spawn(async move {
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
@@ -293,6 +308,27 @@ async fn main() -> Result<()> {
             &p.prompt,
             &result.output,
         );
+
+        // Sidecar: record fresh sessions created by --oneshot. We rely on a
+        // captured session ID, which only claude/codex provide today.
+        if p.oneshot
+            && let Some(ref sid) = result.session_id
+        {
+            sessions::record(
+                &project_root,
+                cfg.audit.private,
+                &audit_id,
+                &p.archetype,
+                &result.provider,
+                sid,
+                "oneshot",
+                p.model.as_deref(),
+                p.env_keys.clone(),
+                &p.operator_prompt,
+                &p.prompt,
+                &result.output,
+            );
+        }
 
         results.push((p.archetype, result));
     }
@@ -393,6 +429,20 @@ async fn run_session_resume(
             archetype,
             &result.provider,
             session_id,
+            &stdin_instructions,
+            &result.output,
+        );
+        sessions::record(
+            &root,
+            cfg.audit.private,
+            &audit_id,
+            archetype,
+            &result.provider,
+            session_id,
+            "session",
+            None,
+            Vec::new(),
+            &stdin_instructions,
             &stdin_instructions,
             &result.output,
         );

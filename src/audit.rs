@@ -101,7 +101,7 @@ pub fn log_result(
     }
 }
 
-fn chrono_now() -> String {
+pub(crate) fn chrono_now() -> String {
     // UTC timestamp without pulling in the chrono crate
     let duration = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

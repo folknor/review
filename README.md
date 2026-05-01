@@ -142,6 +142,20 @@ Constraints:
 - Bypasses `.review.toml` entirely — model/env overrides from the config are not applied. If you need a non-default model on a follow-up, switch to the persistent-archetype-session flow.
 - Validation of the session ID is delegated to the provider; an unknown ID produces a provider-specific error, not a `review` error.
 
+### Sessions sidecar log
+
+Each `--oneshot` that captures a session ID and each `--session` resume appends a JSONL row to `~/.local/share/review/sessions.jsonl` (or `sessions-private.jsonl` when `audit.private = true`). Rows carry:
+
+- `timestamp` (UTC), `project` (root path), `hostname`
+- `audit_id`, `provider`, `archetype`, `session_id`
+- `kind` — `"oneshot"` for creation events, `"session"` for resume touches
+- `model`, `env_keys` (env-var *names* only — values are not recorded so secrets don't leak through the sidecar)
+- `operator_prompt` (raw stdin), `assembled_prompt` (what the provider actually saw)
+- `response` or `error`
+- `review_version`
+
+This is intended for "what sessions can I follow up on, and how warm is the cache?" lookups. There's no read tooling in `review` itself yet — `jq` and `grep` work fine on the JSONL.
+
 ### Output format
 
 ```
