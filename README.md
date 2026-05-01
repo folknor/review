@@ -146,7 +146,7 @@ Constraints:
 
 Each `--oneshot` that captures a session ID and each `--session` resume appends a JSONL row to `~/.local/share/review/sessions.jsonl` (or `sessions-private.jsonl` when `audit.private = true`). Rows carry:
 
-- `timestamp` (UTC), `project` (root path), `hostname`
+- `timestamp` (UTC), `epoch_secs`, `project` (root path), `hostname`
 - `audit_id`, `provider`, `archetype`, `session_id`
 - `kind` — `"oneshot"` for creation events, `"session"` for resume touches
 - `model`, `env_keys` (env-var *names* only — values are not recorded so secrets don't leak through the sidecar)
@@ -154,7 +154,35 @@ Each `--oneshot` that captures a session ID and each `--session` resume appends 
 - `response` or `error`
 - `review_version`
 
-This is intended for "what sessions can I follow up on, and how warm is the cache?" lookups. There's no read tooling in `review` itself yet — `jq` and `grep` work fine on the JSONL.
+The sidecar drives two things:
+
+**1. Cache-age advisory on `--session`.** When you resume, `review` looks up the last touch and prints how long it's been:
+
+```
+$ echo "follow up" | review bugs --provider claude --session 019deabc-...
+session last touched 14m ago
+--- claude ---
+<response>
+```
+
+If the last touch was over 55 minutes ago — past the longest realistic prompt-cache TTL — it adds a warning that `--oneshot` with restated context may be cheaper.
+
+**2. `review sessions` listing.** Aggregates by `session_id` and shows recent sessions for the current project (or `--all` projects), most recent first:
+
+```
+$ review sessions
+[14m] claude / bugs / 3 touches
+       session: 019deabc-0def-7000-8000-abcdef012345
+       opened:  review the new sync code
+
+[1h12m] codex / security / 1 touch
+       session: 019d0123-...
+       opened:  check OAuth handling on the IMAP path
+```
+
+Each block shows the age since the last touch, the provider/archetype/touch count, the session ID (copy-paste into `--session <id>`), and the operator prompt that opened the session. `--limit <N>` caps the row count (default 20).
+
+For ad-hoc queries beyond what `review sessions` exposes, the JSONL works directly with `jq` and `grep`.
 
 ### Output format
 

@@ -109,4 +109,15 @@ pub enum Command {
         #[arg(long, value_delimiter = ',', required = true)]
         provider: Vec<String>,
     },
+
+    /// List recent --oneshot sessions for follow-up via --session
+    Sessions {
+        /// List sessions across all projects, not just the current one
+        #[arg(long)]
+        all: bool,
+
+        /// Maximum number of sessions to list (most recent first)
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
 }

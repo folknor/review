@@ -26,6 +26,10 @@ async fn main() -> Result<()> {
         return run_prime(archetype, provider).await;
     }
 
+    if let Some(cli::Command::Sessions { all, limit }) = &cli.command {
+        return run_sessions(*all, *limit);
+    }
+
     let archetype_name = match cli.archetype.as_deref() {
         Some(name) => name,
         None => {
@@ -389,6 +393,27 @@ async fn run_session_resume(
         bail!("'{provider_name}' not found on PATH");
     }
 
+    // Cache-age advisory. The sidecar lets us tell the operator how long it's
+    // been since the session was last touched; >55 minutes is roughly the cap
+    // on Anthropic's prompt cache TTL (5 min default, ~1h with the right env
+    // vars), so anything older is almost certainly a cold-cache resume.
+    if let Some(record) = sessions::latest_for_session(session_id) {
+        if let Some(age) = sessions::age_secs(&record) {
+            if age < 60 {
+                eprintln!("session last touched just now");
+            } else {
+                eprintln!("session last touched {} ago", sessions::format_age(age));
+            }
+            if age > 55 * 60 {
+                eprintln!(
+                    "  cache is likely cold — --oneshot with restated context may be cheaper"
+                );
+            }
+        }
+    } else {
+        eprintln!("note: no sidecar record for this session — was it created with --oneshot?");
+    }
+
     // Global lock: serialize against other `review` invocations.
     let lock_path = std::env::temp_dir().join("review.lock");
     let lock_file = std::fs::File::create(&lock_path)
@@ -454,6 +479,109 @@ async fn run_session_resume(
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// `review sessions` — aggregate sidecar records by session_id and print
+/// recent sessions with their age, provider, archetype, touch count, and the
+/// prompt that opened them. Filtered to the current project unless `--all`.
+fn run_sessions(all: bool, limit: usize) -> Result<()> {
+    let project_filter: Option<String> = if all {
+        None
+    } else {
+        let root = config::load()
+            .map(|(_, root)| root)
+            .or_else(|_| std::env::current_dir().map_err(anyhow::Error::from))?;
+        Some(root.to_string_lossy().into_owned())
+    };
+
+    let mut records = sessions::read_all();
+    if let Some(ref proj) = project_filter {
+        records.retain(|r| &r.project == proj);
+    }
+
+    if records.is_empty() {
+        if project_filter.is_some() {
+            eprintln!("no sessions recorded for this project (try --all)");
+        } else {
+            eprintln!("no sessions recorded");
+        }
+        return Ok(());
+    }
+
+    // Group by session_id.
+    let mut groups: std::collections::HashMap<String, Vec<sessions::SessionRecord>> =
+        std::collections::HashMap::new();
+    for rec in records {
+        groups.entry(rec.session_id.clone()).or_default().push(rec);
+    }
+
+    struct Row {
+        latest_secs: u64,
+        opener: sessions::SessionRecord,
+        latest: sessions::SessionRecord,
+        touches: usize,
+    }
+
+    let mut rows: Vec<Row> = groups
+        .into_values()
+        .map(|mut entries| {
+            entries.sort_by_key(|r| r.epoch_secs);
+            let touches = entries.len();
+            let opener = entries
+                .iter()
+                .find(|r| r.kind == "oneshot")
+                .cloned()
+                .unwrap_or_else(|| entries[0].clone());
+            let latest = entries.last().cloned().expect("non-empty group");
+            Row {
+                latest_secs: latest.epoch_secs,
+                opener,
+                latest,
+                touches,
+            }
+        })
+        .collect();
+
+    rows.sort_by(|a, b| b.latest_secs.cmp(&a.latest_secs));
+    rows.truncate(limit);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    for row in &rows {
+        let age = if row.latest_secs == 0 {
+            "?".to_string()
+        } else {
+            sessions::format_age(now.saturating_sub(row.latest_secs))
+        };
+        let touches_label = if row.touches == 1 { "touch" } else { "touches" };
+        println!(
+            "[{age}] {} / {} / {} {touches_label}",
+            row.opener.provider, row.opener.archetype, row.touches
+        );
+        println!("       session: {}", row.latest.session_id);
+        let opened = first_line_truncated(&row.opener.operator_prompt, 80);
+        println!("       opened:  {opened}");
+        if all {
+            println!("       project: {}", row.opener.project);
+        }
+        println!();
+    }
+
+    Ok(())
+}
+
+fn first_line_truncated(s: &str, max_chars: usize) -> String {
+    let line = s.lines().next().unwrap_or("");
+    let count = line.chars().count();
+    if count <= max_chars {
+        return line.to_string();
+    }
+    let mut out: String = line.chars().take(max_chars).collect();
+    out.push('…');
+    out
 }
 
 async fn run_prime(archetype: &str, providers: &[String]) -> Result<()> {
