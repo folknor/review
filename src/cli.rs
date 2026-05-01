@@ -15,8 +15,13 @@ so if a session later breaks you can re-prime without retyping it:
 Re-priming replaces stale session IDs in-place. Manually-added `model` and
 `env` overrides on a provider entry are preserved.
 
-Passing stdin while a stored prompt already exists is an error, to avoid
-silently overwriting it. Remove the entry from [_prime] to replace it.";
+Re-piping the same prompt is fine (silent reuse) — that's what happens when
+you run `echo \"...\" | review prime ARCH --provider X` once per provider in
+sequence. Passing stdin that DIFFERS from the stored prompt is an error; in
+that case, remove the entry from [_prime] to replace it.
+
+Each successful priming writes a sidecar entry (kind = \"prime\") so
+`review sessions` lists primed sessions alongside --oneshot ones.";
 
 const AFTER_HELP: &str = "\
 Archetypes are named reviewer sessions defined in .review.toml.

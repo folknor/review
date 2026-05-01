@@ -53,6 +53,10 @@ review prime security --provider claude    # stdin omitted; reuses stored prompt
 
 Re-priming replaces the stale session ID in place. Manually-added `model` and `env` overrides on a provider entry are preserved.
 
+Re-piping the same prompt is a silent reuse — `echo "lens" | review prime security --provider claude` then `echo "lens" | review prime security --provider codex` works without an error, since the second pipe matches the stored prompt. Piping a *different* prompt while one is already stored is still rejected, to prevent accidental overwrites; remove the `[_prime]` entry first if you want to replace it.
+
+Each successful priming writes a sidecar row (`kind = "prime"`), so primed sessions show up in `review sessions` alongside `--oneshot` ones.
+
 ### 3. Run reviews
 
 ```

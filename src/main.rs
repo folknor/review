@@ -527,11 +527,10 @@ fn run_sessions(all: bool, limit: usize) -> Result<()> {
         .map(|mut entries| {
             entries.sort_by_key(|r| r.epoch_secs);
             let touches = entries.len();
-            let opener = entries
-                .iter()
-                .find(|r| r.kind == "oneshot")
-                .cloned()
-                .unwrap_or_else(|| entries[0].clone());
+            // Chronologically first entry is the opener: --oneshot or prime
+            // creation in normal flows; a session touch in pathological cases
+            // where the creation row is missing.
+            let opener = entries[0].clone();
             let latest = entries.last().cloned().expect("non-empty group");
             Row {
                 latest_secs: latest.epoch_secs,
@@ -557,8 +556,13 @@ fn run_sessions(all: bool, limit: usize) -> Result<()> {
             sessions::format_age(now.saturating_sub(row.latest_secs))
         };
         let touches_label = if row.touches == 1 { "touch" } else { "touches" };
+        let opener_kind = match row.opener.kind.as_str() {
+            "prime" => "primed",
+            "oneshot" => "oneshot",
+            other => other,
+        };
         println!(
-            "[{age}] {} / {} / {} {touches_label}",
+            "[{age}] {} / {} ({opener_kind}) / {} {touches_label}",
             row.opener.provider, row.opener.archetype, row.touches
         );
         println!("       session: {}", row.latest.session_id);
@@ -623,9 +627,23 @@ async fn run_prime(archetype: &str, providers: &[String]) -> Result<()> {
     lock::acquire_blocking(&lock_file)?;
 
     // Re-load config under the lock so we see any concurrent writer's changes.
-    let cfg = match config::load() {
+    let mut cfg = match config::load() {
         Ok((c, _)) => c,
         Err(_) => cfg,
+    };
+
+    // Mirror the review path: ensure an audit_id exists so sidecar rows from
+    // prime invocations are tagged consistently with rows from --oneshot.
+    let audit_id = match cfg.audit.id {
+        Some(ref id) => id.clone(),
+        None => {
+            let id = config::generate_short_id();
+            if let Err(e) = config_write::append_audit_id(&config_path, &id) {
+                eprintln!("warning: failed to write audit id to .review.toml: {e}");
+            }
+            cfg.audit.id = Some(id.clone());
+            id
+        }
     };
 
     let stored = cfg.prime.get(archetype).cloned();
@@ -640,10 +658,17 @@ async fn run_prime(archetype: &str, providers: &[String]) -> Result<()> {
     }
 
     let (stdin_prompt, save_prompt) = match (piped, stored) {
+        (Some(p), Some(s)) if p.trim() == s.trim() => {
+            // Same prompt re-piped (e.g. reflexively pasting the same command
+            // line for a second provider). Silent reuse — no error, no rewrite.
+            eprintln!("Stored prime prompt matches stdin — reusing");
+            (s, false)
+        }
         (Some(_), Some(_)) => bail!(
-            "a prime prompt for '{archetype}' is already stored in .review.toml\n  \
+            "a prime prompt for '{archetype}' is already stored in .review.toml \
+             and the piped stdin differs from it.\n  \
              Remove [_prime].{archetype} manually if you want to replace it,\n  \
-             or omit stdin to reuse the stored prompt."
+             or omit stdin (or pipe the same prompt) to reuse the stored prompt."
         ),
         (Some(s), None) => (s, true),
         (None, Some(s)) => {
@@ -671,6 +696,24 @@ async fn run_prime(archetype: &str, providers: &[String]) -> Result<()> {
         match result {
             Ok(primed) => {
                 eprintln!();
+                let response_for_log: Result<String> = match primed.response.clone() {
+                    Some(text) => Ok(text),
+                    None => Ok(String::new()),
+                };
+                sessions::record(
+                    &project_root,
+                    cfg.audit.private,
+                    &audit_id,
+                    archetype,
+                    &primed.provider,
+                    &primed.session_id,
+                    "prime",
+                    None,
+                    Vec::new(),
+                    &stdin_prompt,
+                    &send_prompt,
+                    &response_for_log,
+                );
                 sessions.push((primed.provider, primed.session_id));
             }
             Err(e) => {

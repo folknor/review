@@ -7,6 +7,10 @@ use tokio::process::Command;
 pub struct PrimedSession {
     pub provider: String,
     pub session_id: String,
+    /// Agent's acknowledgment from the priming call, when captured. Used by
+    /// the sidecar log so the row carries the same response/error shape as
+    /// `--oneshot`/`--session` rows.
+    pub response: Option<String>,
 }
 
 pub async fn prime_provider(
@@ -68,6 +72,7 @@ async fn prime_claude(prompt: &str, project_root: &Path) -> Result<PrimedSession
     Ok(PrimedSession {
         provider: "claude".to_string(),
         session_id,
+        response: Some(response.trim().to_string()),
     })
 }
 
@@ -125,7 +130,7 @@ async fn prime_codex(prompt: &str, project_root: &Path) -> Result<PrimedSession>
     })?;
 
     eprintln!("codex primed successfully (session: {session_id})");
-    if let Some(text) = response_text {
+    if let Some(ref text) = response_text {
         eprintln!("---");
         eprintln!("{}", text.trim());
         eprintln!("---");
@@ -134,6 +139,7 @@ async fn prime_codex(prompt: &str, project_root: &Path) -> Result<PrimedSession>
     Ok(PrimedSession {
         provider: "codex".to_string(),
         session_id,
+        response: response_text.map(|s| s.trim().to_string()),
     })
 }
 

@@ -43,6 +43,9 @@ pub struct SessionRecord {
     pub provider: String,
     pub archetype: String,
     pub session_id: String,
+    /// "oneshot", "session", or "prime"; "" for entries written before this
+    /// field existed (none in practice — included for forward compat).
+    #[serde(default)]
     pub kind: String,
     #[allow(dead_code)]
     pub model: Option<String>,
