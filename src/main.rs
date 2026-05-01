@@ -379,8 +379,10 @@ async fn run_prime(archetype: &str, providers: &[String]) -> Result<()> {
 
     let mut sessions: Vec<(String, String)> = Vec::new();
 
+    let send_prompt = prompt::assemble_prime(&stdin_prompt);
+
     for provider in providers {
-        let result = prime::prime_provider(provider, &stdin_prompt, &project_root).await;
+        let result = prime::prime_provider(provider, &send_prompt, &project_root).await;
         match result {
             Ok(primed) => {
                 eprintln!();
