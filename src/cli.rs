@@ -38,6 +38,7 @@ Examples:
   echo \"review please\" | review security,bugs,arch                 Multiple archetypes
   echo \"how to handle X?\" | review competitors                     Fan out to a group
   echo \"re-anchor please\" | review bugs --anchor                   Prepend grounding prefix
+  echo \"check now\" | review --oneshot security,bugs               Fresh sessions, prepend stored prime
   echo \"just claude\" | review bugs --provider claude               Only use claude
   echo \"check for issues\" | review bugs --dry-run                  Preview the prompt";
 
@@ -64,6 +65,11 @@ pub struct Cli {
     /// Prepend grounding prefix to stdin
     #[arg(long)]
     pub anchor: bool,
+
+    /// Skip session resume; start fresh providers and prepend the stored prime prompt.
+    /// Implies --anchor.
+    #[arg(long)]
+    pub oneshot: bool,
 
     /// Limit to specific providers (comma-separated, e.g. claude,kilo)
     #[arg(long, value_delimiter = ',')]

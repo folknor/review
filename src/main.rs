@@ -122,7 +122,10 @@ async fn main() -> Result<()> {
     // Dry run: print what would be sent and exit
     if cli.dry_run {
         for arch_name in &runnable {
-            let prompt = if cli.anchor {
+            let prompt = if cli.oneshot {
+                let prime = cfg.prime.get(*arch_name).map(String::as_str);
+                prompt::assemble_oneshot(prime, &stdin_instructions)
+            } else if cli.anchor {
                 prompt::assemble(&stdin_instructions)
             } else {
                 stdin_instructions.clone()
@@ -171,7 +174,10 @@ async fn main() -> Result<()> {
     let mut launch_count = 0u32;
 
     for arch_name in &runnable {
-        let assembled = if cli.anchor {
+        let assembled = if cli.oneshot {
+            let prime = cfg.prime.get(*arch_name).map(String::as_str);
+            prompt::assemble_oneshot(prime, &stdin_instructions)
+        } else if cli.anchor {
             prompt::assemble(&stdin_instructions)
         } else {
             stdin_instructions.clone()
@@ -195,13 +201,18 @@ async fn main() -> Result<()> {
             }
 
             let prov = prov_name.clone();
-            let sid = entry.session().to_string();
+            let sid = if cli.oneshot {
+                String::new()
+            } else {
+                entry.session().to_string()
+            };
             let model = entry.model().map(String::from);
             let env = entry.env().cloned();
             let aname = (*arch_name).to_string();
             let prompt = assembled.clone();
             let root = project_root.clone();
             let delay = stagger * launch_count;
+            let oneshot = cli.oneshot;
 
             let session_for_audit = sid.clone();
             let prompt_for_audit = prompt.clone();
@@ -213,7 +224,7 @@ async fn main() -> Result<()> {
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
                     }
-                    provider::invoke(&prov, &sid, model.as_deref(), env.as_ref(), &aname, &prompt, &root).await
+                    provider::invoke(&prov, &sid, model.as_deref(), env.as_ref(), &aname, &prompt, &root, oneshot).await
                 }),
             });
             launch_count += 1;

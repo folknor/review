@@ -23,6 +23,7 @@ pub struct ProviderResult {
     pub output: Result<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn invoke(
     provider: &str,
     session_id: &str,
@@ -31,12 +32,13 @@ pub async fn invoke(
     archetype: &str,
     prompt: &str,
     project_root: &Path,
+    oneshot: bool,
 ) -> ProviderResult {
     let result = match provider {
-        "claude" => run_claude(session_id, model, env, prompt, project_root).await,
-        "codex" => run_codex(session_id, model, env, archetype, prompt, project_root).await,
-        "kilo" => run_stdout_provider("kilo", session_id, model, env, prompt, project_root).await,
-        "opencode" => run_stdout_provider("opencode", session_id, model, env, prompt, project_root).await,
+        "claude" => run_claude(session_id, model, env, prompt, project_root, oneshot).await,
+        "codex" => run_codex(session_id, model, env, archetype, prompt, project_root, oneshot).await,
+        "kilo" => run_stdout_provider("kilo", session_id, model, env, prompt, project_root, oneshot).await,
+        "opencode" => run_stdout_provider("opencode", session_id, model, env, prompt, project_root, oneshot).await,
         other => Err(anyhow::anyhow!("unknown provider: {other}")),
     };
     ProviderResult {
@@ -85,8 +87,19 @@ async fn run_with_stdout(mut child: tokio::process::Child, prompt: &str, provide
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-async fn run_claude(session_id: &str, model: Option<&str>, env: Option<&std::collections::BTreeMap<String, String>>, prompt: &str, project_root: &Path) -> Result<String> {
-    let mut args = vec!["--resume", session_id, "--print", "--permission-mode", "dontAsk"];
+async fn run_claude(
+    session_id: &str,
+    model: Option<&str>,
+    env: Option<&std::collections::BTreeMap<String, String>>,
+    prompt: &str,
+    project_root: &Path,
+    oneshot: bool,
+) -> Result<String> {
+    let mut args: Vec<&str> = if oneshot {
+        vec!["--print", "--permission-mode", "dontAsk", "--no-session-persistence"]
+    } else {
+        vec!["--resume", session_id, "--print", "--permission-mode", "dontAsk"]
+    };
     let model_owned;
     if let Some(m) = model {
         model_owned = m.to_string();
@@ -108,6 +121,7 @@ async fn run_claude(session_id: &str, model: Option<&str>, env: Option<&std::col
     run_with_stdout(child, prompt, "claude").await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_codex(
     session_id: &str,
     model: Option<&str>,
@@ -115,15 +129,23 @@ async fn run_codex(
     archetype: &str,
     prompt: &str,
     project_root: &Path,
+    oneshot: bool,
 ) -> Result<String> {
     let output_path = temp_path(archetype, "codex");
 
-    let mut args = vec!["exec".to_string(), "--sandbox".to_string(), "read-only".to_string()];
+    let mut args: Vec<String> = vec!["exec".to_string(), "--sandbox".to_string(), "read-only".to_string()];
+    if oneshot {
+        args.push("--ephemeral".to_string());
+    }
     if let Some(m) = model {
         args.push("-m".to_string());
         args.push(m.to_string());
     }
-    args.extend(["resume".to_string(), session_id.to_string(), "-o".to_string(), output_path.clone()]);
+    if oneshot {
+        args.extend(["-o".to_string(), output_path.clone()]);
+    } else {
+        args.extend(["resume".to_string(), session_id.to_string(), "-o".to_string(), output_path.clone()]);
+    }
 
     let mut cmd = Command::new("codex");
     cmd.args(&args)
@@ -160,7 +182,8 @@ async fn run_codex(
     result.with_context(|| format!("failed to read codex output from {output_path}"))
 }
 
-/// Run kilo or opencode — both use `<binary> run -s <id> --dir <path>` and output to stdout.
+/// Run kilo or opencode — both use `<binary> run [-s <id>] [-m M] --dir <path>` and output to stdout.
+/// In oneshot mode, kilo gets `--auto` to bypass interactive permission prompts; opencode runs plain.
 async fn run_stdout_provider(
     provider: &str,
     session_id: &str,
@@ -168,8 +191,17 @@ async fn run_stdout_provider(
     env: Option<&std::collections::BTreeMap<String, String>>,
     prompt: &str,
     project_root: &Path,
+    oneshot: bool,
 ) -> Result<String> {
-    let mut args = vec!["run".to_string(), "-s".to_string(), session_id.to_string()];
+    let mut args: Vec<String> = vec!["run".to_string()];
+    if oneshot {
+        if provider == "kilo" {
+            args.push("--auto".to_string());
+        }
+    } else {
+        args.push("-s".to_string());
+        args.push(session_id.to_string());
+    }
     if let Some(m) = model {
         args.push("-m".to_string());
         args.push(m.to_string());

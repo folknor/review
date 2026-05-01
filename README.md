@@ -88,11 +88,33 @@ Use `all` to fan out to every configured archetype, or define **groups** to fan 
 | Flag | Description |
 |------|-------------|
 | `--anchor` | Prepend grounding prefix to stdin |
+| `--oneshot` | Skip session resume; start fresh each call and prepend the stored prime prompt. Implies `--anchor`. |
 | `--dry-run` | Print what would be sent instead of sending it |
 | `--provider <list>` | Limit to specific providers (comma-separated) |
 | `--stagger <secs>` | Seconds between each provider launch (default: 30, 0 to disable) |
 
 By default, stdin goes directly to the provider sessions. Use `--anchor` for the first review in a session or to re-anchor a stale session.
+
+### Oneshot mode
+
+`--oneshot` skips session resume entirely. Each call starts fresh providers, prepends the priming prompt stored under `[_prime].<archetype>`, and lets the agent fetch code itself.
+
+```
+echo "check the new auth flow" | review --oneshot security,bugs
+```
+
+Use this when reviews happen far enough apart that the prompt cache has expired (default 5min, up to 1h with the right env vars). Resuming a long-lived session means reprocessing the entire accumulated prefix on every wake — expensive in API tokens and corrosive to subscription rate-limit windows for once-a-day usage. Oneshot keeps the prefix small and predictable.
+
+`.review.toml` still drives provider selection and `model`/`env` overrides; the session IDs are simply unused. If no `[_prime]` entry exists for the archetype, the prime block is silently skipped.
+
+Per-provider behavior in oneshot mode:
+
+| Provider | Oneshot args |
+|----------|--------------|
+| claude | `--print --permission-mode dontAsk --no-session-persistence` |
+| codex | `exec --sandbox read-only --ephemeral` |
+| kilo | `run --auto` (auto-approve permissions; sessions don't carry pre-approval) |
+| opencode | `run` (no auto-approve flag — may prompt; use the regular session flow if it does) |
 
 ### Output format
 

@@ -39,8 +39,8 @@ Single binary crate, no workspace.
 - `src/cli.rs` — Clap CLI. Archetype is a positional arg, `init` and `prime` are subcommands.
 - `src/config.rs` — Parses `.review.toml` in cwd. TOML config for host-scoped sessions (archetype → hostname → provider), `_groups` for named archetype sets. Uses `toml` and `gethostname` crates.
 - `src/input.rs` — Reads stdin instructions (required, 20KB limit).
-- `src/prompt.rs` — Assembles: compiled prefix + stdin instructions. Used only with `--anchor`.
-- `src/provider.rs` — Async provider invocation. Prompts piped via stdin. Claude uses `--permission-mode dontAsk`, Codex uses `--sandbox read-only`.
+- `src/prompt.rs` — Assembles: compiled prefix + stdin (`--anchor`), or prefix + `[_prime]` prompt + stdin (`--oneshot`).
+- `src/provider.rs` — Async provider invocation. Prompts piped via stdin. Claude uses `--permission-mode dontAsk`, Codex uses `--sandbox read-only`. In oneshot mode each provider drops its resume args and runs fresh (claude `--no-session-persistence`, codex `--ephemeral`, kilo `--auto`, opencode plain).
 - `src/prime.rs` — Session creation for `review prime`. Claude uses `--session-id`, Codex uses `--json` to capture `thread_id`.
 - `src/config_write.rs` — Appends session entries to `.review.toml`.
 - `src/main.rs` — Wires CLI to config, prompt assembly, and provider dispatch.
@@ -49,6 +49,7 @@ Single binary crate, no workspace.
 ## Design decisions
 
 - Stdin goes directly to provider sessions by default. `--anchor` prepends a grounding prefix.
+- `--oneshot` skips session resume to avoid reprocessing accumulated session prefixes on cold-cache daily wakes; prepends `[_prime].<archetype>` instead. Existing `[archetype.host]` config still drives provider selection and overrides; only the session ID is ignored. Implies `--anchor`.
 - Providers get prompts via **stdin pipe**, not CLI args, to avoid shell argument length limits.
 - Claude runs with `--permission-mode dontAsk` (uses pre-approved permissions, rejects interactive prompts). Codex runs with `--sandbox read-only`.
 - No global config — `.review.toml` lives in the project root.
