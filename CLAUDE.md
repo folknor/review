@@ -37,7 +37,7 @@ Single binary crate, no workspace.
 ## Architecture
 
 - `src/cli.rs` — Clap CLI. Archetype is a positional arg, `init` and `prime` are subcommands.
-- `src/config.rs` — Parses `.review.toml` in cwd. TOML config for host-scoped sessions (archetype → hostname → provider), `_groups` for named archetype sets. Uses `toml` and `gethostname` crates.
+- `src/config.rs` — Parses `.review.toml` in cwd. TOML config for host-scoped sessions (archetype → hostname → provider), `_groups` for named archetype sets, `_defaults.providers` for the prime-only-archetype fallback (see Design decisions). Uses `toml` and `gethostname` crates.
 - `src/input.rs` — Reads stdin instructions (required, 20KB limit).
 - `src/prompt.rs` — Assembles: compiled prefix + stdin (`--anchor`), or prefix + `[_prime]` prompt + stdin (`--oneshot`).
 - `src/provider.rs` — Async provider invocation. Prompts piped via stdin. Claude uses `--permission-mode dontAsk`, Codex uses `--sandbox read-only`. In oneshot mode each provider runs a fresh persistable session (claude `--session-id <generated UUID>`, codex `--json` to capture `thread_id`, kilo `--auto`, opencode plain). Claude/codex emit the new session ID via `ProviderResult.session_id` so the operator can follow up via `--session`.
@@ -51,6 +51,7 @@ Single binary crate, no workspace.
 
 - Stdin goes directly to provider sessions by default. `--anchor` prepends a grounding prefix.
 - `--oneshot` skips session resume to avoid reprocessing accumulated session prefixes on cold-cache daily wakes; prepends `[_prime].<archetype>` instead. Existing `[archetype.host]` config still drives provider selection and overrides; only the session ID is ignored. The fresh session is persistable and its ID is printed above the response so the operator can follow up via `--session <id>` while the cache is warm. Implies `--anchor`.
+- Prime-only archetypes: an archetype defined only in `[_prime]` (no `[archetype.host]` block) is valid for `--oneshot` — there's no session to persist, so no host block is needed. Provider list resolves from `--provider` first, then `[_defaults].providers`. Without either, the run errors with a message naming both. Non-oneshot still requires a host session (nothing to send to without one).
 - `--session <id>` resumes a specific provider session and sends raw stdin — bypasses `.review.toml`, no PREFIX, no prime, no anchor. Requires a single `--provider`; mutually exclusive with `--oneshot` and `--anchor`. Validation of the session ID is delegated to the provider. Before invoking, `review` looks up the sidecar log to print the time since the last touch and warn when it's > ~55 min (past the realistic prompt-cache TTL).
 - `review sessions` lists recent sessions for the current project (or `--all`), grouped by session ID, sorted by most recent touch. Output is block-formatted for terminal reading; ad-hoc queries beyond that go through `jq` on the JSONL directly.
 - Providers get prompts via **stdin pipe**, not CLI args, to avoid shell argument length limits.
@@ -73,4 +74,7 @@ claude = { session = "session-id", env = { ANTHROPIC_BASE_URL = "http://localhos
 
 [_groups]
 sweep = ["security", "bugs"]
+
+[_defaults]
+providers = ["claude"]
 ```

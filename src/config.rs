@@ -12,6 +12,14 @@ pub struct AuditConfig {
     pub id: Option<String>,
 }
 
+/// Project-wide defaults under [_defaults]. Currently used as a fallback when
+/// --provider is omitted and a prime-only archetype is invoked under --oneshot.
+#[derive(Debug, Default, Deserialize)]
+pub struct DefaultsConfig {
+    #[serde(default)]
+    pub providers: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RawConfig {
     #[serde(default, rename = "_groups")]
@@ -20,6 +28,8 @@ pub struct RawConfig {
     pub audit: AuditConfig,
     #[serde(default, rename = "_prime")]
     pub prime: BTreeMap<String, String>,
+    #[serde(default, rename = "_defaults")]
+    pub defaults: DefaultsConfig,
     #[serde(flatten)]
     pub archetypes: BTreeMap<String, ArchetypeConfig>,
 }
@@ -30,6 +40,7 @@ pub struct ReviewConfig {
     pub groups: BTreeMap<String, Vec<String>>,
     pub audit: AuditConfig,
     pub prime: BTreeMap<String, String>,
+    pub defaults: DefaultsConfig,
 }
 
 /// Per-archetype config: maps hostname → host config.
@@ -212,12 +223,22 @@ pub fn parse(raw: &str) -> Result<ReviewConfig> {
             }
         }
     }
+    for prov_name in &raw_cfg.defaults.providers {
+        if !KNOWN_PROVIDERS.contains(&prov_name.as_str()) {
+            bail!(
+                "unknown provider '{prov_name}' in [_defaults].providers\n  \
+                 supported: {}",
+                KNOWN_PROVIDERS.join(", ")
+            );
+        }
+    }
 
     Ok(ReviewConfig {
         archetypes: raw_cfg.archetypes,
         groups: raw_cfg.groups,
         audit: raw_cfg.audit,
         prime: raw_cfg.prime,
+        defaults: raw_cfg.defaults,
     })
 }
 

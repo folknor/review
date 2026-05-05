@@ -78,12 +78,19 @@ async fn main() -> Result<()> {
             archetypes_to_run.extend(cfg.archetypes.keys().map(String::as_str));
         } else if let Some(group) = cfg.groups.get(*name) {
             archetypes_to_run.extend(group.iter().map(String::as_str));
-        } else if cfg.archetypes.contains_key(*name) {
+        } else if cfg.archetypes.contains_key(*name) || cfg.prime.contains_key(*name) {
             archetypes_to_run.push(name);
         } else {
             let mut available: Vec<&str> = cfg.archetypes.keys().map(String::as_str).collect();
-            let groups: Vec<&str> = cfg.groups.keys().map(String::as_str).collect();
-            available.extend(groups);
+            available.extend(cfg.groups.keys().map(String::as_str));
+            // Surface prime-only archetypes (defined in [_prime] but with no
+            // [archetype.host] block) so the diagnostic reflects the full set
+            // of names the user could pass.
+            for prime_name in cfg.prime.keys() {
+                if !cfg.archetypes.contains_key(prime_name) {
+                    available.push(prime_name.as_str());
+                }
+            }
             bail!(
                 "'{name}' not found in .review.toml\n  \
                  configured: {}",
@@ -100,7 +107,11 @@ async fn main() -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     archetypes_to_run.retain(|name| seen.insert(*name));
 
-    // Filter to archetypes that have sessions configured for this host
+    // Filter to archetypes that have sessions configured for this host. In
+    // --oneshot mode we also accept prime-only archetypes (defined in [_prime]
+    // with no [archetype.host] block) — sessions aren't reused under --oneshot
+    // so the lack of a session ID is fine; we'll synthesize provider entries
+    // from --provider further down.
     let mut skipped: Vec<&str> = Vec::new();
     let runnable: Vec<&str> = archetypes_to_run
         .iter()
@@ -108,6 +119,9 @@ async fn main() -> Result<()> {
             if let Some(arch) = cfg.archetypes.get(**name)
                 && arch.has_sessions_for_host(&hostname)
             {
+                return true;
+            }
+            if cli.oneshot && cfg.prime.contains_key(**name) {
                 return true;
             }
             skipped.push(name);
@@ -207,25 +221,65 @@ async fn main() -> Result<()> {
         } else {
             stdin_instructions.clone()
         };
-        let arch_cfg = cfg.archetypes.get(*arch_name).expect("filtered above");
-        let host_cfg = arch_cfg.resolve_host(&hostname).expect("filtered above");
 
-        for (prov_name, entry) in &host_cfg.providers {
+        // Provider entries to launch for this archetype. Normally these come
+        // from [archetype.host]. For prime-only archetypes under --oneshot
+        // there's no host block, so we synthesize entries from --provider.
+        let host_cfg = cfg
+            .archetypes
+            .get(*arch_name)
+            .and_then(|a| a.resolve_host(&hostname));
+        let synthesized_entries: Vec<(String, config::ProviderEntry)>;
+        let provider_iter: Box<dyn Iterator<Item = (&str, &config::ProviderEntry)>> =
+            match host_cfg {
+                Some(h) => Box::new(
+                    h.providers
+                        .iter()
+                        .map(|(n, e)| (n.as_str(), e)),
+                ),
+                None => {
+                    // Reachable only when cli.oneshot && cfg.prime contains arch_name
+                    // (see runnable filter above). Need a provider list to launch:
+                    // --provider wins, otherwise fall back to [_defaults].providers.
+                    let names: Vec<&str> = if let Some(f) = provider_filter.as_ref().filter(|f| !f.is_empty()) {
+                        f.clone()
+                    } else if !cfg.defaults.providers.is_empty() {
+                        cfg.defaults.providers.iter().map(String::as_str).collect()
+                    } else {
+                        bail!(
+                            "'{arch_name}' is defined only in [_prime] with no [{arch_name}.{}] block; \
+                             --oneshot requires --provider <name> (or set [_defaults].providers in .review.toml)",
+                            config::toml_key(&hostname)
+                        )
+                    };
+                    synthesized_entries = names
+                        .iter()
+                        .map(|p| ((*p).to_string(), config::ProviderEntry::SessionOnly(String::new())))
+                        .collect();
+                    Box::new(
+                        synthesized_entries
+                            .iter()
+                            .map(|(n, e)| (n.as_str(), e)),
+                    )
+                }
+            };
+
+        for (prov_name, entry) in provider_iter {
             // Skip if --provider filter is set and this provider isn't in it
             if let Some(ref filter) = provider_filter
-                && !filter.contains(&prov_name.as_str())
+                && !filter.contains(&prov_name)
             {
                 continue;
             }
 
             if !provider::is_available(prov_name) {
-                if warned_unavailable.insert(prov_name.clone()) {
+                if warned_unavailable.insert(prov_name.to_string()) {
                     eprintln!("warning: '{prov_name}' not found on PATH, skipping");
                 }
                 continue;
             }
 
-            let prov = prov_name.clone();
+            let prov = prov_name.to_string();
             let sid = if cli.oneshot {
                 String::new()
             } else {
@@ -609,6 +663,7 @@ async fn run_prime(archetype: &str, providers: &[String]) -> Result<()> {
                 groups: std::collections::BTreeMap::new(),
                 audit: config::AuditConfig::default(),
                 prime: std::collections::BTreeMap::new(),
+                defaults: config::DefaultsConfig::default(),
             },
             cwd,
         ))

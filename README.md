@@ -112,6 +112,23 @@ Use this when reviews happen far enough apart that the prompt cache has expired 
 
 `.review.toml` still drives provider selection and `model`/`env` overrides; the session IDs from `[archetype.host]` are simply unused. If no `[_prime]` entry exists for the archetype, the prime block is silently skipped.
 
+**Prime-only archetypes.** An archetype defined only under `[_prime]` (with no `[archetype.host]` block) is a valid configuration for ephemeral-consultant personas that should always be invoked via `--oneshot`. There's no session to persist, so no host block is needed. To know which providers to launch, `review` consults `--provider` first, then falls back to `[_defaults].providers`:
+
+```toml
+[_defaults]
+providers = ["claude"]
+
+[_prime]
+lua = """You're a Lua subject-matter expert..."""
+```
+
+```
+echo "is this idiomatic?" | review lua --oneshot          # uses [_defaults].providers
+echo "is this idiomatic?" | review lua --oneshot --provider codex   # --provider wins
+```
+
+If neither is set, `review` errors with a message naming both options.
+
 The fresh sessions are persistable — for claude and codex, the new session ID is printed above the response so the operator can follow up via `--session <id>` while the cache is warm:
 
 ```
@@ -236,6 +253,9 @@ claude = "session-vwx234"
 [_groups]
 sweep = ["security", "bugs"]
 competitors = ["tilemaker", "tippecanoe"]
+
+[_defaults]
+providers = ["claude"]    # fallback when --provider is omitted for prime-only archetypes
 ```
 
 Session IDs are scoped by hostname, so the same `.review.toml` works across machines with different sessions.
