@@ -259,6 +259,7 @@ async fn main() -> Result<()> {
                 provider: "unknown".into(),
                 output: Err(anyhow::anyhow!("task panicked: {err}")),
                 session_id: None,
+                digest: None,
             },
         };
 

@@ -10,12 +10,12 @@ Add a command that creates an archetype from a priming prompt (writes `[archetyp
 
 ## Subsume the pbfhogg spec-loop scripts
 
-`review` is absorbing the per-project python scripts (`pbfhogg/scripts/codex_common.py`, `codex-review.py`, `codex-implement.py`) so the workflow stops living as copied scripts in each project. Landed so far: fresh-session-per-run, host-scoped profiles (model/effort/env), and `sandbox` as a profile field (codex `--sandbox`; default `read-only`). Remaining:
+`review` is absorbing the per-project python scripts (`pbfhogg/scripts/codex_common.py`, `codex-review.py`, `codex-implement.py`) so the workflow stops living as copied scripts in each project. Landed so far: fresh-session-per-run, host-scoped profiles (model/effort/env), `sandbox` as a profile field (codex `--sandbox`; default `read-only`), and the rich codex digest + `-o`/`--output-last-message` backstop (token usage, turn count, captured-vs-interrupted; run no longer bails on non-zero exit). Remaining:
 
-- **Rich digest.** Parse codex's NDJSON into a summary instead of raw passthrough: token usage (input/cached/output/reasoning), turn count, and a completed-vs-interrupted verdict.
-- **`-o` / `--output-last-message` backstop.** Authoritative "did it finish" signal that survives codex halting its NDJSON mid-run. The load-bearing trick in `codex_common.run_codex`.
-- **Transcript forensics.** Optionally read codex's on-disk session JSONL (`$CODEX_HOME/sessions`) to diagnose why a run stopped.
+- **Transcript forensics.** Optionally read codex's on-disk session JSONL (`$CODEX_HOME/sessions`) to diagnose why a run stopped (last in-flight tool, stream_error vs clean turn). Enriches the digest's "why it stopped" line.
+- **Usage in the sidecar.** The digest is printed but not persisted; consider recording token usage/turns into the sessions sidecar for accounting.
 - **claude sandbox mapping.** Wire the profile `sandbox` value onto claude's `--permission-mode` (see the `_sandbox` TODO in `provider.rs`).
+- **Digest for the codex `--session` resume path.** Currently only fresh runs get a digest; resume uses `-o` without `--json` so it has no usage/turns.
 
 Note: `goal` needs no code - an archetype whose prompt is `/goal` covers it. With the grounding prefix gone, `/goal` now leads the message, but `assemble` joins it as `/goal\n\n<stdin>` whereas the old scripts used `/goal <text>` (same line). Verify codex accepts the newline-separated form, or special-case the join if not.
 

@@ -172,6 +172,24 @@ For ad-hoc queries beyond what `review sessions` exposes, the JSONL works direct
 <review content>
 ```
 
+Codex runs also print a digest above the message, distilled from its `--json`
+stream plus the `-o`/`--output-last-message` backstop:
+
+```
+--- codex ---
+session: 019f5f70-b2ca-7590-8a61-be66d9d7cf07
+exit: 0
+captured: true
+turns: 1
+usage: input=12244 cached=10112 output=5 reasoning=0
+<review content>
+```
+
+`captured: true` means the final message came from the authoritative `-o` file
+(which survives a frozen or halted stream); `false` means we fell back to the
+last streamed message. Non-JSON log lines codex interleaves (ERROR/WARN,
+apply_patch dumps) are printed between the digest and the message.
+
 When using `all` or groups, archetype headers are added:
 
 ```
