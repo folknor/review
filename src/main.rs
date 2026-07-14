@@ -356,25 +356,32 @@ async fn run_session_resume(
         bail!("'{provider_name}' not found on PATH");
     }
 
-    // Cache-age advisory. The sidecar lets us tell the operator how long it's
-    // been since the session was last touched; >55 minutes is roughly the cap
-    // on Anthropic's prompt cache TTL (5 min default, ~1h with the right env
-    // vars), so anything older is almost certainly a cold-cache resume.
+    // Cache-age gate. The sidecar tells us how long it's been since the session
+    // last ended; past ~55 minutes (the realistic cap on Anthropic's prompt
+    // cache TTL - 5 min default, ~1h with the right env vars) the cache is cold,
+    // and resuming means reprocessing the whole session prefix at full cost.
+    // `--session` is the *warm* follow-up path, so a cold resume is refused: do
+    // a fresh run with restated context instead. When there's no sidecar record
+    // we can't determine age, so we proceed rather than block.
+    const STALE_SESSION_SECS: u64 = 55 * 60;
     if let Some(record) = sessions::latest_for_session(session_id) {
         if let Some(age) = sessions::age_secs(&record) {
+            if age > STALE_SESSION_SECS {
+                bail!(
+                    "session last touched {} ago - its prompt cache is cold.\n  \
+                     Resuming would reprocess the whole session prefix at full cost.\n  \
+                     Start a fresh run with restated context instead of `--session`.",
+                    sessions::format_age(age)
+                );
+            }
             if age < 60 {
                 eprintln!("session last touched just now");
             } else {
                 eprintln!("session last touched {} ago", sessions::format_age(age));
             }
-            if age > 55 * 60 {
-                eprintln!(
-                    "  cache is likely cold - a fresh run with restated context may be cheaper"
-                );
-            }
         }
     } else {
-        eprintln!("note: no sidecar record for this session");
+        eprintln!("note: no sidecar record for this session (age unknown)");
     }
 
     // Global lock: serialize against other `review` invocations.

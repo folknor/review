@@ -134,7 +134,7 @@ Each run that captures a session ID and each `--session` resume appends a JSONL 
 
 The sidecar drives two things:
 
-**1. Cache-age advisory on `--session`.** When you resume, `review` looks up the last touch and prints how long it's been:
+**1. Cache-age gate on `--session`.** When you resume, `review` looks up the last touch and prints how long it's been:
 
 ```
 $ echo "follow up" | review bugs --provider claude --session 019deabc-...
@@ -143,7 +143,20 @@ session last touched 14m ago
 <response>
 ```
 
-If the last touch was over 55 minutes ago - past the longest realistic prompt-cache TTL - it adds a warning that a fresh run with restated context may be cheaper.
+`--session` is the *warm* follow-up path. If the session last ended over 55
+minutes ago - past the longest realistic prompt-cache TTL - the cache is cold,
+and resuming would reprocess the whole session prefix at full cost. So `review`
+**refuses** it and tells you to do a fresh run with restated context instead:
+
+```
+$ echo "follow up" | review bugs --provider claude --session 019deabc-...
+Error: session last touched 1h17m ago - its prompt cache is cold.
+  Resuming would reprocess the whole session prefix at full cost.
+  Start a fresh run with restated context instead of `--session`.
+```
+
+If there's no sidecar record for the session, the age is unknown and the resume
+proceeds.
 
 **2. `review sessions` listing.** Aggregates by `session_id` and shows recent sessions for the current project (or `--all` projects), most recent first:
 

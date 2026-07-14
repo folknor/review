@@ -12,7 +12,8 @@ Add a command that creates an archetype from a priming prompt (writes `[archetyp
 
 `review` is absorbing the per-project python scripts (`pbfhogg/scripts/codex_common.py`, `codex-review.py`, `codex-implement.py`) so the workflow stops living as copied scripts in each project. Landed so far: fresh-session-per-run, host-scoped profiles (model/effort/env), `sandbox` as a profile field (codex `--sandbox`; default `read-only`), the rich codex digest + `-o`/`--output-last-message` backstop (token usage, turn count, captured-vs-interrupted; run no longer bails on non-zero exit; both fresh and `--session` resume runs share the digest via `run_codex_json`), and transcript forensics (`src/transcript.rs`: on suspicious runs, read `$CODEX_HOME/sessions/**/*-<id>.jsonl` for task_complete / stream_error / last in-flight tool). Remaining:
 
-- **Usage in the sidecar.** The digest is printed but not persisted; consider recording token usage/turns into the sessions sidecar for accounting.
+Non-goals (considered and dropped):
+- **Usage in the sidecar.** Token usage/turns are in the printed digest; persisting them only helps after-the-fact spend aggregation, which we don't need. Skipped.
 
 Note: `goal` needs no code - an archetype whose prompt is `/goal` covers it.
 Note: `sandbox` is codex-only by design. Codex's filesystem sandbox and claude's
