@@ -6,7 +6,7 @@ Built with LLMs. See [LLM.md](LLM.md).
 
 ## How it works
 
-You define **archetypes** -- reviewer perspectives like `security`, `bugs`, `perf`, or any custom name -- as a name mapped to a priming prompt. When you run a review, you pipe your instructions via stdin. The tool starts a **fresh session** on each provider, prepends the grounding prefix and the archetype's priming prompt, and lets the agent fetch code itself.
+You define **archetypes** -- reviewer perspectives like `security`, `bugs`, `perf`, or any custom name -- as a name mapped to a priming prompt. When you run a review, you pipe your instructions via stdin. The tool starts a **fresh session** on each provider, prepends the archetype's priming prompt, and lets the agent fetch code itself. The archetype prompt carries its own grounding (role, whether it may modify files, "inspect current state") -- the tool bakes in nothing.
 
 Every run is a clean session by design. Reviving a long-lived session on a cold prompt cache means reprocessing its entire accumulated history - which only grows - whereas a fresh session costs roughly one review's worth of tokens each time. For claude and codex the new session ID is printed above the response, so you can follow up while the cache is still warm via `--session`.
 
@@ -67,12 +67,12 @@ Use `all` to fan out to every configured archetype, or define **groups** to fan 
 | Flag | Description |
 |------|-------------|
 | `--profile <name>` | Apply a named profile's `model`/`effort`/`env` overrides. Resolved per launched provider from `[<host>.<provider>.<profile>]`. |
-| `--session <id>` | Resume a specific session. Sends raw stdin (no PREFIX or prime). Requires a single `--provider`. |
+| `--session <id>` | Resume a specific session. Sends raw stdin (no prime prepended). Requires a single `--provider`. |
 | `--dry-run` | Print what would be sent instead of sending it |
 | `--provider <list>` | Limit to specific providers (comma-separated) |
 | `--stagger <secs>` | Seconds between each provider launch (default: 30, 0 to disable) |
 
-Each run starts a fresh session, prepends the grounding prefix and the archetype's priming prompt, and lets the agent fetch code itself. Providers come from `--provider`, or `[_defaults].providers` when `--provider` is omitted.
+Each run starts a fresh session, prepends the archetype's priming prompt to your stdin, and lets the agent fetch code itself. Providers come from `--provider`, or `[_defaults].providers` when `--provider` is omitted.
 
 Per-provider launch behavior:
 
@@ -107,7 +107,7 @@ echo "audit the auth flow" | review security --profile opus
 
 ### Follow-up via `--session`
 
-`--session <id>` resumes a specific provider session and sends raw stdin - no PREFIX, no prime. The grounding is already in the session's history from the run that created it.
+`--session <id>` resumes a specific provider session and sends raw stdin - no prime prepended. The grounding is already in the session's history from the run that created it.
 
 ```
 echo "what's the worst of those for a single-account user?" | \

@@ -17,7 +17,7 @@ Add a command that creates an archetype from a priming prompt (writes `[archetyp
 - **Transcript forensics.** Optionally read codex's on-disk session JSONL (`$CODEX_HOME/sessions`) to diagnose why a run stopped.
 - **claude sandbox mapping.** Wire the profile `sandbox` value onto claude's `--permission-mode` (see the `_sandbox` TODO in `provider.rs`).
 
-Note: `goal` needs no code - an archetype whose prompt is `/goal` covers it (verify codex still treats it as a slash command when it follows the grounding prefix).
+Note: `goal` needs no code - an archetype whose prompt is `/goal` covers it. With the grounding prefix gone, `/goal` now leads the message, but `assemble` joins it as `/goal\n\n<stdin>` whereas the old scripts used `/goal <text>` (same line). Verify codex accepts the newline-separated form, or special-case the join if not.
 
 Sources:
 - [Codex session-id feature request](https://github.com/openai/codex/issues/13242)

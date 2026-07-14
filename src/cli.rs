@@ -49,7 +49,7 @@ pub struct Cli {
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
 
-    /// Resume a specific session ID (no prefix or prime prepended).
+    /// Resume a specific session ID (no prime prepended).
     /// Requires a single --provider.
     #[arg(long, value_name = "ID")]
     pub session: Option<String>,

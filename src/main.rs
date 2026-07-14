@@ -321,9 +321,9 @@ async fn main() -> Result<()> {
 }
 
 /// `--session <id>` mode: resume a specific provider session and send raw
-/// stdin. No `.review.toml` lookup, no PREFIX, no prime - the session already
-/// has its grounding from the original interaction. Single provider, single
-/// archetype (the archetype is cosmetic context for audit).
+/// stdin. No `.review.toml` lookup, no prime - the session already has its
+/// grounding from the original interaction. Single provider, single archetype
+/// (the archetype is cosmetic context for audit).
 async fn run_session_resume(
     archetype: &str,
     provider_name: &str,
