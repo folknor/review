@@ -10,13 +10,12 @@ Add a command that creates an archetype from a priming prompt (writes `[archetyp
 
 ## Subsume the pbfhogg spec-loop scripts
 
-`review` is absorbing the per-project python scripts (`pbfhogg/scripts/codex_common.py`, `codex-review.py`, `codex-implement.py`) so the workflow stops living as copied scripts in each project. Landed so far: fresh-session-per-run, host-scoped profiles (model/effort/env), `sandbox` as a profile field (codex `--sandbox`; default `read-only`), the rich codex digest + `-o`/`--output-last-message` backstop (token usage, turn count, captured-vs-interrupted; run no longer bails on non-zero exit), and transcript forensics (`src/transcript.rs`: on suspicious runs, read `$CODEX_HOME/sessions/**/*-<id>.jsonl` for task_complete / stream_error / last in-flight tool). Remaining:
+`review` is absorbing the per-project python scripts (`pbfhogg/scripts/codex_common.py`, `codex-review.py`, `codex-implement.py`) so the workflow stops living as copied scripts in each project. Landed so far: fresh-session-per-run, host-scoped profiles (model/effort/env), `sandbox` as a profile field (codex `--sandbox`; default `read-only`), the rich codex digest + `-o`/`--output-last-message` backstop (token usage, turn count, captured-vs-interrupted; run no longer bails on non-zero exit; both fresh and `--session` resume runs share the digest via `run_codex_json`), and transcript forensics (`src/transcript.rs`: on suspicious runs, read `$CODEX_HOME/sessions/**/*-<id>.jsonl` for task_complete / stream_error / last in-flight tool). Remaining:
 
 - **Usage in the sidecar.** The digest is printed but not persisted; consider recording token usage/turns into the sessions sidecar for accounting.
 - **claude sandbox mapping.** Wire the profile `sandbox` value onto claude's `--permission-mode` (see the `_sandbox` TODO in `provider.rs`).
-- **Digest for the codex `--session` resume path.** Currently only fresh runs get a digest; resume uses `-o` without `--json` so it has no usage/turns.
 
-Note: `goal` needs no code - an archetype whose prompt is `/goal` covers it. With the grounding prefix gone, `/goal` now leads the message, but `assemble` joins it as `/goal\n\n<stdin>` whereas the old scripts used `/goal <text>` (same line). Verify codex accepts the newline-separated form, or special-case the join if not.
+Note: `goal` needs no code - an archetype whose prompt is `/goal` covers it.
 
 Sources:
 - [Codex session-id feature request](https://github.com/openai/codex/issues/13242)

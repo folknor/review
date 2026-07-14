@@ -266,12 +266,9 @@ async fn run_codex(
     project_root: &Path,
     oneshot: bool,
 ) -> Result<RunOutput> {
-    if oneshot {
-        return run_codex_oneshot(model, effort, sandbox, env, prompt, project_root).await;
-    }
+    let last_msg_path = temp_path(archetype, "codex");
 
-    let output_path = temp_path(archetype, "codex");
-
+    // Exec-level options shared by both paths.
     let mut args: Vec<String> = vec![
         "exec".to_string(),
         "--sandbox".to_string(),
@@ -285,85 +282,49 @@ async fn run_codex(
         args.push("-c".to_string());
         args.push(format!("model_reasoning_effort=\"{e}\""));
     }
-    args.extend([
-        "resume".to_string(),
-        session_id.to_string(),
-        "-o".to_string(),
-        output_path.clone(),
-    ]);
 
-    let mut cmd = Command::new("codex");
-    cmd.args(&args)
-        .current_dir(project_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(vars) = env {
-        cmd.envs(vars);
-    }
-    let mut child = cmd.spawn().context("failed to spawn codex")?;
-
-    let stdin = child.stdin.take().context("failed to open codex stdin")?;
-    let write_result = write_stdin(stdin, prompt.as_bytes().to_vec());
-    let output = child.wait_with_output();
-
-    let (write_res, output) = tokio::join!(write_result, output);
-    let output = output.context("failed to wait for codex")?;
-
-    let cleanup = || async {
-        let _ = tokio::fs::remove_file(&output_path).await;
+    // A fresh run captures the new session id from the stream; the `resume`
+    // subcommand carries the id we already know. Both stream `--json` and take
+    // `-o` (placed at the subcommand level for resume, exec level for fresh).
+    let known_session_id = if oneshot {
+        args.push("--json".to_string());
+        args.push("-o".to_string());
+        args.push(last_msg_path.clone());
+        None
+    } else {
+        args.push("resume".to_string());
+        args.push(session_id.to_string());
+        args.push("--json".to_string());
+        args.push("-o".to_string());
+        args.push(last_msg_path.clone());
+        Some(session_id.to_string())
     };
 
-    if !output.status.success() {
-        cleanup().await;
-        if let Err(e) = write_res {
-            anyhow::bail!("failed to write prompt: {e}");
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("codex exited with error: {}", stderr.trim());
-    }
-
-    let result = tokio::fs::read_to_string(&output_path).await;
-    cleanup().await;
-
-    let text = result.with_context(|| format!("failed to read codex output from {output_path}"))?;
-    Ok(RunOutput {
-        text,
-        session_id: None,
-        digest: None,
-    })
+    run_codex_json(
+        args,
+        &last_msg_path,
+        known_session_id,
+        env,
+        prompt,
+        project_root,
+    )
+    .await
 }
 
-/// Oneshot codex: `--json` to capture the freshly-created thread_id and stream
-/// events, plus `-o` as the authoritative final-message backstop. Distills a
-/// `Digest` (usage, turns, captured, exit/signal, log lines) so the run's
-/// outcome is legible even when the stream halts or the process errors.
-async fn run_codex_oneshot(
-    model: Option<&str>,
-    effort: Option<&str>,
-    sandbox: Option<&str>,
+/// Shared codex runner. `args` must include `--json` and `-o <last_msg_path>`.
+/// Pipes the prompt on stdin and distills a `Digest` (usage, turns, captured,
+/// exit/signal, log lines, transcript) from the NDJSON stream plus the `-o`
+/// backstop. `known_session_id` is `Some` on resume (we already know it) and
+/// `None` on a fresh run (parsed from `thread.started`). Never bails on a
+/// non-zero exit: a halted/errored run still reports what it produced.
+async fn run_codex_json(
+    args: Vec<String>,
+    last_msg_path: &str,
+    known_session_id: Option<String>,
     env: Option<&std::collections::BTreeMap<String, String>>,
     prompt: &str,
     project_root: &Path,
 ) -> Result<RunOutput> {
-    let last_msg_path = temp_path("last", "codex");
-    let mut args: Vec<String> = vec![
-        "exec".to_string(),
-        "--sandbox".to_string(),
-        sandbox.unwrap_or("read-only").to_string(),
-        "--json".to_string(),
-        "-o".to_string(),
-        last_msg_path.clone(),
-    ];
-    if let Some(m) = model {
-        args.push("-m".to_string());
-        args.push(m.to_string());
-    }
-    if let Some(e) = effort {
-        args.push("-c".to_string());
-        args.push(format!("model_reasoning_effort=\"{e}\""));
-    }
-
     let mut cmd = Command::new("codex");
     cmd.args(&args)
         .current_dir(project_root)
@@ -387,7 +348,7 @@ async fn run_codex_oneshot(
     // exit here - the whole point of the digest is that a halted or errored run
     // still yields whatever it produced, with the exit status recorded.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut session_id: Option<String> = None;
+    let mut parsed_session_id: Option<String> = None;
     let mut stream_message: Option<String> = None;
     let mut turns: u32 = 0;
     let mut usage = Usage::default();
@@ -407,7 +368,7 @@ async fn run_codex_oneshot(
         };
         match val.get("type").and_then(|t| t.as_str()) {
             Some("thread.started") => {
-                session_id = val
+                parsed_session_id = val
                     .get("thread_id")
                     .and_then(|t| t.as_str())
                     .map(String::from);
@@ -454,6 +415,10 @@ async fn run_codex_oneshot(
 
     let captured = final_from_file.is_some();
     let final_message = final_from_file.or(stream_message);
+
+    // On resume we already know the session id; on a fresh run it comes from
+    // the stream.
+    let session_id = known_session_id.or(parsed_session_id);
 
     let exit_code = output.status.code();
     let signal = signal_name(&output.status);

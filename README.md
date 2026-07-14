@@ -172,8 +172,9 @@ For ad-hoc queries beyond what `review sessions` exposes, the JSONL works direct
 <review content>
 ```
 
-Codex runs also print a digest above the message, distilled from its `--json`
-stream plus the `-o`/`--output-last-message` backstop:
+Codex runs (both fresh and `--session` follow-ups) also print a digest above
+the message, distilled from its `--json` stream plus the
+`-o`/`--output-last-message` backstop:
 
 ```
 --- codex ---
