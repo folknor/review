@@ -103,7 +103,7 @@ echo "audit the auth flow" | review security --profile opus
 
 `--profile opus` resolves `[<host>.<provider>.opus]` for each launched provider and applies its overrides. If any launched provider lacks that profile table, the run errors naming the missing `[host.provider.profile]`.
 
-`sandbox` maps to codex's `--sandbox` (`read-only`, `workspace-write`); it defaults to `read-only` when unset, so a bare `review` run can never modify files. (The claude read-only/write mapping onto `--permission-mode` is not wired yet.)
+`sandbox` maps to codex's `--sandbox` (`read-only`, `workspace-write`, `danger-full-access`); it defaults to `read-only` when unset, so a bare `review` run can never modify files. It is **codex-only** -- claude's `--permission-mode` is a tool-approval policy on a different axis with no honest mapping, so claude ignores `sandbox`.
 
 ### Follow-up via `--session`
 

@@ -88,12 +88,14 @@ pub async fn invoke(
     oneshot: bool,
 ) -> ProviderResult {
     let result = match provider {
+        // `sandbox` is a codex-only concept (an OS filesystem sandbox). Claude's
+        // `--permission-mode` is a tool-approval policy on a different axis with
+        // no honest mapping, so claude ignores it.
         "claude" => {
             run_claude(
                 session_id,
                 model,
                 effort,
-                sandbox,
                 env,
                 prompt,
                 project_root,
@@ -185,11 +187,6 @@ async fn run_claude(
     session_id: &str,
     model: Option<&str>,
     effort: Option<&str>,
-    // TODO: map the profile `sandbox` value (read-only / workspace-write) onto
-    // claude's `--permission-mode` (acceptEdits/bypassPermissions for writes).
-    // Deferred; claude currently always runs read-only via `--permission-mode
-    // dontAsk`.
-    _sandbox: Option<&str>,
     env: Option<&std::collections::BTreeMap<String, String>>,
     prompt: &str,
     project_root: &Path,
