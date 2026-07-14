@@ -10,9 +10,8 @@ Add a command that creates an archetype from a priming prompt (writes `[archetyp
 
 ## Subsume the pbfhogg spec-loop scripts
 
-`review` is absorbing the per-project python scripts (`pbfhogg/scripts/codex_common.py`, `codex-review.py`, `codex-implement.py`) so the workflow stops living as copied scripts in each project. Landed so far: fresh-session-per-run, host-scoped profiles (model/effort/env), `sandbox` as a profile field (codex `--sandbox`; default `read-only`), and the rich codex digest + `-o`/`--output-last-message` backstop (token usage, turn count, captured-vs-interrupted; run no longer bails on non-zero exit). Remaining:
+`review` is absorbing the per-project python scripts (`pbfhogg/scripts/codex_common.py`, `codex-review.py`, `codex-implement.py`) so the workflow stops living as copied scripts in each project. Landed so far: fresh-session-per-run, host-scoped profiles (model/effort/env), `sandbox` as a profile field (codex `--sandbox`; default `read-only`), the rich codex digest + `-o`/`--output-last-message` backstop (token usage, turn count, captured-vs-interrupted; run no longer bails on non-zero exit), and transcript forensics (`src/transcript.rs`: on suspicious runs, read `$CODEX_HOME/sessions/**/*-<id>.jsonl` for task_complete / stream_error / last in-flight tool). Remaining:
 
-- **Transcript forensics.** Optionally read codex's on-disk session JSONL (`$CODEX_HOME/sessions`) to diagnose why a run stopped (last in-flight tool, stream_error vs clean turn). Enriches the digest's "why it stopped" line.
 - **Usage in the sidecar.** The digest is printed but not persisted; consider recording token usage/turns into the sessions sidecar for accounting.
 - **claude sandbox mapping.** Wire the profile `sandbox` value onto claude's `--permission-mode` (see the `_sandbox` TODO in `provider.rs`).
 - **Digest for the codex `--session` resume path.** Currently only fresh runs get a digest; resume uses `-o` without `--json` so it has no usage/turns.

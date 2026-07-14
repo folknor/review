@@ -50,6 +50,9 @@ pub struct Digest {
     /// Non-JSON stdout lines (codex ERROR/WARN, apply_patch dumps). The harness
     /// can halt NDJSON emission on these, so we keep them visible.
     pub log_lines: Vec<String>,
+    /// On-disk transcript forensics, read only when the run looks wrong
+    /// (not captured, non-zero exit, or killed by a signal).
+    pub transcript: Option<crate::transcript::TranscriptSummary>,
 }
 
 pub struct ProviderResult {
@@ -452,13 +455,27 @@ async fn run_codex_oneshot(
     let captured = final_from_file.is_some();
     let final_message = final_from_file.or(stream_message);
 
+    let exit_code = output.status.code();
+    let signal = signal_name(&output.status);
+    // Only pay for transcript forensics when the run looks wrong; a clean
+    // captured run needs no post-mortem.
+    let suspicious = !captured || exit_code != Some(0) || signal.is_some();
+    let transcript = if suspicious {
+        session_id
+            .as_deref()
+            .and_then(crate::transcript::summarize_session)
+    } else {
+        None
+    };
+
     let digest = Digest {
-        exit_code: output.status.code(),
-        signal: signal_name(&output.status),
+        exit_code,
+        signal,
         captured,
         turns,
         usage,
         log_lines,
+        transcript,
     };
 
     match final_message {
@@ -534,4 +551,26 @@ fn print_digest(d: &Digest) {
         }
         println!("--- end log lines ---");
     }
+    if let Some(ref t) = d.transcript {
+        println!("transcript: {}", t.path);
+        println!(
+            "  task_complete={} stream_error={}",
+            t.task_complete, t.stream_error
+        );
+        if let Some(ref last) = t.last_event {
+            println!("  last_event: {last}");
+        }
+        if let Some((ref name, ref args)) = t.last_in_flight_tool {
+            println!("  last_in_flight_tool: {name} {}", truncate(args, 200));
+        }
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push_str("...");
+    out
 }

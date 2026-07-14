@@ -7,6 +7,7 @@ mod lock;
 mod prompt;
 mod provider;
 mod sessions;
+mod transcript;
 
 use anyhow::{Result, bail};
 use clap::Parser;

@@ -190,6 +190,12 @@ usage: input=12244 cached=10112 output=5 reasoning=0
 last streamed message. Non-JSON log lines codex interleaves (ERROR/WARN,
 apply_patch dumps) are printed between the digest and the message.
 
+When a run looks wrong (`captured: false`, non-zero exit, or a signal), the
+digest also reads codex's on-disk transcript and appends a post-mortem: whether
+the turn reached `task_complete`, whether a `stream_error` occurred, the last
+event, and the last in-flight tool call (what was running when it stopped).
+Clean runs skip this.
+
 When using `all` or groups, archetype headers are added:
 
 ```
