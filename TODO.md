@@ -8,23 +8,19 @@
 
 Add a command that creates an archetype from a priming prompt (writes `[archetypes].<name>` in `.review.toml`), so archetypes don't have to be hand-edited. Takes the prompt on stdin.
 
-## kilo/opencode session-ID capture
+## Subsume the pbfhogg spec-loop scripts
 
-Claude and codex capture the fresh session's ID (claude generates the UUID up front; codex parses `thread_id` from `--json`). Kilo and opencode runs succeed but their session is unreachable for follow-up via `--session` because we don't capture the ID.
+`review` is absorbing the per-project python scripts (`pbfhogg/scripts/codex_common.py`, `codex-review.py`, `codex-implement.py`) so the workflow stops living as copied scripts in each project. Landed so far: fresh-session-per-run, host-scoped profiles (model/effort/env), and `sandbox` as a profile field (codex `--sandbox`; default `read-only`). Remaining:
 
-**Kilo** - `--format json` does not emit a session ID event before task completion (output is buffered). But `kilo session list` shows sessions:
-```
-ses_2c61344d5ffe61Moxe9A1e3Klk  New session - 2026-03-29T14:08:28.970Z
-```
-Approach: run `kilo session list` before and after the run, diff to find the new one. Note: ID format is `ses_*`, not UUID.
+- **Rich digest.** Parse codex's NDJSON into a summary instead of raw passthrough: token usage (input/cached/output/reasoning), turn count, and a completed-vs-interrupted verdict.
+- **`-o` / `--output-last-message` backstop.** Authoritative "did it finish" signal that survives codex halting its NDJSON mid-run. The load-bearing trick in `codex_common.run_codex`.
+- **Transcript forensics.** Optionally read codex's on-disk session JSONL (`$CODEX_HOME/sessions`) to diagnose why a run stopped.
+- **claude sandbox mapping.** Wire the profile `sandbox` value onto claude's `--permission-mode` (see the `_sandbox` TODO in `provider.rs`).
 
-**OpenCode** - same as Kilo (shared codebase). Same buffered JSON, same `session list` approach.
-
-Once capture is implemented, wire it into `run_stdout_provider` so those providers emit their session IDs alongside claude/codex.
+Note: `goal` needs no code - an archetype whose prompt is `/goal` covers it (verify codex still treats it as a slash command when it follows the grounding prefix).
 
 Sources:
 - [Codex session-id feature request](https://github.com/openai/codex/issues/13242)
-- [Kilo CLI docs](https://kilo.ai/docs/code-with-ai/platforms/cli)
 
 ## Audit log phase 2: git sync
 

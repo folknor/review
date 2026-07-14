@@ -191,6 +191,7 @@ async fn main() -> Result<()> {
                 .and_then(|name| cfg.resolve_profile(&hostname, prov_name, name));
             let model = profile.and_then(|p| p.model.clone());
             let effort = profile.and_then(|p| p.effort.clone());
+            let sandbox = profile.and_then(|p| p.sandbox.clone());
             let env = profile.and_then(|p| p.env.clone());
             let env_keys: Vec<String> = env
                 .as_ref()
@@ -221,6 +222,7 @@ async fn main() -> Result<()> {
                         "",
                         model.as_deref(),
                         effort.as_deref(),
+                        sandbox.as_deref(),
                         env.as_ref(),
                         &aname,
                         &prompt,
@@ -260,8 +262,8 @@ async fn main() -> Result<()> {
             },
         };
 
-        // Audit log always records the run; the session_id may be absent for
-        // providers that don't capture it (kilo/opencode).
+        // Audit log always records the run; the session_id is present for
+        // claude/codex (both capture it).
         let session_for_log = result.session_id.as_deref().unwrap_or("");
         audit::log_result(
             &project_root,
@@ -382,6 +384,7 @@ async fn run_session_resume(
     let result = provider::invoke(
         provider_name,
         session_id,
+        None,
         None,
         None,
         None,

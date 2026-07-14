@@ -38,6 +38,7 @@ pub async fn invoke(
     session_id: &str,
     model: Option<&str>,
     effort: Option<&str>,
+    sandbox: Option<&str>,
     env: Option<&std::collections::BTreeMap<String, String>>,
     archetype: &str,
     prompt: &str,
@@ -50,6 +51,7 @@ pub async fn invoke(
                 session_id,
                 model,
                 effort,
+                sandbox,
                 env,
                 prompt,
                 project_root,
@@ -62,32 +64,9 @@ pub async fn invoke(
                 session_id,
                 model,
                 effort,
+                sandbox,
                 env,
                 archetype,
-                prompt,
-                project_root,
-                oneshot,
-            )
-            .await
-        }
-        "kilo" => {
-            run_stdout_provider(
-                "kilo",
-                session_id,
-                model,
-                env,
-                prompt,
-                project_root,
-                oneshot,
-            )
-            .await
-        }
-        "opencode" => {
-            run_stdout_provider(
-                "opencode",
-                session_id,
-                model,
-                env,
                 prompt,
                 project_root,
                 oneshot,
@@ -126,7 +105,7 @@ async fn write_stdin(
     }
 }
 
-/// Run a provider that outputs to stdout (claude, kilo, opencode).
+/// Run a provider that outputs to stdout (claude).
 /// Shared logic for stdin pipe → stdout capture.
 async fn run_with_stdout(
     mut child: tokio::process::Child,
@@ -159,6 +138,11 @@ async fn run_claude(
     session_id: &str,
     model: Option<&str>,
     effort: Option<&str>,
+    // TODO: map the profile `sandbox` value (read-only / workspace-write) onto
+    // claude's `--permission-mode` (acceptEdits/bypassPermissions for writes).
+    // Deferred; claude currently always runs read-only via `--permission-mode
+    // dontAsk`.
+    _sandbox: Option<&str>,
     env: Option<&std::collections::BTreeMap<String, String>>,
     prompt: &str,
     project_root: &Path,
@@ -224,6 +208,7 @@ async fn run_codex(
     session_id: &str,
     model: Option<&str>,
     effort: Option<&str>,
+    sandbox: Option<&str>,
     env: Option<&std::collections::BTreeMap<String, String>>,
     archetype: &str,
     prompt: &str,
@@ -231,7 +216,7 @@ async fn run_codex(
     oneshot: bool,
 ) -> Result<(String, Option<String>)> {
     if oneshot {
-        return run_codex_oneshot(model, effort, env, prompt, project_root).await;
+        return run_codex_oneshot(model, effort, sandbox, env, prompt, project_root).await;
     }
 
     let output_path = temp_path(archetype, "codex");
@@ -239,7 +224,7 @@ async fn run_codex(
     let mut args: Vec<String> = vec![
         "exec".to_string(),
         "--sandbox".to_string(),
-        "read-only".to_string(),
+        sandbox.unwrap_or("read-only").to_string(),
     ];
     if let Some(m) = model {
         args.push("-m".to_string());
@@ -301,6 +286,7 @@ async fn run_codex(
 async fn run_codex_oneshot(
     model: Option<&str>,
     effort: Option<&str>,
+    sandbox: Option<&str>,
     env: Option<&std::collections::BTreeMap<String, String>>,
     prompt: &str,
     project_root: &Path,
@@ -308,7 +294,7 @@ async fn run_codex_oneshot(
     let mut args: Vec<String> = vec![
         "exec".to_string(),
         "--sandbox".to_string(),
-        "read-only".to_string(),
+        sandbox.unwrap_or("read-only").to_string(),
         "--json".to_string(),
     ];
     if let Some(m) = model {
@@ -373,54 +359,6 @@ async fn run_codex_oneshot(
     let text = response_text
         .ok_or_else(|| anyhow::anyhow!("could not find item.completed in codex output"))?;
     Ok((text, session_id))
-}
-
-/// Run kilo or opencode - both use `<binary> run [-s <id>] [-m M] --dir <path>` and output to stdout.
-/// In oneshot mode, kilo gets `--auto` to bypass interactive permission prompts; opencode runs plain.
-/// Session-ID capture for these providers is not implemented yet, so the caller gets `None`
-/// back even in `--oneshot` mode (oneshot kilo/opencode follow-ups via `--session` are not
-/// supported until we add per-provider capture).
-async fn run_stdout_provider(
-    provider: &str,
-    session_id: &str,
-    model: Option<&str>,
-    env: Option<&std::collections::BTreeMap<String, String>>,
-    prompt: &str,
-    project_root: &Path,
-    oneshot: bool,
-) -> Result<(String, Option<String>)> {
-    let mut args: Vec<String> = vec!["run".to_string()];
-    if oneshot {
-        if provider == "kilo" {
-            args.push("--auto".to_string());
-        }
-    } else {
-        args.push("-s".to_string());
-        args.push(session_id.to_string());
-    }
-    if let Some(m) = model {
-        args.push("-m".to_string());
-        args.push(m.to_string());
-    }
-    let dir = project_root.to_string_lossy().to_string();
-    args.push("--dir".to_string());
-    args.push(dir);
-
-    let mut cmd = Command::new(provider);
-    cmd.args(&args)
-        .current_dir(project_root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(vars) = env {
-        cmd.envs(vars);
-    }
-    let child = cmd
-        .spawn()
-        .with_context(|| format!("failed to spawn {provider}"))?;
-
-    let text = run_with_stdout(child, prompt, provider).await?;
-    Ok((text, None))
 }
 
 pub fn print_result(result: &ProviderResult) {

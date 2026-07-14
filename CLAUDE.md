@@ -30,7 +30,7 @@ Do not use your Memory functionality. Update CLAUDE.md instead. This project is 
 
 ## What this project is
 
-A Rust CLI (`review`) that fans out code reviews to fresh AI sessions across multiple providers (Claude Code, Codex, Kilo, OpenCode). It's a prompt builder - the agents fetch code themselves. Each run starts a clean session primed with an archetype's prompt (see Design decisions for why fresh beats long-lived).
+A Rust CLI (`review`) that fans out code reviews to fresh AI sessions across providers (Claude Code, Codex). It's a prompt builder - the agents fetch code themselves. Each run starts a clean session primed with an archetype's prompt (see Design decisions for why fresh beats long-lived).
 
 Per-project config via `.review.toml`: archetypes (name → priming prompt), groups, default providers, and host-scoped `--profile` overrides. Comma-separated archetypes/groups can be mixed freely, with deduplication.
 
@@ -52,7 +52,7 @@ Single binary crate, no workspace.
 - `src/config.rs` - Parses `.review.toml` in cwd. `[archetypes]` maps name → priming prompt; `[_groups]` names archetype sets; `[_defaults].providers` is the provider list when `--provider` is omitted; every other top-level table is a hostname carrying `[<host>.<provider>.<profile>]` profiles (model/effort/env). Parsed by peeling reserved sections off a `toml::Table` and treating the rest as hosts (serde `flatten` can't coexist with the sibling `archetypes` field). Also holds `generate_uuid`/`generate_short_id`. Uses `toml` and `gethostname` crates.
 - `src/input.rs` - Reads stdin instructions (required, 20KB limit).
 - `src/prompt.rs` - `assemble`: grounding prefix + archetype prompt + stdin.
-- `src/provider.rs` - Async provider invocation. Prompts piped via stdin. Claude uses `--permission-mode dontAsk`, Codex uses `--sandbox read-only`. Each run (oneshot=true) starts a fresh persistable session (claude `--session-id <generated UUID>`, codex `--json` to capture `thread_id`, kilo `--auto`, opencode plain); `--session` resume passes oneshot=false. Model/effort/env applied per profile (`--effort` for claude, `-c model_reasoning_effort=` for codex - codex invocation is provisional). Claude/codex emit the new session ID via `ProviderResult.session_id`.
+- `src/provider.rs` - Async provider invocation for claude and codex only. Prompts piped via stdin. Each run (oneshot=true) starts a fresh persistable session (claude `--session-id <generated UUID> --permission-mode dontAsk`, codex `exec --json` to capture `thread_id`); `--session` resume passes oneshot=false. Profile settings applied: `model` (claude `--model`, codex `-m`), `effort` (claude `--effort`, codex `-c model_reasoning_effort=` - provisional), `sandbox` (codex `--sandbox`, default `read-only`; claude mapping onto `--permission-mode` is deferred - see the `_sandbox` TODO), `env`. Claude/codex emit the new session ID via `ProviderResult.session_id`.
 - `src/sessions.rs` - Append-only sidecar log at `~/.local/share/review/sessions.jsonl` (or `sessions-private.jsonl` if `audit.private`). One row per run that captured a session ID (`kind = "run"`), one per `--session` resume (`kind = "session"`). Rows carry timestamp + epoch_secs, project, hostname, audit_id, provider, archetype, session_id, model, env var *names* (not values - those can carry secrets), operator prompt, assembled prompt, response or error, and review version. Read helpers (`read_all`, `latest_for_session`, `age_secs`, `format_age`) drive the cache-age advisory in `--session` mode and the `review sessions` subcommand.
 - `src/config_write.rs` - `append_audit_id` (the only writer left; archetypes/profiles are hand-edited).
 - `src/main.rs` - Wires CLI to config, prompt assembly, and provider dispatch.
@@ -61,13 +61,15 @@ Single binary crate, no workspace.
 ## Design decisions
 
 - Every run starts a fresh session - grounding prefix + archetype priming prompt + stdin. Reviving a long-lived session on a cold cache reprocesses its ever-growing history; a fresh session costs ~one review's worth of tokens and can't act on stale accumulated context. The session is persistable and its ID is printed so follow-ups can go through `--session` while the cache is warm.
-- Archetypes are pure: `[archetypes]` name → prompt, no host/session binding. Overrides live in separate host-scoped named profiles (`[<host>.<provider>.<profile>]`) selected with `--profile <name>`; `--profile` requires the table to exist for every launched provider or the run errors.
+- Archetypes are pure: `[archetypes]` name → prompt, no host/session binding. Overrides live in separate host-scoped named profiles (`[<host>.<provider>.<profile>]` carrying model/effort/sandbox/env) selected with `--profile <name>`; `--profile` requires the table to exist for every launched provider or the run errors. `sandbox` defaults to `read-only`, so a bare run can never modify files; a profile opts up to `workspace-write`.
 - Providers resolve from `--provider`, else `[_defaults].providers`; empty → error.
 - `--session <id>` resumes a specific provider session and sends raw stdin - bypasses `.review.toml`, no PREFIX, no prime, no profile. Requires a single `--provider`. Validation of the session ID is delegated to the provider. Before invoking, `review` looks up the sidecar log to print the time since the last touch and warn when it's > ~55 min (past the realistic prompt-cache TTL).
 - `review sessions` lists recent sessions for the current project (or `--all`), grouped by session ID, sorted by most recent touch. Output is block-formatted for terminal reading; ad-hoc queries beyond that go through `jq` on the JSONL directly.
 - Providers get prompts via **stdin pipe**, not CLI args, to avoid shell argument length limits.
 - Claude runs with `--permission-mode dontAsk` (uses pre-approved permissions, rejects interactive prompts). Codex runs with `--sandbox read-only`.
 - No global config - `.review.toml` lives in the project root.
+- claude and codex only. kilo/opencode were removed.
+- Subsuming the pbfhogg spec-loop python scripts (codex review/implement roles). Landed: sandbox as a profile field. Deferred: rich digest (token usage/turns/completed-vs-interrupted), the codex `-o`/`--output-last-message` frozen-stream backstop, transcript forensics. `goal` needs no code - it's just an archetype whose prompt is `/goal`.
 - Planned: a `review add` command to create an archetype from a priming prompt (currently hand-edited).
 
 ## Config format
@@ -88,4 +90,9 @@ sweep = ["security", "bugs"]
 model = "Opus 4.8"
 effort = "medium"
 env = { ANTHROPIC_BASE_URL = "http://localhost:8787" }
+
+[myhostname.codex.implement]
+model = "gpt-5.6-terra"
+effort = "high"
+sandbox = "workspace-write"
 ```

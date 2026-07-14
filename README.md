@@ -1,6 +1,6 @@
 # review
 
-A Rust CLI that fans out code reviews to fresh AI sessions across multiple providers (Claude Code, Codex, Kilo, OpenCode), each primed with a specific reviewer perspective.
+A Rust CLI that fans out code reviews to fresh AI sessions across multiple providers (Claude Code, Codex), each primed with a specific reviewer perspective.
 
 Built with LLMs. See [LLM.md](LLM.md).
 
@@ -80,12 +80,10 @@ Per-provider launch behavior:
 |----------|------|----------------------|
 | claude | `--session-id <generated> --print --permission-mode dontAsk` | yes (UUID generated up front) |
 | codex | `exec --sandbox read-only --json` | yes (parsed from `thread.started`) |
-| kilo | `run --auto` (auto-approve permissions) | not yet |
-| opencode | `run` (no auto-approve flag - may prompt) | not yet |
 
 ### Profiles
 
-Profiles carry per-provider `model`, `effort`, and `env` overrides, applied only when you pass `--profile`. They are scoped by host, provider, and profile name so the same name can mean different settings on different machines (e.g. a local proxy `ANTHROPIC_BASE_URL` that differs per host):
+Profiles carry per-provider `model`, `effort`, `sandbox`, and `env` overrides, applied only when you pass `--profile`. They are scoped by host, provider, and profile name so the same name can mean different settings on different machines (e.g. a local proxy `ANTHROPIC_BASE_URL` that differs per host):
 
 ```toml
 [myhostname.claude.opus]
@@ -93,9 +91,10 @@ model = "Opus 4.8"
 effort = "medium"
 env = { ANTHROPIC_BASE_URL = "http://localhost:8787" }
 
-[myhostname.codex.high]
-model = "o3"
+[myhostname.codex.implement]
+model = "gpt-5.6-terra"
 effort = "high"
+sandbox = "workspace-write"
 ```
 
 ```
@@ -103,6 +102,8 @@ echo "audit the auth flow" | review security --profile opus
 ```
 
 `--profile opus` resolves `[<host>.<provider>.opus]` for each launched provider and applies its overrides. If any launched provider lacks that profile table, the run errors naming the missing `[host.provider.profile]`.
+
+`sandbox` maps to codex's `--sandbox` (`read-only`, `workspace-write`); it defaults to `read-only` when unset, so a bare `review` run can never modify files. (The claude read-only/write mapping onto `--permission-mode` is not wired yet.)
 
 ### Follow-up via `--session`
 
@@ -223,14 +224,12 @@ An archetype is just a name mapped to a priming prompt - no session, no host bin
 |----------|--------|----------------|--------|------------|
 | claude | `claude` | `--print` | `--resume <id>` | `--model <name>` |
 | codex | `codex` | `exec` | `exec resume <id>` | `-m <model>` |
-| kilo | `kilo` | `run` | `run -s <id>` | `-m <provider/model>` |
-| opencode | `opencode` | `run` | `run -s <id>` | `-m <provider/model>` |
 
 Use `--provider` to limit which providers run:
 
 ```
 echo "just claude" | review bugs --provider claude
-echo "claude and kilo" | review bugs --provider claude,kilo
+echo "claude and codex" | review bugs --provider claude,codex
 ```
 
 ### Groups

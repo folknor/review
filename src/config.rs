@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 const CONFIG_FILENAME: &str = ".review.toml";
-pub const KNOWN_PROVIDERS: &[&str] = &["claude", "codex", "kilo", "opencode"];
+pub const KNOWN_PROVIDERS: &[&str] = &["claude", "codex"];
 
 #[derive(Debug, Default, Deserialize)]
 pub struct AuditConfig {
@@ -43,12 +43,15 @@ pub struct ProviderProfiles {
     pub profiles: BTreeMap<String, Profile>,
 }
 
-/// A named settings profile: optional model, effort, and env overrides applied
-/// to a provider invocation when selected via `--profile`.
+/// A named settings profile: optional model, effort, sandbox, and env overrides
+/// applied to a provider invocation when selected via `--profile`.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Profile {
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// Sandbox / write-access level. Codex: passed as `--sandbox` (e.g.
+    /// `read-only`, `workspace-write`). Defaults to `read-only` when unset.
+    pub sandbox: Option<String>,
     pub env: Option<BTreeMap<String, String>>,
 }
 
@@ -358,23 +361,26 @@ model = \"Opus 4.8\"
 effort = \"medium\"
 env = { ANTHROPIC_BASE_URL = \"http://localhost:8787\" }
 
-[myhost.codex.high]
-model = \"o3\"
+[myhost.codex.implement]
+model = \"gpt-5.6-terra\"
 effort = \"high\"
+sandbox = \"workspace-write\"
 ";
         let cfg = parse(raw).unwrap();
 
         let opus = cfg.resolve_profile("myhost", "claude", "opus").unwrap();
         assert_eq!(opus.model.as_deref(), Some("Opus 4.8"));
         assert_eq!(opus.effort.as_deref(), Some("medium"));
+        assert_eq!(opus.sandbox, None);
         assert_eq!(
             opus.env.as_ref().unwrap()["ANTHROPIC_BASE_URL"],
             "http://localhost:8787"
         );
 
-        let high = cfg.resolve_profile("myhost", "codex", "high").unwrap();
-        assert_eq!(high.model.as_deref(), Some("o3"));
-        assert_eq!(high.effort.as_deref(), Some("high"));
+        let implement = cfg.resolve_profile("myhost", "codex", "implement").unwrap();
+        assert_eq!(implement.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(implement.effort.as_deref(), Some("high"));
+        assert_eq!(implement.sandbox.as_deref(), Some("workspace-write"));
 
         assert!(cfg.resolve_profile("myhost", "claude", "nope").is_none());
         assert!(cfg.resolve_profile("otherhost", "claude", "opus").is_none());

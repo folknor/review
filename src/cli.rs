@@ -5,7 +5,7 @@ Archetypes are named reviewer personas defined under [archetypes] in
 .review.toml (name = priming prompt). Groups fan out to multiple archetypes
 (defined under [_groups]). Use \"all\" to fan out to every configured archetype.
 
-Providers: claude, codex, kilo, opencode. Providers come from --provider, or
+Providers: claude, codex. Providers come from --provider, or
 [_defaults].providers when --provider is omitted.
 
 Each run starts a fresh session, prepends the archetype's priming prompt, and
@@ -54,7 +54,7 @@ pub struct Cli {
     #[arg(long, value_name = "ID")]
     pub session: Option<String>,
 
-    /// Limit to specific providers (comma-separated, e.g. claude,kilo)
+    /// Limit to specific providers (comma-separated, e.g. claude,codex)
     #[arg(long, value_delimiter = ',')]
     pub provider: Option<Vec<String>>,
 
