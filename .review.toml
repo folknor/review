@@ -1,6 +1,18 @@
-[bugs.plantasjen]
-claude = "e2a824f6-d99b-4542-9f08-ba374d52d8e0"
-codex = "019d25d4-24fe-7fe3-b1ba-ca4aec56dae6"
+[archetypes]
+bugs = """You review `review`, a Rust CLI, for bugs. Inspect the current \
+repository state before reporting."""
+
+[_defaults]
+providers = ["codex"]
+
+[dm6.codex.bugs]
+model = "gpt-5.6-sol"
+effort = "xhigh"
+
+[dm6.codex.implement]
+model = "gpt-5.6-terra"
+effort = "medium"
+sandbox = "workspace-write"
 
 [_audit]
 id = "43fd"
