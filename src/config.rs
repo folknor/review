@@ -5,6 +5,12 @@ use std::collections::BTreeMap;
 const CONFIG_FILENAME: &str = ".review.toml";
 pub const KNOWN_PROVIDERS: &[&str] = &["claude", "codex"];
 
+/// Names that can't be archetypes or groups because the CLI routes them
+/// elsewhere: `all` (fan-out keyword) and the clap subcommands (`init`,
+/// `sessions`, plus the auto-generated `help`). Without this guard such a
+/// config entry parses fine but is unreachable - clap intercepts the name.
+pub const RESERVED_NAMES: &[&str] = &["all", "init", "sessions", "help"];
+
 #[derive(Debug, Default, Deserialize)]
 pub struct AuditConfig {
     #[serde(default)]
@@ -202,7 +208,7 @@ pub fn parse(raw: &str) -> Result<ReviewConfig> {
     }
 
     // Reserved names
-    for reserved in ["all", "init"] {
+    for &reserved in RESERVED_NAMES {
         if archetypes.contains_key(reserved) {
             bail!(
                 "'{reserved}' is a reserved name and cannot be used as an archetype in {CONFIG_FILENAME}"
@@ -212,7 +218,7 @@ pub fn parse(raw: &str) -> Result<ReviewConfig> {
 
     // Validate group names
     for name in groups.keys() {
-        for reserved in ["all", "init"] {
+        for &reserved in RESERVED_NAMES {
             if name == reserved {
                 bail!(
                     "'{reserved}' is a reserved name and cannot be used as a group in {CONFIG_FILENAME}"
@@ -474,6 +480,30 @@ security = [\"security\"]
         let raw = "\
 [archetypes]
 all = \"a\"
+";
+        let result = parse(raw);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn subcommand_names_reserved_as_archetype() {
+        for name in ["sessions", "help", "init"] {
+            let raw = format!("[archetypes]\n{name} = \"x\"\n");
+            let result = parse(&raw);
+            assert!(result.is_err(), "'{name}' should be reserved");
+            assert!(result.unwrap_err().to_string().contains("reserved"));
+        }
+    }
+
+    #[test]
+    fn subcommand_name_reserved_as_group() {
+        let raw = "\
+[archetypes]
+bugs = \"x\"
+
+[_groups]
+sessions = [\"bugs\"]
 ";
         let result = parse(raw);
         assert!(result.is_err());

@@ -162,6 +162,9 @@ pub fn record(
     provider: &str,
     session_id: &str,
     kind: &'static str,
+    // UNIX seconds when the run finished (from ProviderResult.completed_epoch),
+    // so the recorded time reflects completion rather than collection order.
+    epoch_secs: u64,
     model: Option<&str>,
     env_keys: Vec<String>,
     operator_prompt: &str,
@@ -184,8 +187,8 @@ pub fn record(
 
     let project_str = project_root.to_string_lossy();
     let entry = SessionEntry {
-        timestamp: crate::audit::chrono_now(),
-        epoch_secs: now_epoch_secs(),
+        timestamp: crate::audit::chrono_utc(epoch_secs),
+        epoch_secs,
         project: project_str.as_ref(),
         hostname: crate::config::hostname(),
         audit_id,

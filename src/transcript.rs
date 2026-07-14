@@ -22,7 +22,14 @@ pub struct TranscriptSummary {
     pub last_in_flight_tool: Option<(String, String)>,
 }
 
-fn codex_home() -> PathBuf {
+/// Codex home directory. `override_home` is the effective `CODEX_HOME` for the
+/// run (e.g. a profile `env` override), which wins over the parent process's
+/// environment - otherwise a run pointed at a custom codex home would have its
+/// transcript written somewhere we never look.
+fn codex_home(override_home: Option<&str>) -> PathBuf {
+    if let Some(dir) = override_home {
+        return PathBuf::from(dir);
+    }
     if let Ok(dir) = std::env::var("CODEX_HOME") {
         return PathBuf::from(dir);
     }
@@ -33,8 +40,8 @@ fn codex_home() -> PathBuf {
 /// Locate the transcript file for a session id by matching the `-<id>.jsonl`
 /// filename suffix (the id is a UUID, so this is unambiguous). Bounded
 /// recursive walk of the date-nested `sessions/` tree.
-fn find_transcript(session_id: &str) -> Option<PathBuf> {
-    let sessions = codex_home().join("sessions");
+fn find_transcript(session_id: &str, override_home: Option<&str>) -> Option<PathBuf> {
+    let sessions = codex_home(override_home).join("sessions");
     let needle = format!("-{session_id}.jsonl");
     let mut stack = vec![(sessions, 0u32)];
     while let Some((dir, depth)) = stack.pop() {
@@ -89,6 +96,14 @@ fn parse(content: &str) -> TranscriptSummary {
         last_event = Some(format!("{}/{}", top.unwrap_or("?"), ptype.unwrap_or("?")));
 
         match ptype {
+            // A resumed session appends new turns to the same rollout file. Reset
+            // per-turn state on each turn boundary so the summary reflects the
+            // current (last) turn, not a completed earlier one.
+            Some("task_started") => {
+                task_complete = false;
+                stream_error = false;
+                in_flight.clear();
+            }
             Some("task_complete") => task_complete = true,
             Some("stream_error") => stream_error = true,
             Some(pt) if pt.ends_with("_call") => {
@@ -135,8 +150,13 @@ fn parse(content: &str) -> TranscriptSummary {
 }
 
 /// Find and summarize the transcript for a codex session id, if one exists.
-pub fn summarize_session(session_id: &str) -> Option<TranscriptSummary> {
-    let path = find_transcript(session_id)?;
+/// `override_home` is the run's effective `CODEX_HOME` (a profile `env`
+/// override), if any.
+pub fn summarize_session(
+    session_id: &str,
+    override_home: Option<&str>,
+) -> Option<TranscriptSummary> {
+    let path = find_transcript(session_id, override_home)?;
     summarize(&path)
 }
 
@@ -181,5 +201,28 @@ mod tests {
         assert!(s.task_complete);
         assert!(!s.stream_error);
         assert!(s.last_in_flight_tool.is_none());
+    }
+
+    // A resumed rollout: the first turn completed, then a second turn started
+    // (resume), ran a tool, and hit a stream_error without completing. The
+    // summary must reflect the current turn, not the completed earlier one.
+    #[test]
+    fn resumed_turn_does_not_inherit_prior_completion() {
+        let resumed = concat!(
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"sleep 999\"}","call_id":"c9"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"stream_error"}}"#,
+        );
+        let s = parse(resumed);
+        assert!(!s.task_complete, "second turn must not report complete");
+        assert!(s.stream_error);
+        let (name, _) = s.last_in_flight_tool.expect("in-flight tool from turn 2");
+        assert_eq!(name, "exec_command");
     }
 }

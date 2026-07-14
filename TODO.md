@@ -1,16 +1,12 @@
 # TODO
 
-## Remaining review findings
-
-- **Stale temp file from PID reuse** (LOW) - killed process + recycled PID = silent wrong codex results. Use `tempfile` crate or `create_new(true)`.
-
 ## `review add`
 
 Add a command that creates an archetype from a priming prompt (writes `[archetypes].<name>` in `.review.toml`), so archetypes don't have to be hand-edited. Takes the prompt on stdin.
 
 ## Subsume the pbfhogg spec-loop scripts
 
-`review` is absorbing the per-project python scripts (`pbfhogg/scripts/codex_common.py`, `codex-review.py`, `codex-implement.py`) so the workflow stops living as copied scripts in each project. Landed so far: fresh-session-per-run, host-scoped profiles (model/effort/env), `sandbox` as a profile field (codex `--sandbox`; default `read-only`), the rich codex digest + `-o`/`--output-last-message` backstop (token usage, turn count, captured-vs-interrupted; run no longer bails on non-zero exit; both fresh and `--session` resume runs share the digest via `run_codex_json`), and transcript forensics (`src/transcript.rs`: on suspicious runs, read `$CODEX_HOME/sessions/**/*-<id>.jsonl` for task_complete / stream_error / last in-flight tool). Remaining:
+`review` is absorbing the per-project python scripts (`pbfhogg/scripts/codex_common.py`, `codex-review.py`, `codex-implement.py`) so the workflow stops living as copied scripts in each project. Landed so far: fresh-session-per-run, host-scoped profiles (model/effort/env), `sandbox` as a profile field (codex `--sandbox`; default `read-only`), the rich codex digest + `-o`/`--output-last-message` backstop (token usage, turn count, captured-vs-interrupted; run no longer bails on non-zero exit; both fresh and `--session` resume runs share the digest via `run_codex_json`), and transcript forensics (`src/transcript.rs`: on suspicious runs, read `$CODEX_HOME/sessions/**/*-<id>.jsonl` for task_complete / stream_error / last in-flight tool). The absorption is complete; a codex self-review (dogfood) then surfaced a batch of bugs in the new code, all since fixed (unique `-o` temp file, digest preserved on no-message runs, per-turn transcript reset, completion-time sidecar stamping, `--session`/`--profile` guard, reserved subcommand names, resume-recording conditions, profile `CODEX_HOME` in forensics).
 
 Non-goals (considered and dropped):
 - **Usage in the sidecar.** Token usage/turns are in the printed digest; persisting them only helps after-the-fact spend aggregation, which we don't need. Skipped.

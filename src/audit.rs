@@ -102,12 +102,16 @@ pub fn log_result(
 }
 
 pub(crate) fn chrono_now() -> String {
-    // UTC timestamp without pulling in the chrono crate
-    let duration = std::time::SystemTime::now()
+    let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = duration.as_secs();
+        .unwrap_or_default()
+        .as_secs();
+    chrono_utc(secs)
+}
 
+/// Format a UNIX-seconds instant as a UTC `YYYY-MM-DDThh:mm:ssZ` string without
+/// pulling in the chrono crate.
+pub(crate) fn chrono_utc(secs: u64) -> String {
     // Convert to date-time components
     let days = secs / 86400;
     let time_secs = secs % 86400;

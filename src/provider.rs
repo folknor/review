@@ -9,19 +9,33 @@ pub fn is_available(provider: &str) -> bool {
     which::which(provider).is_ok()
 }
 
-fn temp_path(archetype: &str, provider: &str) -> String {
-    let pid = std::process::id();
-    let safe_name: String = archetype
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
+/// Create a fresh, exclusively-owned temp file for codex's `-o` output and
+/// return its path. A random unguessable name (UUID) plus `O_EXCL` creation
+/// (`create_new`) makes collisions between concurrent runs impossible and
+/// defeats symlink pre-planting on what used to be a predictable pid+archetype
+/// path. The file is created empty; codex overwrites it with the final message.
+fn new_output_file() -> Result<String> {
+    let dir = std::env::temp_dir();
+    for _ in 0..8 {
+        let path = dir.join(format!(
+            "review-codex-{}.txt",
+            crate::config::generate_uuid()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(path.to_string_lossy().into_owned()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "failed to create codex output temp file: {e}"
+                ));
             }
-        })
-        .collect();
-    format!("/tmp/review-{safe_name}-{provider}-{pid}.txt")
+        }
+    }
+    anyhow::bail!("could not create a unique codex output temp file after 8 tries")
 }
 
 /// Token accounting summed across a run's `turn.completed` events (codex).
@@ -63,6 +77,17 @@ pub struct ProviderResult {
     pub session_id: Option<String>,
     /// Structured run summary (codex only, today).
     pub digest: Option<Digest>,
+    /// UNIX seconds when this run actually finished. Stamped here rather than at
+    /// sidecar-record time so the cold-cache clock reflects completion, not the
+    /// (possibly much later) moment results are collected in launch order.
+    pub completed_epoch: u64,
+}
+
+pub fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Internal result of one provider run before it's wrapped into a
@@ -82,7 +107,6 @@ pub async fn invoke(
     effort: Option<&str>,
     sandbox: Option<&str>,
     env: Option<&std::collections::BTreeMap<String, String>>,
-    archetype: &str,
     prompt: &str,
     project_root: &Path,
     oneshot: bool,
@@ -110,7 +134,6 @@ pub async fn invoke(
                 effort,
                 sandbox,
                 env,
-                archetype,
                 prompt,
                 project_root,
                 oneshot,
@@ -119,18 +142,21 @@ pub async fn invoke(
         }
         other => Err(anyhow::anyhow!("unknown provider: {other}")),
     };
+    let completed_epoch = now_epoch_secs();
     match result {
         Ok(run) => ProviderResult {
             provider: provider.to_string(),
             output: Ok(run.text),
             session_id: run.session_id,
             digest: run.digest,
+            completed_epoch,
         },
         Err(e) => ProviderResult {
             provider: provider.to_string(),
             output: Err(e),
             session_id: None,
             digest: None,
+            completed_epoch,
         },
     }
 }
@@ -258,12 +284,11 @@ async fn run_codex(
     effort: Option<&str>,
     sandbox: Option<&str>,
     env: Option<&std::collections::BTreeMap<String, String>>,
-    archetype: &str,
     prompt: &str,
     project_root: &Path,
     oneshot: bool,
 ) -> Result<RunOutput> {
-    let last_msg_path = temp_path(archetype, "codex");
+    let last_msg_path = new_output_file()?;
 
     // Exec-level options shared by both paths.
     let mut args: Vec<String> = vec![
@@ -420,12 +445,14 @@ async fn run_codex_json(
     let exit_code = output.status.code();
     let signal = signal_name(&output.status);
     // Only pay for transcript forensics when the run looks wrong; a clean
-    // captured run needs no post-mortem.
+    // captured run needs no post-mortem. Look under the run's effective
+    // CODEX_HOME (a profile env override) so a custom codex home is searched.
     let suspicious = !captured || exit_code != Some(0) || signal.is_some();
+    let codex_home = env.and_then(|e| e.get("CODEX_HOME")).map(String::as_str);
     let transcript = if suspicious {
         session_id
             .as_deref()
-            .and_then(crate::transcript::summarize_session)
+            .and_then(|sid| crate::transcript::summarize_session(sid, codex_home))
     } else {
         None
     };
@@ -440,25 +467,23 @@ async fn run_codex_json(
         transcript,
     };
 
-    match final_message {
-        Some(text) => Ok(RunOutput {
-            text,
-            session_id,
-            digest: Some(digest),
-        }),
-        None => {
-            // Nothing usable came back at all. Surface stderr as the error.
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let detail = stderr.trim();
-            if detail.is_empty() {
-                anyhow::bail!(
-                    "codex produced no final message (exit {:?})",
-                    output.status.code()
-                );
-            }
-            anyhow::bail!("codex produced no final message: {detail}");
+    // Even when no message came back (a hard freeze before any agent_message,
+    // the very case forensics exist to explain), return the digest rather than a
+    // bare error - otherwise `invoke` would drop the session id and transcript.
+    let text = final_message.unwrap_or_else(|| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            "(codex produced no final message)".to_string()
+        } else {
+            format!("(codex produced no final message)\n{detail}")
         }
-    }
+    });
+    Ok(RunOutput {
+        text,
+        session_id,
+        digest: Some(digest),
+    })
 }
 
 /// Signal name when a process was terminated by a signal, else `None`.

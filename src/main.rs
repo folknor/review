@@ -35,6 +35,13 @@ async fn main() -> Result<()> {
     };
 
     if let Some(ref session_id) = cli.session {
+        if cli.profile.is_some() {
+            bail!(
+                "--session and --profile are mutually exclusive: a resumed session \
+                 bypasses .review.toml, so profile model/effort/sandbox/env overrides \
+                 can't be applied"
+            );
+        }
         let providers = cli.provider.as_deref().unwrap_or(&[]);
         let provider_name = match providers {
             [one] => one.as_str(),
@@ -200,7 +207,6 @@ async fn main() -> Result<()> {
                 .unwrap_or_default();
 
             let prov = prov_name.clone();
-            let aname = (*arch_name).to_string();
             let prompt = assembled.clone();
             let root = project_root.clone();
             let delay = stagger * launch_count;
@@ -225,7 +231,6 @@ async fn main() -> Result<()> {
                         effort.as_deref(),
                         sandbox.as_deref(),
                         env.as_ref(),
-                        &aname,
                         &prompt,
                         &root,
                         true,
@@ -261,6 +266,7 @@ async fn main() -> Result<()> {
                 output: Err(anyhow::anyhow!("task panicked: {err}")),
                 session_id: None,
                 digest: None,
+                completed_epoch: provider::now_epoch_secs(),
             },
         };
 
@@ -289,6 +295,7 @@ async fn main() -> Result<()> {
                 &result.provider,
                 sid,
                 "run",
+                result.completed_epoch,
                 p.model.as_deref(),
                 p.env_keys.clone(),
                 &p.operator_prompt,
@@ -397,7 +404,6 @@ async fn run_session_resume(
         None,
         None,
         None,
-        archetype,
         &stdin_instructions,
         &project_root,
         false,
@@ -406,37 +412,48 @@ async fn run_session_resume(
 
     drop(lock_file);
 
-    // Audit log: load config opportunistically for audit_id/private settings;
-    // tolerate the case where .review.toml is absent.
-    if let Ok((mut cfg, root)) = config::load() {
-        let audit_id = match cfg.audit.id {
-            Some(ref id) => id.clone(),
-            None => {
-                let id = config::generate_short_id();
-                let config_path = root.join(".review.toml");
-                let _ = config_write::append_audit_id(&config_path, &id);
-                cfg.audit.id = Some(id.clone());
-                id
-            }
-        };
-        audit::log_result(
-            &root,
-            cfg.audit.private,
-            &audit_id,
-            archetype,
-            &result.provider,
-            session_id,
-            &stdin_instructions,
-            &result.output,
-        );
+    // Resolve audit_id/private for the logs. Load config opportunistically (and
+    // persist a generated id when a config exists), but fall back so logging
+    // works even without a .review.toml - otherwise a successful resume in a
+    // config-less dir would never be recorded and would soon be refused as stale.
+    let (audit_id, private) = match config::load() {
+        Ok((mut cfg, root)) => {
+            let id = match cfg.audit.id.take() {
+                Some(id) => id,
+                None => {
+                    let id = config::generate_short_id();
+                    let _ = config_write::append_audit_id(&root.join(".review.toml"), &id);
+                    id
+                }
+            };
+            (id, cfg.audit.private)
+        }
+        Err(_) => (config::generate_short_id(), false),
+    };
+
+    audit::log_result(
+        &project_root,
+        private,
+        &audit_id,
+        archetype,
+        &result.provider,
+        session_id,
+        &stdin_instructions,
+        &result.output,
+    );
+    // Only a *successful* resume refreshes the cold-cache clock. Recording a
+    // failed/rejected resume would make a dead session look warm for another
+    // ~55 minutes and defeat the gate.
+    if result.output.is_ok() {
         sessions::record(
-            &root,
-            cfg.audit.private,
+            &project_root,
+            private,
             &audit_id,
             archetype,
             &result.provider,
             session_id,
             "session",
+            result.completed_epoch,
             None,
             Vec::new(),
             &stdin_instructions,
