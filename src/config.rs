@@ -12,102 +12,65 @@ pub struct AuditConfig {
     pub id: Option<String>,
 }
 
-/// Project-wide defaults under [_defaults]. Currently used as a fallback when
-/// --provider is omitted and a prime-only archetype is invoked under --oneshot.
+/// Project-wide defaults under [_defaults]. `providers` is the provider list
+/// used when --provider is omitted.
 #[derive(Debug, Default, Deserialize)]
 pub struct DefaultsConfig {
     #[serde(default)]
     pub providers: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct RawConfig {
-    #[serde(default, rename = "_groups")]
-    pub groups: BTreeMap<String, Vec<String>>,
-    #[serde(default, rename = "_audit")]
-    pub audit: AuditConfig,
-    #[serde(default, rename = "_prime")]
-    pub prime: BTreeMap<String, String>,
-    #[serde(default, rename = "_defaults")]
-    pub defaults: DefaultsConfig,
-    #[serde(flatten)]
-    pub archetypes: BTreeMap<String, ArchetypeConfig>,
-}
-
 #[derive(Debug)]
 pub struct ReviewConfig {
-    pub archetypes: BTreeMap<String, ArchetypeConfig>,
+    pub archetypes: BTreeMap<String, String>,
     pub groups: BTreeMap<String, Vec<String>>,
     pub audit: AuditConfig,
-    pub prime: BTreeMap<String, String>,
     pub defaults: DefaultsConfig,
-}
-
-/// Per-archetype config: maps hostname → host config.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ArchetypeConfig {
-    #[serde(flatten)]
     pub hosts: BTreeMap<String, HostConfig>,
 }
 
-/// Per-host config: maps provider name → provider entry.
+/// Per-host config: maps provider name → its named profiles.
 #[derive(Debug, Clone, Deserialize)]
 pub struct HostConfig {
     #[serde(flatten)]
-    pub providers: BTreeMap<String, ProviderEntry>,
+    pub providers: BTreeMap<String, ProviderProfiles>,
 }
 
-/// A provider entry: either just a session ID string, or a table with session + model + env.
+/// Per-provider config: maps profile name → profile settings.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-pub enum ProviderEntry {
-    SessionOnly(String),
-    Full {
-        session: String,
-        model: Option<String>,
-        env: Option<BTreeMap<String, String>>,
-    },
+pub struct ProviderProfiles {
+    #[serde(flatten)]
+    pub profiles: BTreeMap<String, Profile>,
 }
 
-impl ProviderEntry {
-    pub fn session(&self) -> &str {
-        match self {
-            Self::SessionOnly(s) => s,
-            Self::Full { session, .. } => session,
-        }
-    }
-
-    pub fn model(&self) -> Option<&str> {
-        match self {
-            Self::SessionOnly(_) => None,
-            Self::Full { model, .. } => model.as_deref(),
-        }
-    }
-
-    pub fn env(&self) -> Option<&BTreeMap<String, String>> {
-        match self {
-            Self::SessionOnly(_) => None,
-            Self::Full { env, .. } => env.as_ref(),
-        }
-    }
+/// A named settings profile: optional model, effort, and env overrides applied
+/// to a provider invocation when selected via `--profile`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Profile {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub env: Option<BTreeMap<String, String>>,
 }
 
-impl ArchetypeConfig {
-    pub fn resolve_host(&self, hostname: &str) -> Option<&HostConfig> {
-        self.hosts.get(hostname)
-    }
-
-    pub fn has_sessions_for_host(&self, hostname: &str) -> bool {
-        self.resolve_host(hostname)
-            .map(|h| !h.providers.is_empty())
-            .unwrap_or(false)
+impl ReviewConfig {
+    /// Resolve a `[host.provider.profile]` settings block, if present.
+    pub fn resolve_profile(
+        &self,
+        hostname: &str,
+        provider: &str,
+        profile: &str,
+    ) -> Option<&Profile> {
+        self.hosts
+            .get(hostname)?
+            .providers
+            .get(provider)?
+            .profiles
+            .get(profile)
     }
 }
 
 pub fn hostname() -> String {
-    gethostname::gethostname()
-        .to_string_lossy()
-        .to_string()
+    gethostname::gethostname().to_string_lossy().to_string()
 }
 
 /// Format a hostname as a TOML key, quoting only if it contains dots.
@@ -132,9 +95,37 @@ pub fn generate_short_id() -> String {
     format!("{:02x}{:02x}", bytes[0], bytes[1])
 }
 
+/// Generate a v4 UUID for provisioning a fresh, persistable session ID.
+pub fn generate_uuid() -> String {
+    // Read from /proc/sys/kernel/random/uuid (Linux)
+    std::fs::read_to_string("/proc/sys/kernel/random/uuid")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| {
+            // Fallback: generate a v4 UUID from random bytes
+            let mut buf = [0u8; 16];
+            if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+                use std::io::Read;
+                let _ = f.read_exact(&mut buf);
+            }
+            buf[6] = (buf[6] & 0x0f) | 0x40; // version 4
+            buf[8] = (buf[8] & 0x3f) | 0x80; // variant 1
+            format!(
+                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                buf[0], buf[1], buf[2], buf[3],
+                buf[4], buf[5],
+                buf[6], buf[7],
+                buf[8], buf[9],
+                buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]
+            )
+        })
+}
+
 pub fn load() -> Result<(ReviewConfig, std::path::PathBuf)> {
     let path = find_config()?;
-    let project_root = path.parent().expect("config file has parent dir").to_path_buf();
+    let project_root = path
+        .parent()
+        .expect("config file has parent dir")
+        .to_path_buf();
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
     let config = parse(&raw)?;
@@ -167,36 +158,79 @@ fn find_config() -> Result<std::path::PathBuf> {
 }
 
 pub fn parse(raw: &str) -> Result<ReviewConfig> {
-    let raw_cfg: RawConfig = toml::from_str(raw)
+    // Parse to a table first, then peel off the reserved sections by name.
+    // Everything left over is a hostname table. This avoids serde `flatten`,
+    // which does not coexist with a sibling named field (`archetypes`).
+    let mut table: toml::Table = toml::from_str(raw)
         .map_err(|e| anyhow::anyhow!("failed to parse {CONFIG_FILENAME}: {e}"))?;
+
+    let groups: BTreeMap<String, Vec<String>> = match table.remove("_groups") {
+        Some(v) => v
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("[_groups] in {CONFIG_FILENAME}: {e}"))?,
+        None => BTreeMap::new(),
+    };
+    let audit: AuditConfig = match table.remove("_audit") {
+        Some(v) => v
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("[_audit] in {CONFIG_FILENAME}: {e}"))?,
+        None => AuditConfig::default(),
+    };
+    let defaults: DefaultsConfig = match table.remove("_defaults") {
+        Some(v) => v
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("[_defaults] in {CONFIG_FILENAME}: {e}"))?,
+        None => DefaultsConfig::default(),
+    };
+    let archetypes: BTreeMap<String, String> = match table.remove("archetypes") {
+        Some(v) => v
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("[archetypes] in {CONFIG_FILENAME}: {e}"))?,
+        None => BTreeMap::new(),
+    };
+
+    // Remaining top-level tables are hostname configs.
+    let mut hosts: BTreeMap<String, HostConfig> = BTreeMap::new();
+    for (key, val) in table {
+        let host: HostConfig = val
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("[{key}.*] in {CONFIG_FILENAME}: {e}"))?;
+        hosts.insert(key, host);
+    }
 
     // Reserved names
     for reserved in ["all", "init"] {
-        if raw_cfg.archetypes.contains_key(reserved) {
-            bail!("'{reserved}' is a reserved name and cannot be used as an archetype in {CONFIG_FILENAME}");
+        if archetypes.contains_key(reserved) {
+            bail!(
+                "'{reserved}' is a reserved name and cannot be used as an archetype in {CONFIG_FILENAME}"
+            );
         }
     }
 
     // Validate group names
-    for name in raw_cfg.groups.keys() {
+    for name in groups.keys() {
         for reserved in ["all", "init"] {
             if name == reserved {
-                bail!("'{reserved}' is a reserved name and cannot be used as a group in {CONFIG_FILENAME}");
+                bail!(
+                    "'{reserved}' is a reserved name and cannot be used as a group in {CONFIG_FILENAME}"
+                );
             }
         }
-        if raw_cfg.archetypes.contains_key(name) {
-            bail!("group '{name}' conflicts with an archetype of the same name in {CONFIG_FILENAME}");
+        if archetypes.contains_key(name) {
+            bail!(
+                "group '{name}' conflicts with an archetype of the same name in {CONFIG_FILENAME}"
+            );
         }
     }
 
     // Validate group members: must exist, no duplicates, not empty
-    for (group_name, members) in &raw_cfg.groups {
+    for (group_name, members) in &groups {
         if members.is_empty() {
             bail!("group '{group_name}' is empty in {CONFIG_FILENAME}");
         }
         let mut seen = std::collections::HashSet::new();
         for member in members {
-            if !raw_cfg.archetypes.contains_key(member) {
+            if !archetypes.contains_key(member) {
                 bail!(
                     "group '{group_name}' references unknown archetype '{member}' in {CONFIG_FILENAME}"
                 );
@@ -209,21 +243,19 @@ pub fn parse(raw: &str) -> Result<ReviewConfig> {
         }
     }
 
-    // Validate provider names
-    for (arch_name, arch) in &raw_cfg.archetypes {
-        for (hostname, host) in &arch.hosts {
-            for prov_name in host.providers.keys() {
-                if !KNOWN_PROVIDERS.contains(&prov_name.as_str()) {
-                    bail!(
-                        "unknown provider '{prov_name}' in [{arch_name}.{hostname}]\n  \
-                         supported: {}",
-                        KNOWN_PROVIDERS.join(", ")
-                    );
-                }
+    // Validate provider names in host profile tables.
+    for (host, host_cfg) in &hosts {
+        for prov_name in host_cfg.providers.keys() {
+            if !KNOWN_PROVIDERS.contains(&prov_name.as_str()) {
+                bail!(
+                    "unknown provider '{prov_name}' in [{host}.{prov_name}.*]\n  \
+                     supported: {}",
+                    KNOWN_PROVIDERS.join(", ")
+                );
             }
         }
     }
-    for prov_name in &raw_cfg.defaults.providers {
+    for prov_name in &defaults.providers {
         if !KNOWN_PROVIDERS.contains(&prov_name.as_str()) {
             bail!(
                 "unknown provider '{prov_name}' in [_defaults].providers\n  \
@@ -234,26 +266,36 @@ pub fn parse(raw: &str) -> Result<ReviewConfig> {
     }
 
     Ok(ReviewConfig {
-        archetypes: raw_cfg.archetypes,
-        groups: raw_cfg.groups,
-        audit: raw_cfg.audit,
-        prime: raw_cfg.prime,
-        defaults: raw_cfg.defaults,
+        archetypes,
+        groups,
+        audit,
+        defaults,
+        hosts,
     })
 }
 
 const INIT_TEMPLATE_PREFIX: &str = "\
-# Session IDs are scoped by hostname.
-# Any archetype name works. Provider options: claude, codex, kilo, opencode
+# Archetypes are reviewer personas: a name mapped to a priming prompt.
+# Any name works.
 #
-# [security.myhostname]
-# claude = \"your-session-id\"
-# codex = { session = \"your-session-id\", model = \"o3\" }
-# kilo = { session = \"your-session-id\", model = \"anthropic/claude-sonnet-4.6\" }
+# [archetypes]
+# security = \"You are a security expert for this project. Read the codebase.\"
+# bugs = \"You hunt for edge cases and correctness bugs.\"
+#
+# Providers to fan out to when --provider is omitted:
+# [_defaults]
+# providers = [\"claude\", \"codex\"]
 #
 # Groups fan out to multiple archetypes:
 # [_groups]
 # sweep = [\"security\", \"bugs\"]
+#
+# Named profiles carry per-provider model/effort/env overrides, selected with
+# --profile. Scoped by host . provider . profile:
+# [myhostname.claude.opus]
+# model = \"Opus 4.8\"
+# effort = \"medium\"
+# env = { ANTHROPIC_BASE_URL = \"http://localhost:8787\" }
 ";
 
 pub fn init() -> Result<()> {
@@ -273,18 +315,16 @@ pub fn init() -> Result<()> {
         );
     }
 
-    let host = hostname();
     let audit_id = generate_short_id();
-    let mut content = INIT_TEMPLATE_PREFIX.replace("myhostname", &toml_key(&host));
+    let mut content = INIT_TEMPLATE_PREFIX.replace("myhostname", &toml_key(&hostname()));
     content.push_str(&format!("\n[_audit]\nid = \"{audit_id}\"\n"));
     std::fs::write(&path, content)
         .map_err(|e| anyhow::anyhow!("failed to write {CONFIG_FILENAME}: {e}"))?;
 
-    let host_key = toml_key(&host);
     println!("Created {CONFIG_FILENAME}");
     println!();
     println!("Next steps:");
-    println!("  1. Add your session IDs under [archetype.{host_key}] tables");
+    println!("  1. Define archetypes under [archetypes] and providers under [_defaults]");
     println!("  2. Run: echo \"check for issues\" | review security");
     Ok(())
 }
@@ -295,84 +335,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_config() {
+    fn parses_archetypes() {
         let raw = "\
-[security.myhost]
-claude = \"sess-1\"
-
-[bugs.myhost]
-claude = \"sess-2\"
-codex = \"sess-3\"
+[archetypes]
+security = \"be a security expert\"
+bugs = \"find edge cases\"
 ";
         let cfg = parse(raw).unwrap();
         assert_eq!(cfg.archetypes.len(), 2);
-
-        let sec_host = cfg.archetypes["security"].resolve_host("myhost").unwrap();
-        assert_eq!(sec_host.providers["claude"].session(), "sess-1");
-
-        let bugs_host = cfg.archetypes["bugs"].resolve_host("myhost").unwrap();
-        assert_eq!(bugs_host.providers["codex"].session(), "sess-3");
+        assert_eq!(cfg.archetypes["security"], "be a security expert");
+        assert_eq!(cfg.archetypes["bugs"], "find edge cases");
     }
 
     #[test]
-    fn parses_full_provider_entry() {
+    fn parses_profiles() {
         let raw = "\
-[bugs.myhost]
-claude = { session = \"sess-1\", model = \"opus\" }
-kilo = { session = \"sess-2\", model = \"anthropic/claude-sonnet-4.6\" }
+[archetypes]
+bugs = \"find edge cases\"
+
+[myhost.claude.opus]
+model = \"Opus 4.8\"
+effort = \"medium\"
+env = { ANTHROPIC_BASE_URL = \"http://localhost:8787\" }
+
+[myhost.codex.high]
+model = \"o3\"
+effort = \"high\"
 ";
         let cfg = parse(raw).unwrap();
-        let host = cfg.archetypes["bugs"].resolve_host("myhost").unwrap();
 
-        assert_eq!(host.providers["claude"].session(), "sess-1");
-        assert_eq!(host.providers["claude"].model(), Some("opus"));
-        assert_eq!(host.providers["kilo"].session(), "sess-2");
-        assert_eq!(host.providers["kilo"].model(), Some("anthropic/claude-sonnet-4.6"));
-    }
+        let opus = cfg.resolve_profile("myhost", "claude", "opus").unwrap();
+        assert_eq!(opus.model.as_deref(), Some("Opus 4.8"));
+        assert_eq!(opus.effort.as_deref(), Some("medium"));
+        assert_eq!(
+            opus.env.as_ref().unwrap()["ANTHROPIC_BASE_URL"],
+            "http://localhost:8787"
+        );
 
-    #[test]
-    fn parses_env_vars() {
-        let raw = "\
-[bugs.myhost]
-claude = { session = \"sess-1\", env = { ANTHROPIC_BASE_URL = \"http://localhost:8787\", FOO = \"bar\" } }
-codex = { session = \"sess-2\", model = \"o3\" }
-";
-        let cfg = parse(raw).unwrap();
-        let host = cfg.archetypes["bugs"].resolve_host("myhost").unwrap();
+        let high = cfg.resolve_profile("myhost", "codex", "high").unwrap();
+        assert_eq!(high.model.as_deref(), Some("o3"));
+        assert_eq!(high.effort.as_deref(), Some("high"));
 
-        let env = host.providers["claude"].env().unwrap();
-        assert_eq!(env.len(), 2);
-        assert_eq!(env["ANTHROPIC_BASE_URL"], "http://localhost:8787");
-        assert_eq!(env["FOO"], "bar");
-
-        assert!(host.providers["codex"].env().is_none());
-    }
-
-    #[test]
-    fn mixed_string_and_table_entries() {
-        let raw = "\
-[bugs.myhost]
-claude = \"sess-1\"
-codex = { session = \"sess-2\", model = \"o3\" }
-";
-        let cfg = parse(raw).unwrap();
-        let host = cfg.archetypes["bugs"].resolve_host("myhost").unwrap();
-
-        assert_eq!(host.providers["claude"].session(), "sess-1");
-        assert!(host.providers["claude"].model().is_none());
-        assert_eq!(host.providers["codex"].session(), "sess-2");
-        assert_eq!(host.providers["codex"].model(), Some("o3"));
-    }
-
-    #[test]
-    fn allows_custom_archetype() {
-        let raw = "\
-[foobar.myhost]
-claude = \"sess-1\"
-";
-        let cfg = parse(raw).unwrap();
-        assert!(cfg.archetypes.contains_key("foobar"));
-        assert!(cfg.archetypes["foobar"].has_sessions_for_host("myhost"));
+        assert!(cfg.resolve_profile("myhost", "claude", "nope").is_none());
+        assert!(cfg.resolve_profile("otherhost", "claude", "opus").is_none());
     }
 
     #[test]
@@ -380,43 +385,47 @@ claude = \"sess-1\"
         let raw = "";
         let cfg = parse(raw).unwrap();
         assert!(cfg.archetypes.is_empty());
+        assert!(cfg.hosts.is_empty());
     }
 
     #[test]
-    fn has_sessions_for_matching_host() {
+    fn unknown_provider_in_profile_errors() {
         let raw = "\
-[bugs.myhost]
-claude = \"sess-1\"
+[archetypes]
+bugs = \"x\"
+
+[myhost.gpt.fast]
+model = \"whatever\"
 ";
-        let cfg = parse(raw).unwrap();
-        assert!(cfg.archetypes["bugs"].has_sessions_for_host("myhost"));
-        assert!(!cfg.archetypes["bugs"].has_sessions_for_host("otherhost"));
+        let result = parse(raw);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown provider 'gpt'")
+        );
     }
 
     #[test]
-    fn multiple_hosts() {
+    fn parses_defaults_providers() {
         let raw = "\
-[security.host-a]
-claude = \"sess-a\"
+[archetypes]
+bugs = \"x\"
 
-[security.host-b]
-codex = \"sess-b\"
+[_defaults]
+providers = [\"claude\", \"codex\"]
 ";
         let cfg = parse(raw).unwrap();
-        let sec = &cfg.archetypes["security"];
-        assert!(sec.has_sessions_for_host("host-a"));
-        assert!(sec.has_sessions_for_host("host-b"));
-        assert!(!sec.has_sessions_for_host("host-c"));
+        assert_eq!(cfg.defaults.providers, vec!["claude", "codex"]);
     }
 
     #[test]
     fn parses_groups() {
         let raw = "\
-[security.myhost]
-claude = \"sess-1\"
-
-[bugs.myhost]
-claude = \"sess-2\"
+[archetypes]
+security = \"a\"
+bugs = \"b\"
 
 [_groups]
 sweep = [\"security\", \"bugs\"]
@@ -429,30 +438,39 @@ sweep = [\"security\", \"bugs\"]
     #[test]
     fn group_with_unknown_member_errors() {
         let raw = "\
-[security.myhost]
-claude = \"sess-1\"
+[archetypes]
+security = \"a\"
 
 [_groups]
 sweep = [\"security\", \"nonexistent\"]
 ";
         let result = parse(raw);
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("nonexistent"));
+        assert!(result.unwrap_err().to_string().contains("nonexistent"));
     }
 
     #[test]
     fn group_name_conflicts_with_archetype() {
         let raw = "\
-[security.myhost]
-claude = \"sess-1\"
+[archetypes]
+security = \"a\"
 
 [_groups]
 security = [\"security\"]
 ";
         let result = parse(raw);
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("conflicts"));
+        assert!(result.unwrap_err().to_string().contains("conflicts"));
+    }
+
+    #[test]
+    fn reserved_archetype_name_errors() {
+        let raw = "\
+[archetypes]
+all = \"a\"
+";
+        let result = parse(raw);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("reserved"));
     }
 }

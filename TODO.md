@@ -2,31 +2,25 @@
 
 ## Remaining review findings
 
-- **Stale temp file from PID reuse** (LOW) — killed process + recycled PID = silent wrong codex results. Use `tempfile` crate or `create_new(true)`.
+- **Stale temp file from PID reuse** (LOW) - killed process + recycled PID = silent wrong codex results. Use `tempfile` crate or `create_new(true)`.
 
-## Session scaffolding: `review prime` phase 2
+## `review add`
 
-Phase 1 (done) implements `review prime` for claude and codex:
-- Claude: generates UUID, passes `--session-id`
-- Codex: parses `thread_id` from `--json` JSONL output
-- Appends session IDs to `.review.toml` (handles existing sections)
+Add a command that creates an archetype from a priming prompt (writes `[archetypes].<name>` in `.review.toml`), so archetypes don't have to be hand-edited. Takes the prompt on stdin.
 
-Phase 2: kilo and opencode support — needed both for `review prime` and for `--oneshot` session-ID emission (currently kilo/opencode oneshots run, but the session is unreachable for follow-up via `--session` because we don't capture the ID).
+## kilo/opencode session-ID capture
 
-**Kilo** — `--format json` does not emit a session ID event before task completion (output is buffered). But `kilo session list` shows sessions:
+Claude and codex capture the fresh session's ID (claude generates the UUID up front; codex parses `thread_id` from `--json`). Kilo and opencode runs succeed but their session is unreachable for follow-up via `--session` because we don't capture the ID.
+
+**Kilo** - `--format json` does not emit a session ID event before task completion (output is buffered). But `kilo session list` shows sessions:
 ```
 ses_2c61344d5ffe61Moxe9A1e3Klk  New session - 2026-03-29T14:08:28.970Z
 ```
-Approach: run `kilo session list` before and after priming, diff to find the new one. Note: ID format is `ses_*`, not UUID.
+Approach: run `kilo session list` before and after the run, diff to find the new one. Note: ID format is `ses_*`, not UUID.
 
-**OpenCode** — same as Kilo (shared codebase). Same buffered JSON, same `session list` approach.
+**OpenCode** - same as Kilo (shared codebase). Same buffered JSON, same `session list` approach.
 
-Once kilo/opencode capture is implemented, wire it into `run_stdout_provider` so `--oneshot` can emit their session IDs alongside claude/codex.
-
-### Open questions
-
-- Should `review prime` support `--model` for providers that need it (kilo, opencode)?
-- Should there be a `review sessions` command to list/manage sessions?
+Once capture is implemented, wire it into `run_stdout_provider` so those providers emit their session IDs alongside claude/codex.
 
 Sources:
 - [Codex session-id feature request](https://github.com/openai/codex/issues/13242)
@@ -63,4 +57,4 @@ When configured and `gh` is authenticated:
 - Should the audit repo be private by default? (yes, probably)
 - Should `review init` offer to set up the audit repo?
 - Should there be a `review audit` subcommand to inspect/manage the log?
-- How to handle multiple machines pushing to the same repo — just append and let git merge, or use per-host branches?
+- How to handle multiple machines pushing to the same repo - just append and let git merge, or use per-host branches?

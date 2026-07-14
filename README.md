@@ -1,21 +1,14 @@
 # review
 
-A Rust CLI that fans out code reviews to persistent AI sessions across multiple providers (Claude Code, Codex, Kilo, OpenCode), each cultivated with a specific reviewer perspective.
+A Rust CLI that fans out code reviews to fresh AI sessions across multiple providers (Claude Code, Codex, Kilo, OpenCode), each primed with a specific reviewer perspective.
 
 Built with LLMs. See [LLM.md](LLM.md).
 
-
 ## How it works
 
-You configure **archetypes** -- reviewer perspectives like `security`, `bugs`, `perf`, or any custom name -- each backed by long-lived sessions in one or more AI providers. When you run a review, you pipe your instructions via stdin. The tool sends them to all providers for that archetype in parallel. Sessions are persistent — the agents already have project context from previous interactions.
+You define **archetypes** -- reviewer perspectives like `security`, `bugs`, `perf`, or any custom name -- as a name mapped to a priming prompt. When you run a review, you pipe your instructions via stdin. The tool starts a **fresh session** on each provider, prepends the grounding prefix and the archetype's priming prompt, and lets the agent fetch code itself.
 
-## Install
-
-```
-cargo install --path .
-```
-
-Requires Rust 1.92+.
+Every run is a clean session by design. Reviving a long-lived session on a cold prompt cache means reprocessing its entire accumulated history - which only grows - whereas a fresh session costs roughly one review's worth of tokens each time. For claude and codex the new session ID is printed above the response, so you can follow up while the cache is still warm via `--session`.
 
 ## Quick start
 
@@ -26,36 +19,18 @@ cd /path/to/your/project
 review init
 ```
 
-### 2. Add session IDs
+### 2. Define archetypes
 
-Add session IDs to `.review.toml`. Either edit the file manually:
+Add archetypes to `.review.toml` - a name mapped to a priming prompt - and list the providers to fan out to:
 
 ```toml
-[security.myhostname]
-claude = "your-claude-session-id"
-codex = "your-codex-session-id"
+[archetypes]
+security = "You are a security expert for this project. Read the codebase."
+bugs = "You hunt for edge cases and correctness bugs."
 
-[bugs.myhostname]
-claude = "your-claude-session-id"
+[_defaults]
+providers = ["claude", "codex"]
 ```
-
-Or use `review prime` to create sessions and register them automatically:
-
-```
-echo "You are a security expert for this project. Read the codebase." | review prime security --provider claude,codex
-```
-
-`review prime` creates new sessions, sends the priming prompt, and writes the session IDs to `.review.toml` automatically. The prompt is stored under `[_prime]` so if a session later breaks you can re-prime with a fresh session without retyping it:
-
-```
-review prime security --provider claude    # stdin omitted; reuses stored prompt
-```
-
-Re-priming replaces the stale session ID in place. Manually-added `model` and `env` overrides on a provider entry are preserved.
-
-Re-piping the same prompt is a silent reuse — `echo "lens" | review prime security --provider claude` then `echo "lens" | review prime security --provider codex` works without an error, since the second pipe matches the stored prompt. Piping a *different* prompt while one is already stored is still rejected, to prevent accidental overwrites; remove the `[_prime]` entry first if you want to replace it.
-
-Each successful priming writes a sidecar row (`kind = "prime"`), so primed sessions show up in `review sessions` alongside `--oneshot` ones.
 
 ### 3. Run reviews
 
@@ -83,7 +58,7 @@ Duplicates are removed automatically (e.g. if a group overlaps with an explicit 
 
 ### Archetypes
 
-Archetypes are named reviewer sessions defined in `.review.toml`. Any name works — use whatever fits your project.
+Archetypes are named reviewer personas defined under `[archetypes]` in `.review.toml` (name = priming prompt). Any name works - use whatever fits your project.
 
 Use `all` to fan out to every configured archetype, or define **groups** to fan out to a named subset. Groups and individual archetypes can be mixed freely.
 
@@ -91,65 +66,47 @@ Use `all` to fan out to every configured archetype, or define **groups** to fan 
 
 | Flag | Description |
 |------|-------------|
-| `--anchor` | Prepend grounding prefix to stdin |
-| `--oneshot` | Skip session resume; start a fresh persistable session and prepend the stored prime prompt. Emits the new session ID for follow-up via `--session`. Implies `--anchor`. |
-| `--session <id>` | Resume a specific session. Sends raw stdin (no PREFIX, prime, or anchor). Requires a single `--provider`; mutually exclusive with `--oneshot` and `--anchor`. |
+| `--profile <name>` | Apply a named profile's `model`/`effort`/`env` overrides. Resolved per launched provider from `[<host>.<provider>.<profile>]`. |
+| `--session <id>` | Resume a specific session. Sends raw stdin (no PREFIX or prime). Requires a single `--provider`. |
 | `--dry-run` | Print what would be sent instead of sending it |
 | `--provider <list>` | Limit to specific providers (comma-separated) |
 | `--stagger <secs>` | Seconds between each provider launch (default: 30, 0 to disable) |
 
-By default, stdin goes directly to the provider sessions. Use `--anchor` for the first review in a session or to re-anchor a stale session.
+Each run starts a fresh session, prepends the grounding prefix and the archetype's priming prompt, and lets the agent fetch code itself. Providers come from `--provider`, or `[_defaults].providers` when `--provider` is omitted.
 
-### Oneshot mode
+Per-provider launch behavior:
 
-`--oneshot` skips session resume entirely. Each call starts a fresh provider session, prepends the priming prompt stored under `[_prime].<archetype>`, and lets the agent fetch code itself.
-
-```
-echo "check the new auth flow" | review --oneshot security,bugs
-```
-
-Use this when reviews happen far enough apart that the prompt cache has expired (default 5min, up to 1h with the right env vars). Resuming a long-lived session means reprocessing the entire accumulated prefix on every wake — expensive in API tokens and corrosive to subscription rate-limit windows for once-a-day usage. Oneshot keeps the prefix small and predictable.
-
-`.review.toml` still drives provider selection and `model`/`env` overrides; the session IDs from `[archetype.host]` are simply unused. If no `[_prime]` entry exists for the archetype, the prime block is silently skipped.
-
-**Prime-only archetypes.** An archetype defined only under `[_prime]` (with no `[archetype.host]` block) is a valid configuration for ephemeral-consultant personas that should always be invoked via `--oneshot`. There's no session to persist, so no host block is needed. To know which providers to launch, `review` consults `--provider` first, then falls back to `[_defaults].providers`:
-
-```toml
-[_defaults]
-providers = ["claude"]
-
-[_prime]
-lua = """You're a Lua subject-matter expert..."""
-```
-
-```
-echo "is this idiomatic?" | review lua --oneshot          # uses [_defaults].providers
-echo "is this idiomatic?" | review lua --oneshot --provider codex   # --provider wins
-```
-
-If neither is set, `review` errors with a message naming both options.
-
-The fresh sessions are persistable — for claude and codex, the new session ID is printed above the response so the operator can follow up via `--session <id>` while the cache is warm:
-
-```
-echo "check the new auth flow" | review bugs --oneshot --provider claude
---- claude ---
-session: 019deabc-0def-7000-8000-abcdef012345
-<findings>
-```
-
-Per-provider behavior in oneshot mode:
-
-| Provider | Oneshot args | Captures session ID? |
-|----------|--------------|----------------------|
+| Provider | Args | Captures session ID? |
+|----------|------|----------------------|
 | claude | `--session-id <generated> --print --permission-mode dontAsk` | yes (UUID generated up front) |
 | codex | `exec --sandbox read-only --json` | yes (parsed from `thread.started`) |
-| kilo | `run --auto` (auto-approve permissions; sessions don't carry pre-approval) | not yet |
-| opencode | `run` (no auto-approve flag — may prompt; use the regular session flow if it does) | not yet |
+| kilo | `run --auto` (auto-approve permissions) | not yet |
+| opencode | `run` (no auto-approve flag - may prompt) | not yet |
+
+### Profiles
+
+Profiles carry per-provider `model`, `effort`, and `env` overrides, applied only when you pass `--profile`. They are scoped by host, provider, and profile name so the same name can mean different settings on different machines (e.g. a local proxy `ANTHROPIC_BASE_URL` that differs per host):
+
+```toml
+[myhostname.claude.opus]
+model = "Opus 4.8"
+effort = "medium"
+env = { ANTHROPIC_BASE_URL = "http://localhost:8787" }
+
+[myhostname.codex.high]
+model = "o3"
+effort = "high"
+```
+
+```
+echo "audit the auth flow" | review security --profile opus
+```
+
+`--profile opus` resolves `[<host>.<provider>.opus]` for each launched provider and applies its overrides. If any launched provider lacks that profile table, the run errors naming the missing `[host.provider.profile]`.
 
 ### Follow-up via `--session`
 
-`--session <id>` resumes a specific provider session and sends raw stdin — no PREFIX, no prime, no anchor. The grounding is already in the session's history from the original `--oneshot` (or `prime`) call.
+`--session <id>` resumes a specific provider session and sends raw stdin - no PREFIX, no prime. The grounding is already in the session's history from the run that created it.
 
 ```
 echo "what's the worst of those for a single-account user?" | \
@@ -159,18 +116,17 @@ echo "what's the worst of those for a single-account user?" | \
 Constraints:
 
 - Requires exactly one `--provider`. Session IDs are provider-scoped.
-- Mutually exclusive with `--oneshot` and `--anchor`.
-- Bypasses `.review.toml` entirely — model/env overrides from the config are not applied. If you need a non-default model on a follow-up, switch to the persistent-archetype-session flow.
+- Bypasses `.review.toml` entirely - no profile overrides are applied.
 - Validation of the session ID is delegated to the provider; an unknown ID produces a provider-specific error, not a `review` error.
 
 ### Sessions sidecar log
 
-Each `--oneshot` that captures a session ID and each `--session` resume appends a JSONL row to `~/.local/share/review/sessions.jsonl` (or `sessions-private.jsonl` when `audit.private = true`). Rows carry:
+Each run that captures a session ID and each `--session` resume appends a JSONL row to `~/.local/share/review/sessions.jsonl` (or `sessions-private.jsonl` when `audit.private = true`). Rows carry:
 
 - `timestamp` (UTC), `epoch_secs`, `project` (root path), `hostname`
 - `audit_id`, `provider`, `archetype`, `session_id`
-- `kind` — `"oneshot"` for creation events, `"session"` for resume touches
-- `model`, `env_keys` (env-var *names* only — values are not recorded so secrets don't leak through the sidecar)
+- `kind` - `"run"` for fresh-session creation events, `"session"` for resume touches
+- `model`, `env_keys` (env-var *names* only - values are not recorded so secrets don't leak through the sidecar)
 - `operator_prompt` (raw stdin), `assembled_prompt` (what the provider actually saw)
 - `response` or `error`
 - `review_version`
@@ -186,17 +142,17 @@ session last touched 14m ago
 <response>
 ```
 
-If the last touch was over 55 minutes ago — past the longest realistic prompt-cache TTL — it adds a warning that `--oneshot` with restated context may be cheaper.
+If the last touch was over 55 minutes ago - past the longest realistic prompt-cache TTL - it adds a warning that a fresh run with restated context may be cheaper.
 
 **2. `review sessions` listing.** Aggregates by `session_id` and shows recent sessions for the current project (or `--all` projects), most recent first:
 
 ```
 $ review sessions
-[14m] claude / bugs / 3 touches
+[14m] claude / bugs (run) / 3 touches
        session: 019deabc-0def-7000-8000-abcdef012345
        opened:  review the new sync code
 
-[1h12m] codex / security / 1 touch
+[1h12m] codex / security (run) / 1 touch
        session: 019d0123-...
        opened:  check OAuth handling on the IMAP path
 ```
@@ -234,42 +190,32 @@ When using `all` or groups, archetype headers are added:
 Per-project `.review.toml` in the project root (discovered by walking up to the git root). Run `review init` to create a starter.
 
 ```toml
-[security.myhostname]
-claude = "session-abc123"
-codex = "session-def456"
+[archetypes]
+security = "You are a security expert for this project. Read the codebase."
+bugs = "You hunt for edge cases and correctness bugs."
+tilemaker = "You are a tilemaker maintainer weighing tradeoffs."
+tippecanoe = "You are a tippecanoe maintainer weighing tradeoffs."
 
-[bugs.myhostname]
-claude = "session-ghi789"
-codex = { session = "session-jkl012", model = "o3" }
-kilo = { session = "session-mno345", model = "anthropic/claude-sonnet-4.6" }
-opencode = { session = "session-pqr678", model = "openai/gpt-5" }
-
-[tilemaker.myhostname]
-claude = "session-stu901"
-
-[tippecanoe.myhostname]
-claude = "session-vwx234"
+[_defaults]
+providers = ["claude", "codex"]    # used when --provider is omitted
 
 [_groups]
 sweep = ["security", "bugs"]
 competitors = ["tilemaker", "tippecanoe"]
 
-[_defaults]
-providers = ["claude"]    # fallback when --provider is omitted for prime-only archetypes
+# Named profiles: per-provider model/effort/env overrides, applied via --profile.
+# Scoped by host . provider . profile.
+[myhostname.claude.opus]
+model = "Opus 4.8"
+effort = "medium"
+env = { ANTHROPIC_BASE_URL = "http://localhost:8787" }
+
+[myhostname.codex.high]
+model = "o3"
+effort = "high"
 ```
 
-Session IDs are scoped by hostname, so the same `.review.toml` works across machines with different sessions.
-
-Provider entries can be a simple session ID string or a table with session, model, and env:
-
-```toml
-claude = "session-id"                                        # default model
-codex = { session = "session-id", model = "o3" }             # explicit model
-kilo = { session = "session-id", model = "anthropic/claude-sonnet-4.6" }
-
-# environment variables passed to the provider process
-claude = { session = "session-id", env = { ANTHROPIC_BASE_URL = "http://localhost:8787" } }
-```
+An archetype is just a name mapped to a priming prompt - no session, no host binding. Profiles are what's host-scoped, so the same profile name can carry different `model`/`env` on different machines.
 
 ### Providers
 
@@ -300,9 +246,9 @@ Define groups in the `[_groups]` table. Group names must not conflict with arche
 
 ## Rate limits and staggering
 
-Provider APIs enforce rate limits across multiple dimensions — requests per minute (RPM), input tokens per minute (ITPM), and rolling usage quotas. The exact limits are not publicly documented for subscription plans, but in practice, firing multiple provider sessions simultaneously (e.g. a group of 5 claude sessions) will trigger RPM limits.
+Provider APIs enforce rate limits across multiple dimensions - requests per minute (RPM), input tokens per minute (ITPM), and rolling usage quotas. The exact limits are not publicly documented for subscription plans, but in practice, firing multiple provider sessions simultaneously (e.g. a group of 5 claude sessions) will trigger RPM limits.
 
-A single Claude Code invocation generates 8-12 internal API calls through its tool-use architecture. Five concurrent sessions means 40-60 API calls hitting at once — enough to blow past most RPM budgets.
+A single Claude Code invocation generates 8-12 internal API calls through its tool-use architecture. Five concurrent sessions means 40-60 API calls hitting at once - enough to blow past most RPM budgets.
 
 To avoid this, provider launches are staggered by default. The first provider starts immediately; each subsequent one waits 30 seconds. All run concurrently once launched.
 

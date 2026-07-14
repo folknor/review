@@ -18,13 +18,16 @@ pub fn acquire_blocking(file: &File) -> Result<()> {
         bail!("failed to acquire lock: {err}");
     }
 
-    // Lock is held by another process — wait
+    // Lock is held by another process - wait
     eprintln!("Waiting for another review to finish...");
     let start = std::time::Instant::now();
 
     let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
     if ret != 0 {
-        bail!("failed to acquire lock: {}", std::io::Error::last_os_error());
+        bail!(
+            "failed to acquire lock: {}",
+            std::io::Error::last_os_error()
+        );
     }
 
     let elapsed = start.elapsed();

@@ -5,7 +5,7 @@ use std::path::Path;
 #[derive(Serialize)]
 struct SessionEntry<'a> {
     timestamp: String,
-    /// Seconds since UNIX epoch — duplicates `timestamp` but lets readers do
+    /// Seconds since UNIX epoch - duplicates `timestamp` but lets readers do
     /// age math without parsing the ISO string back.
     epoch_secs: u64,
     project: &'a str,
@@ -44,7 +44,7 @@ pub struct SessionRecord {
     pub archetype: String,
     pub session_id: String,
     /// "oneshot", "session", or "prime"; "" for entries written before this
-    /// field existed (none in practice — included for forward compat).
+    /// field existed (none in practice - included for forward compat).
     #[serde(default)]
     pub kind: String,
     #[allow(dead_code)]
@@ -71,7 +71,11 @@ fn sessions_path(private: bool) -> Option<std::path::PathBuf> {
         })
         .ok()?;
     let base = data_dir.join("review");
-    let name = if private { "sessions-private.jsonl" } else { "sessions.jsonl" };
+    let name = if private {
+        "sessions-private.jsonl"
+    } else {
+        "sessions.jsonl"
+    };
     Some(base.join(name))
 }
 

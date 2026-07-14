@@ -9,25 +9,37 @@
 - Never pipe commands with |
 - Never read or write from /tmp. All data lives in the project.
 
+### Memory rules
+Do not use your Memory functionality. Update CLAUDE.md instead. This project is developed across several hosts and several users. Memories do not transfer across hosts or users. CLAUDE.md does.
+
+### Bash rules
+- Never capture stdout into env vars (`UUID=$(...)`).
+- Never run raw cargo, curl, pkill. Use `brokkr`.
+
+### git commit rules
+- Always run `brokkr fmt` before a commit.
+- Never commit markdown changes and/or results.db alone. Bundle them with upcoming code commits.
+- When committing other changes: always tag along brokkrs 'results.db' and markdown files if dirty.
+- Write substantive engineering-focused commit messages.
+- Has `Cargo.lock` changed? Commit it.
+- Never `git push` unless the user explicitly asks. Stop after the commit.
+
 ### Subagents
 - Always launch subagents in the foreground (never use `run_in_background: true`) so the user can approve tool requests.
-- Do NOT use worktree isolation for parallel agents. Worktrees create merge conflicts that silently drop agent work. Instead, launch agents in the same tree with strict file ownership — zero overlap.
-
-### Commits
-- Don't commit pure markdown changes on their own. Bundle them with the code change they relate to, or skip them. Unless the markdown update is substantive.
-- Has Cargo.lock changed? Commit it.
+- Do NOT use worktree isolation for parallel agents. Worktrees create merge conflicts that silently drop agent work. Instead, launch agents in the same tree with strict file ownership - zero overlap.
 
 ## What this project is
 
-A Rust CLI (`review`) that fans out code reviews to persistent AI sessions across multiple providers (Claude Code, Codex, Kilo, OpenCode). It's a prompt builder that knows about sessions — the agents fetch code themselves.
+A Rust CLI (`review`) that fans out code reviews to fresh AI sessions across multiple providers (Claude Code, Codex, Kilo, OpenCode). It's a prompt builder - the agents fetch code themselves. Each run starts a clean session primed with an archetype's prompt (see Design decisions for why fresh beats long-lived).
 
-Per-project config via `.review.toml` (host-scoped session IDs, optional model overrides). Custom archetypes and groups also supported. Comma-separated archetypes/groups can be mixed freely, with deduplication.
+Per-project config via `.review.toml`: archetypes (name → priming prompt), groups, default providers, and host-scoped `--profile` overrides. Comma-separated archetypes/groups can be mixed freely, with deduplication.
 
 ## Build and run
 
+Use `brokkr` for build/test/clippy (`brokkr check`) and running (`brokkr run -- ...`).
+
 ```
-cargo build
-cargo install --path .
+brokkr check
 review init
 echo "review for issues" | review security
 ```
@@ -36,45 +48,44 @@ Single binary crate, no workspace.
 
 ## Architecture
 
-- `src/cli.rs` — Clap CLI. Archetype is a positional arg, `init` and `prime` are subcommands.
-- `src/config.rs` — Parses `.review.toml` in cwd. TOML config for host-scoped sessions (archetype → hostname → provider), `_groups` for named archetype sets, `_defaults.providers` for the prime-only-archetype fallback (see Design decisions). Uses `toml` and `gethostname` crates.
-- `src/input.rs` — Reads stdin instructions (required, 20KB limit).
-- `src/prompt.rs` — Assembles: compiled prefix + stdin (`--anchor`), or prefix + `[_prime]` prompt + stdin (`--oneshot`).
-- `src/provider.rs` — Async provider invocation. Prompts piped via stdin. Claude uses `--permission-mode dontAsk`, Codex uses `--sandbox read-only`. In oneshot mode each provider runs a fresh persistable session (claude `--session-id <generated UUID>`, codex `--json` to capture `thread_id`, kilo `--auto`, opencode plain). Claude/codex emit the new session ID via `ProviderResult.session_id` so the operator can follow up via `--session`.
-- `src/sessions.rs` — Append-only sidecar log at `~/.local/share/review/sessions.jsonl` (or `sessions-private.jsonl` if `audit.private`). One row per `--oneshot` that captured a session ID (`kind = "oneshot"`), one per `--session` resume (`kind = "session"`), and one per `review prime` invocation that successfully created a session (`kind = "prime"`). Rows carry timestamp + epoch_secs, project, hostname, audit_id, provider, archetype, session_id, model, env var *names* (not values — those can carry secrets), operator prompt, assembled prompt, response or error, and review version. Read helpers (`read_all`, `latest_for_session`, `age_secs`, `format_age`) drive the cache-age advisory in `--session` mode and the `review sessions` subcommand.
-- `src/prime.rs` — Session creation for `review prime`. Claude uses `--session-id`, Codex uses `--json` to capture `thread_id`.
-- `src/config_write.rs` — Appends session entries to `.review.toml`.
-- `src/main.rs` — Wires CLI to config, prompt assembly, and provider dispatch.
-- `prompts/` — Grounding prefix compiled into the binary via `include_str!`.
+- `src/cli.rs` - Clap CLI. Archetype is a positional arg; `init` and `sessions` are subcommands.
+- `src/config.rs` - Parses `.review.toml` in cwd. `[archetypes]` maps name → priming prompt; `[_groups]` names archetype sets; `[_defaults].providers` is the provider list when `--provider` is omitted; every other top-level table is a hostname carrying `[<host>.<provider>.<profile>]` profiles (model/effort/env). Parsed by peeling reserved sections off a `toml::Table` and treating the rest as hosts (serde `flatten` can't coexist with the sibling `archetypes` field). Also holds `generate_uuid`/`generate_short_id`. Uses `toml` and `gethostname` crates.
+- `src/input.rs` - Reads stdin instructions (required, 20KB limit).
+- `src/prompt.rs` - `assemble`: grounding prefix + archetype prompt + stdin.
+- `src/provider.rs` - Async provider invocation. Prompts piped via stdin. Claude uses `--permission-mode dontAsk`, Codex uses `--sandbox read-only`. Each run (oneshot=true) starts a fresh persistable session (claude `--session-id <generated UUID>`, codex `--json` to capture `thread_id`, kilo `--auto`, opencode plain); `--session` resume passes oneshot=false. Model/effort/env applied per profile (`--effort` for claude, `-c model_reasoning_effort=` for codex - codex invocation is provisional). Claude/codex emit the new session ID via `ProviderResult.session_id`.
+- `src/sessions.rs` - Append-only sidecar log at `~/.local/share/review/sessions.jsonl` (or `sessions-private.jsonl` if `audit.private`). One row per run that captured a session ID (`kind = "run"`), one per `--session` resume (`kind = "session"`). Rows carry timestamp + epoch_secs, project, hostname, audit_id, provider, archetype, session_id, model, env var *names* (not values - those can carry secrets), operator prompt, assembled prompt, response or error, and review version. Read helpers (`read_all`, `latest_for_session`, `age_secs`, `format_age`) drive the cache-age advisory in `--session` mode and the `review sessions` subcommand.
+- `src/config_write.rs` - `append_audit_id` (the only writer left; archetypes/profiles are hand-edited).
+- `src/main.rs` - Wires CLI to config, prompt assembly, and provider dispatch.
+- `prompts/` - Grounding prefix compiled into the binary via `include_str!`.
 
 ## Design decisions
 
-- Stdin goes directly to provider sessions by default. `--anchor` prepends a grounding prefix.
-- `--oneshot` skips session resume to avoid reprocessing accumulated session prefixes on cold-cache daily wakes; prepends `[_prime].<archetype>` instead. Existing `[archetype.host]` config still drives provider selection and overrides; only the session ID is ignored. The fresh session is persistable and its ID is printed above the response so the operator can follow up via `--session <id>` while the cache is warm. Implies `--anchor`.
-- Prime-only archetypes: an archetype defined only in `[_prime]` (no `[archetype.host]` block) is valid for `--oneshot` — there's no session to persist, so no host block is needed. Provider list resolves from `--provider` first, then `[_defaults].providers`. Without either, the run errors with a message naming both. Non-oneshot still requires a host session (nothing to send to without one).
-- `--session <id>` resumes a specific provider session and sends raw stdin — bypasses `.review.toml`, no PREFIX, no prime, no anchor. Requires a single `--provider`; mutually exclusive with `--oneshot` and `--anchor`. Validation of the session ID is delegated to the provider. Before invoking, `review` looks up the sidecar log to print the time since the last touch and warn when it's > ~55 min (past the realistic prompt-cache TTL).
+- Every run starts a fresh session - grounding prefix + archetype priming prompt + stdin. Reviving a long-lived session on a cold cache reprocesses its ever-growing history; a fresh session costs ~one review's worth of tokens and can't act on stale accumulated context. The session is persistable and its ID is printed so follow-ups can go through `--session` while the cache is warm.
+- Archetypes are pure: `[archetypes]` name → prompt, no host/session binding. Overrides live in separate host-scoped named profiles (`[<host>.<provider>.<profile>]`) selected with `--profile <name>`; `--profile` requires the table to exist for every launched provider or the run errors.
+- Providers resolve from `--provider`, else `[_defaults].providers`; empty → error.
+- `--session <id>` resumes a specific provider session and sends raw stdin - bypasses `.review.toml`, no PREFIX, no prime, no profile. Requires a single `--provider`. Validation of the session ID is delegated to the provider. Before invoking, `review` looks up the sidecar log to print the time since the last touch and warn when it's > ~55 min (past the realistic prompt-cache TTL).
 - `review sessions` lists recent sessions for the current project (or `--all`), grouped by session ID, sorted by most recent touch. Output is block-formatted for terminal reading; ad-hoc queries beyond that go through `jq` on the JSONL directly.
 - Providers get prompts via **stdin pipe**, not CLI args, to avoid shell argument length limits.
 - Claude runs with `--permission-mode dontAsk` (uses pre-approved permissions, rejects interactive prompts). Codex runs with `--sandbox read-only`.
-- No global config — `.review.toml` lives in the project root.
+- No global config - `.review.toml` lives in the project root.
+- Planned: a `review add` command to create an archetype from a priming prompt (currently hand-edited).
 
 ## Config format
 
 ```toml
-[security.myhostname]
-claude = "session-id"
-codex = "session-id"
+[archetypes]
+security = "You are a security expert. Read the codebase."
+bugs = "You hunt for edge cases and correctness bugs."
 
-[bugs.myhostname]
-claude = "session-id"
-codex = { session = "session-id", model = "o3" }
-kilo = { session = "session-id", model = "anthropic/claude-sonnet-4.6" }
-opencode = { session = "session-id", model = "openai/gpt-5" }
-claude = { session = "session-id", env = { ANTHROPIC_BASE_URL = "http://localhost:8787" } }
+[_defaults]
+providers = ["claude", "codex"]
 
 [_groups]
 sweep = ["security", "bugs"]
 
-[_defaults]
-providers = ["claude"]
+# host . provider . profile
+[myhostname.claude.opus]
+model = "Opus 4.8"
+effort = "medium"
+env = { ANTHROPIC_BASE_URL = "http://localhost:8787" }
 ```
