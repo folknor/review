@@ -534,12 +534,13 @@ async fn run_codex_json(
     // the very case forensics exist to explain), return the digest rather than a
     // bare error - otherwise `invoke` would drop the session id and transcript.
     let text = final_message.unwrap_or_else(|| {
-        // Distinguish "finished but emitted no report" (ended on a tool) from a
-        // genuine hard freeze, using the rollout's completion state.
-        let base = if digest.transcript.as_ref().is_some_and(|t| t.task_complete) {
-            "(codex completed the turn but emitted no final answer)"
-        } else {
+        // No final answer at all - not even an interim message. task_complete
+        // is not a success signal (it fires on aborted turns with a null final
+        // answer), so a non-zero exit/signal here means the run died mid-turn.
+        let base = if digest.exit_code == Some(0) && digest.signal.is_none() {
             "(codex produced no final message)"
+        } else {
+            "(codex died without a final answer)"
         };
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim();
@@ -597,8 +598,18 @@ fn print_digest(d: &Digest) {
     println!("captured: {}", d.captured);
     if d.recovered_from_transcript {
         println!("recovered: final answer restored from transcript (stream/-o truncated)");
-    } else if !d.captured && d.transcript.as_ref().is_some_and(|t| t.task_complete) {
-        println!("note: turn completed on disk but no final answer emitted (response is interim)");
+    } else if !d.captured {
+        // No -o and nothing to recover: no final answer was produced. Note that
+        // task_complete is NOT a success signal - it fires on aborted turns too
+        // (task_complete.last_agent_message=null), so the exit status sets tone.
+        if d.exit_code != Some(0) || d.signal.is_some() {
+            println!(
+                "note: run died without a final answer; the text below is the last \
+                 interim note, not a conclusion"
+            );
+        } else if d.transcript.as_ref().is_some_and(|t| t.task_complete) {
+            println!("note: turn ended without a final answer (text below is interim)");
+        }
     }
     println!("turns: {}", d.turns);
     let u = &d.usage;

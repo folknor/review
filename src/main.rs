@@ -553,6 +553,18 @@ fn run_session_show(session_id: &str) -> Result<()> {
     // recovers the real report even for rows recorded before runtime recovery
     // landed (whose sidecar `response` may be a truncated interim note).
     let recovered = transcript.as_ref().and_then(|t| t.final_answer.as_deref());
+    // A codex rollout that reached task_complete but carries no final_answer
+    // produced no conclusion - the turn died mid-work (task_complete fires on
+    // aborted turns too). Flag it even for old rows that predate digest
+    // persistence and so have no stored exit code.
+    if transcript
+        .as_ref()
+        .is_some_and(|t| t.final_answer.is_none() && t.task_complete)
+    {
+        println!(
+            "note: rollout has no final answer - the turn produced no conclusion (likely died mid-work)"
+        );
+    }
     println!("--- response ---");
     match (recovered, &latest.response, &latest.error) {
         (Some(fa), sidecar, _) => {
@@ -581,6 +593,10 @@ fn print_digest_summary(d: &provider::DigestSummary) {
     println!("captured: {}", d.captured);
     if d.recovered_from_transcript {
         println!("recovered: final answer restored from transcript");
+    } else if !d.captured && (d.exit_code != Some(0) || d.signal.is_some()) {
+        // No real final answer obtained and the process failed: a mid-turn
+        // death. task_complete alone doesn't refute this - it fires on aborts.
+        println!("note: no final answer captured - run likely died mid-turn");
     }
     if let Some(false) = d.task_complete {
         println!("task_complete: false");
