@@ -541,8 +541,10 @@ async fn run_codex_json(
     let incident_path = if suspicious {
         crate::incident::write_bundle(&crate::incident::Incident {
             provider: "codex",
+            binary: "codex",
             session_id: session_id.as_deref(),
             argv: &args,
+            prompt,
             cwd: project_root,
             env,
             exit_code,

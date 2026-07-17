@@ -17,9 +17,14 @@ use std::path::{Path, PathBuf};
 /// Everything known about a finished provider run, handed to the bundle writer.
 pub struct Incident<'a> {
     pub provider: &'a str,
+    /// The binary invoked (e.g. "codex") - argv[0] of the replayable command.
+    pub binary: &'a str,
     pub session_id: Option<&'a str>,
-    /// The exact argv passed to the provider binary - for verbatim replay.
+    /// The args passed to the binary (not including argv[0]).
     pub argv: &'a [String],
+    /// The prompt piped on the child's stdin - part of the invocation, so a
+    /// replay is impossible without it.
+    pub prompt: &'a str,
     pub cwd: &'a Path,
     /// Profile env (names always recorded; values redacted when the name looks
     /// secret, so the bundle never leaks tokens).
@@ -52,8 +57,15 @@ struct Meta {
     session_id: Option<String>,
     review_version: &'static str,
     codex_version: Option<String>,
+    /// Full argv including argv[0] (the binary).
     argv: Vec<String>,
+    /// A copy-pasteable shell command that reproduces the run: the injected env
+    /// prefix, the quoted argv, and `< prompt.txt` (the prompt is piped on
+    /// stdin, so it's written alongside as `prompt.txt`). Secret env values are
+    /// shown as `<redacted>` - fill them back in to actually run it.
+    command: String,
     cwd: String,
+    prompt_bytes: usize,
     exit_code: Option<i32>,
     signal: Option<String>,
     stdin_write_error: Option<String>,
@@ -125,6 +137,12 @@ pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
     // RUST_BACKTRACE set on the child, a panic lands here with its trace.
     write_file(&dir, "stderr.txt", inc.stderr);
 
+    // The prompt piped on stdin, and the runnable command that consumes it.
+    write_file(&dir, "prompt.txt", inc.prompt.as_bytes());
+    let mut full_argv = vec![inc.binary.to_string()];
+    full_argv.extend(inc.argv.iter().cloned());
+    let command = replay_command(&full_argv, inc.env);
+
     // Raw NDJSON stream, tail-capped. The interesting part is where it stops.
     let (stdout_slice, stdout_truncated) = tail_bytes(inc.stdout, STDOUT_TAIL_BYTES);
     write_file(&dir, "stdout.jsonl", stdout_slice);
@@ -160,8 +178,10 @@ pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
         session_id: inc.session_id.map(str::to_string),
         review_version: env!("CARGO_PKG_VERSION"),
         codex_version: probe_codex_version(inc.provider),
-        argv: inc.argv.to_vec(),
+        argv: full_argv,
+        command,
         cwd: inc.cwd.to_string_lossy().into_owned(),
+        prompt_bytes: inc.prompt.len(),
         exit_code: inc.exit_code,
         signal: inc.signal.map(str::to_string),
         stdin_write_error: inc.stdin_write_error.map(str::to_string),
@@ -238,6 +258,41 @@ fn scan_transcript(content: &str) -> (Option<bool>, Option<serde_json::Value>) {
     (final_answer_present, rate_limits)
 }
 
+/// Build a copy-pasteable shell command that reproduces the run: the env we
+/// inject (`RUST_BACKTRACE=1`) plus the profile env as a prefix, the quoted
+/// argv, and `< prompt.txt`. Secret env values become `<redacted>` so the
+/// string is safe to keep in the bundle.
+fn replay_command(
+    full_argv: &[String],
+    env: Option<&std::collections::BTreeMap<String, String>>,
+) -> String {
+    let mut parts = vec!["RUST_BACKTRACE=1".to_string()];
+    if let Some(m) = env {
+        for (k, v) in m {
+            let val = if looks_secret(k) {
+                "<redacted>"
+            } else {
+                v.as_str()
+            };
+            parts.push(format!("{k}={}", shell_quote(val)));
+        }
+    }
+    parts.extend(full_argv.iter().map(|a| shell_quote(a)));
+    format!("{} < prompt.txt", parts.join(" "))
+}
+
+/// Minimal POSIX shell quoting: bare when safe, single-quoted otherwise.
+fn shell_quote(s: &str) -> String {
+    let safe = !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_./=:,@".contains(&b));
+    if safe {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 /// Best-effort `codex --version`; deaths may be version-specific.
 fn probe_codex_version(provider: &str) -> Option<String> {
     let out = std::process::Command::new(provider)
@@ -279,6 +334,35 @@ mod tests {
         assert!(looks_secret("DB_PASSWORD"));
         assert!(!looks_secret("CODEX_HOME"));
         assert!(!looks_secret("CARGO_TARGET_DIR"));
+    }
+
+    #[test]
+    fn replay_command_is_runnable_and_redacts_secrets() {
+        let argv = vec![
+            "codex".to_string(),
+            "exec".to_string(),
+            "--sandbox".to_string(),
+            "read-only".to_string(),
+        ];
+        let mut env = std::collections::BTreeMap::new();
+        env.insert("CODEX_HOME".to_string(), "/home/x/.codex".to_string());
+        env.insert(
+            "ANTHROPIC_API_KEY".to_string(),
+            "sk-super-secret".to_string(),
+        );
+        let cmd = replay_command(&argv, Some(&env));
+        assert!(cmd.starts_with("RUST_BACKTRACE=1 "));
+        assert!(cmd.contains("CODEX_HOME=/home/x/.codex"));
+        assert!(cmd.contains("ANTHROPIC_API_KEY='<redacted>'"));
+        assert!(!cmd.contains("sk-super-secret"), "secret leaked: {cmd}");
+        assert!(cmd.ends_with("codex exec --sandbox read-only < prompt.txt"));
+    }
+
+    #[test]
+    fn shell_quote_handles_spaces_and_quotes() {
+        assert_eq!(shell_quote("plain-value"), "plain-value");
+        assert_eq!(shell_quote("has space"), "'has space'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
     }
 
     #[test]
