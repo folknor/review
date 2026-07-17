@@ -38,6 +38,45 @@ fn new_output_file() -> Result<String> {
     anyhow::bail!("could not create a unique codex output temp file after 8 tries")
 }
 
+/// Caps on how much provider output we buffer in memory. Generous - real reviews
+/// are far under these; the cap only stops a runaway stream from OOMing review.
+const STDOUT_CAPTURE_CAP: usize = 64 << 20; // 64 MiB
+const STDERR_CAPTURE_CAP: usize = 8 << 20; // 8 MiB
+
+/// Read `r` to EOF, buffering at most `cap` bytes but continuing to drain the
+/// rest (so the child never blocks on a full pipe). Returns the buffered prefix.
+async fn read_capped<R>(mut r: R, cap: usize) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16384];
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if buf.len() < cap {
+                    let take = (cap - buf.len()).min(n);
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+                // Past the cap: keep reading (drain) but stop buffering.
+            }
+        }
+    }
+    buf
+}
+
+/// Removes a path on drop, so the codex `-o` temp file is cleaned up on every
+/// exit path of the runner - including error returns before the normal read.
+struct RemoveOnDrop(String);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Token accounting summed across a run's `turn.completed` events (codex).
 #[derive(Default, Clone)]
 pub struct Usage {
@@ -419,14 +458,30 @@ async fn run_codex_json(
         cmd.envs(vars);
     }
     let start = std::time::Instant::now();
+    // Wall-clock at spawn, used to gate transcript recovery to this run's turn:
+    // any final_answer in the rollout stamped before now belongs to an earlier
+    // turn (a resume appends to the same file) and must not be recovered.
+    let started_at = crate::audit::chrono_utc(now_epoch_secs());
     let mut child = cmd.spawn().context("failed to spawn codex")?;
+    // Clean up the `-o` temp file on every exit path - spawn succeeded so it
+    // exists, and an error before the read below would otherwise leak it.
+    let _output_cleanup = RemoveOnDrop(last_msg_path.to_string());
 
     let stdin = child.stdin.take().context("failed to open codex stdin")?;
+    let stdout_pipe = child.stdout.take().context("failed to open codex stdout")?;
+    let stderr_pipe = child.stderr.take().context("failed to open codex stderr")?;
     let write_result = write_stdin(stdin, prompt.as_bytes().to_vec());
-    let output = child.wait_with_output();
-
-    let (write_res, output) = tokio::join!(write_result, output);
-    let output = output.context("failed to wait for codex")?;
+    // Bound in-memory buffering: `wait_with_output` holds the entire stream, so a
+    // runaway/noisy provider could OOM `review` long before the 1 MiB forensic
+    // tail is applied. Buffer up to a generous cap and keep draining past it so
+    // codex never blocks on a full pipe. Real reviews are far under the cap.
+    let (write_res, status, stdout_buf, stderr_buf) = tokio::join!(
+        write_result,
+        child.wait(),
+        read_capped(stdout_pipe, STDOUT_CAPTURE_CAP),
+        read_capped(stderr_pipe, STDERR_CAPTURE_CAP),
+    );
+    let status = status.context("failed to wait for codex")?;
     let duration_ms = start.elapsed().as_millis();
     // A failed prompt write (e.g. broken pipe because codex exited first) is a
     // forensic signal, not a fatal error - the digest still reports what ran.
@@ -436,7 +491,7 @@ async fn run_codex_json(
     // summed usage, and any non-JSON log lines. We do NOT bail on a non-zero
     // exit here - the whole point of the digest is that a halted or errored run
     // still yields whatever it produced, with the exit status recorded.
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&stdout_buf);
     let mut parsed_session_id: Option<String> = None;
     let mut stream_message: Option<String> = None;
     let mut turns: u32 = 0;
@@ -500,7 +555,7 @@ async fn run_codex_json(
         }
         Err(_) => None,
     };
-    let _ = tokio::fs::remove_file(&last_msg_path).await;
+    // (the `-o` temp file is removed by `_output_cleanup` on scope exit)
 
     let captured = final_from_file.is_some();
 
@@ -508,8 +563,8 @@ async fn run_codex_json(
     // the stream.
     let session_id = known_session_id.or(parsed_session_id);
 
-    let exit_code = output.status.code();
-    let signal = signal_name(&output.status);
+    let exit_code = status.code();
+    let signal = signal_name(&status);
     // Only pay for transcript forensics when the run looks wrong; a clean
     // captured run needs no post-mortem. Look under the run's effective
     // CODEX_HOME (a profile env override) so a custom codex home is searched.
@@ -519,9 +574,9 @@ async fn run_codex_json(
     let suspicious = !captured || exit_code != Some(0) || signal.is_some();
     let codex_home = env.and_then(|e| e.get("CODEX_HOME")).map(String::as_str);
     let transcript = if suspicious {
-        session_id
-            .as_deref()
-            .and_then(|sid| crate::transcript::summarize_session(sid, codex_home))
+        session_id.as_deref().and_then(|sid| {
+            crate::transcript::summarize_session(sid, codex_home, Some(&started_at))
+        })
     } else {
         None
     };
@@ -550,8 +605,8 @@ async fn run_codex_json(
             exit_code,
             signal: signal.as_deref(),
             stdin_write_error: stdin_write_error.as_deref(),
-            stdout: &output.stdout,
-            stderr: &output.stderr,
+            stdout: &stdout_buf,
+            stderr: &stderr_buf,
             transcript_path: transcript.as_ref().map(|t| t.path.as_str()),
             duration_ms,
             captured,
@@ -587,7 +642,7 @@ async fn run_codex_json(
         } else {
             "(codex died without a final answer)"
         };
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&stderr_buf);
         let detail = stderr.trim();
         if detail.is_empty() {
             base.to_string()

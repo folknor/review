@@ -38,6 +38,53 @@ fn got_final_answer(r: &provider::ProviderResult) -> bool {
     }
 }
 
+/// Write one provider run to the audit log and, if it captured a session, the
+/// sidecar. Shared so an auto-resume can persist *both* of its invocations.
+#[allow(clippy::too_many_arguments)]
+fn record_run(
+    project_root: &std::path::Path,
+    private: bool,
+    audit_id: &str,
+    archetype: &str,
+    model: Option<&str>,
+    env_keys: &[String],
+    operator_prompt: &str,
+    prompt: &str,
+    result: &provider::ProviderResult,
+) {
+    let session_for_log = result.session_id.as_deref().unwrap_or("");
+    let digest_summary = result.digest.as_ref().map(provider::Digest::summary);
+    audit::log_result(
+        project_root,
+        private,
+        audit_id,
+        archetype,
+        &result.provider,
+        session_for_log,
+        prompt,
+        &result.output,
+        digest_summary.as_ref(),
+    );
+    if let Some(ref sid) = result.session_id {
+        sessions::record(
+            project_root,
+            private,
+            audit_id,
+            archetype,
+            &result.provider,
+            sid,
+            "run",
+            result.completed_epoch,
+            model,
+            env_keys.to_vec(),
+            operator_prompt,
+            prompt,
+            &result.output,
+            digest_summary.as_ref(),
+        );
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -179,8 +226,7 @@ async fn main() -> Result<()> {
 
     // Global lock
     let lock_path = std::env::temp_dir().join("review.lock");
-    let lock_file = std::fs::File::create(&lock_path)
-        .map_err(|e| anyhow::anyhow!("failed to create lock file: {e}"))?;
+    let lock_file = lock::open_lock_file(&lock_path)?;
     lock::acquire_blocking(&lock_file)?;
 
     // Ensure audit ID exists - generate and persist if missing (after lock to prevent races)
@@ -200,13 +246,21 @@ async fn main() -> Result<()> {
     // Spawn all providers with staggered launches to avoid rate limits
     let stagger = std::time::Duration::from_secs(cli.stagger);
     let auto_resume = !cli.no_auto_resume;
+    // A task yields its reportable `result` plus, when auto-resume ran, the
+    // *other* invocation (`also`): the initial death when the resume rescued it,
+    // or the failed resume when it didn't. Both are persisted so no provider
+    // work or death is invisible to the audit/sidecar logs.
+    struct TaskOutcome {
+        result: provider::ProviderResult,
+        also: Option<provider::ProviderResult>,
+    }
     struct PendingResult {
         archetype: String,
         prompt: String,
         operator_prompt: String,
         model: Option<String>,
         env_keys: Vec<String>,
-        handle: tokio::task::JoinHandle<provider::ProviderResult>,
+        handle: tokio::task::JoinHandle<TaskOutcome>,
     }
     let mut pending: Vec<PendingResult> = Vec::new();
     let mut warned_unavailable = std::collections::HashSet::new();
@@ -299,20 +353,36 @@ async fn main() -> Result<()> {
                                     "(auto-resumed after the initial run died without a final answer)\n\n{text}"
                                 );
                             }
-                            return second;
+                            // Resume rescued it: report it, keep the death's record.
+                            return TaskOutcome {
+                                result: second,
+                                also: Some(first),
+                            };
                         }
+                        // Resume didn't help: keep the death as the result, but
+                        // still persist the resume's digest/incident.
+                        return TaskOutcome {
+                            result: first,
+                            also: Some(second),
+                        };
                     }
-                    first
+                    TaskOutcome {
+                        result: first,
+                        also: None,
+                    }
                 }),
             });
             launch_count += 1;
         }
     }
 
-    // Wait one final stagger interval so the next invocation's first launch
-    // doesn't collide with our last launch, then release the global lock.
+    // Hold the lock until every staggered launch has fired, plus one interval,
+    // so a queued invocation can't start launching concurrently with our later
+    // tasks. Task i launches at `stagger * i` (last at `stagger*(launch_count-1)`),
+    // so we wait `stagger * launch_count` to cover the last launch and a trailing
+    // gap before the next invocation's first launch.
     if launch_count > 0 && !stagger.is_zero() {
-        tokio::time::sleep(stagger).await;
+        tokio::time::sleep(stagger * launch_count).await;
     }
     drop(lock_file);
 
@@ -326,53 +396,47 @@ async fn main() -> Result<()> {
     // Collect results
     let mut results: Vec<(String, provider::ProviderResult)> = Vec::new();
     for p in pending {
-        let result = match p.handle.await {
-            Ok(r) => r,
-            Err(err) => provider::ProviderResult {
-                provider: "unknown".into(),
-                output: Err(anyhow::anyhow!("task panicked: {err}")),
-                session_id: None,
-                digest: None,
-                completed_epoch: provider::now_epoch_secs(),
+        let outcome = match p.handle.await {
+            Ok(o) => o,
+            Err(err) => TaskOutcome {
+                result: provider::ProviderResult {
+                    provider: "unknown".into(),
+                    output: Err(anyhow::anyhow!("task panicked: {err}")),
+                    session_id: None,
+                    digest: None,
+                    completed_epoch: provider::now_epoch_secs(),
+                },
+                also: None,
             },
         };
+        let TaskOutcome { result, also } = outcome;
 
-        // Audit log always records the run; the session_id is present for
-        // claude/codex (both capture it).
-        let session_for_log = result.session_id.as_deref().unwrap_or("");
-        let digest_summary = result.digest.as_ref().map(provider::Digest::summary);
-        audit::log_result(
-            &project_root,
-            cfg.audit.private,
-            &audit_id,
-            &p.archetype,
-            &result.provider,
-            session_for_log,
-            &p.prompt,
-            &result.output,
-            digest_summary.as_ref(),
-        );
-
-        // Sidecar: record the fresh session so it can be followed up via
-        // --session. Only claude/codex capture a session ID today.
-        if let Some(ref sid) = result.session_id {
-            sessions::record(
+        // Record the other invocation first (an auto-resume's initial death or
+        // failed retry) so both are in the logs regardless of which we report.
+        if let Some(ref also) = also {
+            record_run(
                 &project_root,
                 cfg.audit.private,
                 &audit_id,
                 &p.archetype,
-                &result.provider,
-                sid,
-                "run",
-                result.completed_epoch,
                 p.model.as_deref(),
-                p.env_keys.clone(),
+                &p.env_keys,
                 &p.operator_prompt,
                 &p.prompt,
-                &result.output,
-                digest_summary.as_ref(),
+                also,
             );
         }
+        record_run(
+            &project_root,
+            cfg.audit.private,
+            &audit_id,
+            &p.archetype,
+            p.model.as_deref(),
+            &p.env_keys,
+            &p.operator_prompt,
+            &p.prompt,
+            &result,
+        );
 
         results.push((p.archetype, result));
     }
@@ -391,7 +455,12 @@ async fn main() -> Result<()> {
         provider::print_result(result);
     }
 
-    let all_failed = results.iter().all(|(_, r)| r.output.is_err());
+    // A codex run that died without a final answer returns Ok (so its session
+    // id + digest survive), but it is a failure for exit-code purposes - a dead
+    // review that exits 0 lies to scripts and CI. Count it as failed.
+    let all_failed = results
+        .iter()
+        .all(|(_, r)| r.output.is_err() || died_without_answer(r));
     if all_failed {
         std::process::exit(1);
     }
@@ -463,8 +532,7 @@ async fn run_session_resume(
 
     // Global lock: serialize against other `review` invocations.
     let lock_path = std::env::temp_dir().join("review.lock");
-    let lock_file = std::fs::File::create(&lock_path)
-        .map_err(|e| anyhow::anyhow!("failed to create lock file: {e}"))?;
+    let lock_file = lock::open_lock_file(&lock_path)?;
     lock::acquire_blocking(&lock_file)?;
 
     let result = provider::invoke(
@@ -513,10 +581,13 @@ async fn run_session_resume(
         &result.output,
         digest_summary.as_ref(),
     );
-    // Only a *successful* resume refreshes the cold-cache clock. Recording a
-    // failed/rejected resume would make a dead session look warm for another
-    // ~55 minutes and defeat the gate.
-    if result.output.is_ok() {
+    // Only a *successful* resume refreshes the cold-cache clock. codex failures
+    // come back as `Ok`-with-a-death-digest, so `output.is_ok()` alone would let
+    // a dead resume mark the session warm for another ~55 minutes and defeat the
+    // gate. Require that it produced a real final answer (claude has no digest,
+    // so `died_without_answer` is false and `output.is_ok()` still governs it).
+    let resume_succeeded = result.output.is_ok() && !died_without_answer(&result);
+    if resume_succeeded {
         sessions::record(
             &project_root,
             private,
@@ -632,7 +703,7 @@ fn run_session_show(session_id: &str) -> Result<()> {
     // var *names*, so a run that overrode CODEX_HOME can't be resolved here;
     // fall back to the default home and report a miss plainly.
     let transcript = if latest.provider == "codex" {
-        transcript::summarize_session(session_id, None)
+        transcript::summarize_session(session_id, None, None)
     } else {
         None
     };

@@ -19,6 +19,48 @@ different axes with no honest mapping, so claude ignores `sandbox`.
 Sources:
 - [Codex session-id feature request](https://github.com/openai/codex/issues/13242)
 
+## Codex WebSocket transport deaths + workaround
+
+codex `exec` runs intermittently die mid-turn: process exits 1, `-o` never written, the `--json` stream stops before `turn.completed` (0 turns), yet the rollout reaches `task_complete` with `last_agent_message: null` and **no** `stream_error`/abort/limit event. Reproduced by forcing an auth failure - stderr showed repeated `401 Unauthorized` on `wss://api.openai.com/v1/responses`.
+
+Root: codex streams each turn over a **WebSocket**; on a WS failure a `426` falls back to HTTP but a `401` (or anything else) is a hard error with **no** HTTP fallback (`core/src/client.rs:1616`), surfacing as the silent null-completion + exit 1. There is no env/flag/global-config to disable websockets, and the built-in `openai` provider (which hardcodes `supports_websockets = true`) cannot be overridden (reserved id).
+
+### Workaround (Lever A - not yet applied): force HTTP/SSE via a custom provider
+
+Define a duplicate OpenAI provider under a **non-reserved** key with `supports_websockets` left at its `false` default, and select it. Routes every turn over HTTP/SSE, bypassing the websocket death, reusing existing auth:
+
+```toml
+model_provider = "openai-http"
+
+[model_providers.openai-http]
+name = "OpenAI"                      # keeps is_openai() true (matches on name, not key)
+base_url = "https://api.openai.com/v1"
+wire_api = "responses"
+requires_openai_auth = true          # reuses auth.json / ChatGPT login
+# supports_websockets omitted -> defaults false -> HTTP/SSE only
+```
+
+Or inline via two `-c` overrides (`-c model_provider="openai-http" -c model_providers.openai-http='{ ... }'`). Tradeoff: loses websocket latency optimizations. Weaker levers (retry/timeout knobs; failure-surfacing) don't help a 401.
+
+**To apply cleanly in `review`:** add a profile `-c` passthrough field (e.g. `config = ["...", "..."]` -> passed as `codex exec -c ...`) so the transport override is scoped per-profile in `.review.toml` rather than editing the global `~/.codex/config.toml`. Not yet built. (Evidence: `core/src/client.rs:930-938,1786-1823`; `model-provider-info/src/lib.rs:139-141,362,498`; `config/src/config_toml.rs:61-66,160,898-918`; `model-provider/src/provider.rs:286-320`.)
+
+## Self-review findings (dogfood, 2026-07-17)
+
+A codex self-review of the digest/recovery/incident/auto-resume work surfaced these. **All fixed** (with regression tests for the transcript/incident logic):
+
+- [x] **[P1] Stale-answer recovery.** A resume that dies before a new `task_started` leaves the prior turn's `final_answer` in the transcript; recovery returns it as the new answer. `transcript.rs`, `provider.rs:509,534`
+- [x] **[P1] Dead run exits 0.** `run_codex_json` returns `Ok` on exit-1/no-answer, and `main` treats only `output.is_err()` as failure, so an all-dead run (incl. failed auto-resume) exits 0. `provider.rs:578`, `main.rs`
+- [x] **[P1] Global lock released too early.** Parent sleeps one `stagger` before dropping the lock, but tasks launch at `stagger * i`; with 3+ launches the lock drops before later launches. `main.rs`
+- [x] **[P1] `review.lock` opened unsafely.** `File::create` truncates + follows symlinks (clobber risk on shared /tmp) and `0644` blocks a second user from opening for write. `main.rs`
+- [x] **[P2] Failed manual resume refreshes warm-cache clock.** `run_session_resume` records a touch on `output.is_ok()`, but codex failures are `Ok`-with-digest. `main.rs`
+- [x] **[P2] Auto-resume loses one invocation's forensics.** Only the returned result is persisted; the other (initial death or failed retry) digest/incident/nudge is dropped. `main.rs`
+- [x] **[P2] Incident scan inherits prior turn's completion.** `scan_transcript` doesn't reset `final_answer_present` on `task_started`, mislabeling a frozen resumed turn as "completed". `incident.rs`
+- [x] **[P2] Incident bundles collide.** Second-resolution timestamp + `no-session` + `create_dir_all` reuse = two concurrent failures overwrite each other. `incident.rs`
+- [x] **[P2] Replay command can't reproduce prompt + cwd.** Uses relative `< prompt.txt` and never `cd`s to the recorded cwd. `incident.rs`
+- [x] **[P2] Incident writer reports success after write failures.** `write_file` only warns; `write_bundle` always returns `Some(dir)`. `incident.rs`
+- [x] **[P2] Forensic cap doesn't bound memory.** `wait_with_output` buffers all stdout/stderr before the 1 MiB tail is applied. `provider.rs`
+- [x] **[P3] Codex `-o` temp files leak on early errors.** Created before spawn, removed only after a successful wait. `provider.rs`
+
 ## Audit log phase 2: git sync
 
 Phase 1 (done) writes audit entries to `~/.local/share/review/<project>/audit.jsonl`. Phase 2 adds optional git sync to a central audit repository.

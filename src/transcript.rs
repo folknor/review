@@ -72,16 +72,27 @@ fn find_transcript(session_id: &str, override_home: Option<&str>) -> Option<Path
     None
 }
 
-fn summarize(path: &Path) -> Option<TranscriptSummary> {
+fn summarize(path: &Path, since: Option<&str>) -> Option<TranscriptSummary> {
     let content = std::fs::read_to_string(path).ok()?;
-    let mut summary = parse(&content);
+    let mut summary = parse(&content, since);
     summary.path = path.to_string_lossy().into_owned();
     Some(summary)
 }
 
+/// Compare two UTC timestamps by their fixed-width `YYYY-MM-DDThh:mm:ss` prefix,
+/// ignoring the sub-second / zone suffix. This lets a `since` with no millis
+/// (`...07Z`) compare cleanly against transcript events that carry them
+/// (`...07.577Z`).
+fn ts_before(event_ts: &str, since: &str) -> bool {
+    event_ts.get(..19).unwrap_or(event_ts) < since.get(..19).unwrap_or(since)
+}
+
 /// Parse transcript NDJSON content into a summary. Split from file IO so the
-/// event handling can be unit-tested directly.
-fn parse(content: &str) -> TranscriptSummary {
+/// event handling can be unit-tested directly. When `since` is set, events
+/// stamped before it are ignored - so recovery reads only the current run's
+/// turn, never a prior completed turn's `final_answer` left in the same rollout
+/// file by a resume that died before emitting `task_started`.
+fn parse(content: &str, since: Option<&str>) -> TranscriptSummary {
     let mut task_complete = false;
     let mut stream_error = false;
     let mut last_event: Option<String> = None;
@@ -97,6 +108,14 @@ fn parse(content: &str) -> TranscriptSummary {
             Ok(v) => v,
             Err(_) => continue,
         };
+        // Drop events older than `since` (an event with no timestamp is kept -
+        // we can't place it, and older transcripts predate the field).
+        if let Some(since) = since
+            && let Some(ts) = event.get("timestamp").and_then(|t| t.as_str())
+            && ts_before(ts, since)
+        {
+            continue;
+        }
         let top = event.get("type").and_then(|t| t.as_str());
         let payload = event.get("payload");
         let ptype = payload.and_then(|p| p.get("type")).and_then(|t| t.as_str());
@@ -176,12 +195,16 @@ fn parse(content: &str) -> TranscriptSummary {
 /// Find and summarize the transcript for a codex session id, if one exists.
 /// `override_home` is the run's effective `CODEX_HOME` (a profile `env`
 /// override), if any.
+/// `since` (a UTC timestamp) restricts the summary to events at or after it -
+/// used by recovery to read only the current run's turn. Pass `None` to
+/// summarize the whole rollout (e.g. `review sessions <id>`).
 pub fn summarize_session(
     session_id: &str,
     override_home: Option<&str>,
+    since: Option<&str>,
 ) -> Option<TranscriptSummary> {
     let path = find_transcript(session_id, override_home)?;
-    summarize(&path)
+    summarize(&path, since)
 }
 
 #[cfg(test)]
@@ -201,7 +224,7 @@ mod tests {
 
     #[test]
     fn frozen_run_surfaces_last_in_flight_tool() {
-        let s = parse(FROZEN);
+        let s = parse(FROZEN, None);
         assert!(!s.task_complete);
         assert!(s.stream_error);
         assert_eq!(s.last_event.as_deref(), Some("event_msg/stream_error"));
@@ -221,7 +244,7 @@ mod tests {
             "\n",
             r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
         );
-        let s = parse(clean);
+        let s = parse(clean, None);
         assert!(s.task_complete);
         assert!(!s.stream_error);
         assert!(s.last_in_flight_tool.is_none());
@@ -245,7 +268,7 @@ mod tests {
             "\n",
             r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
         );
-        let s = parse(run);
+        let s = parse(run, None);
         assert!(s.task_complete);
         assert_eq!(
             s.final_answer.as_deref(),
@@ -267,7 +290,7 @@ mod tests {
             "\n",
             r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
         );
-        let s = parse(run);
+        let s = parse(run, None);
         assert!(s.task_complete);
         assert!(s.final_answer.is_none());
     }
@@ -288,10 +311,36 @@ mod tests {
             "\n",
             r#"{"type":"event_msg","payload":{"type":"stream_error"}}"#,
         );
-        let s = parse(resumed);
+        let s = parse(resumed, None);
         assert!(!s.task_complete, "second turn must not report complete");
         assert!(s.stream_error);
         let (name, _) = s.last_in_flight_tool.expect("in-flight tool from turn 2");
         assert_eq!(name, "exec_command");
+    }
+
+    // A prior turn completed with a real final_answer; a later resume died
+    // before emitting any new event. With `since` set to after the prior turn,
+    // recovery must NOT surface the stale final_answer as this run's result.
+    #[test]
+    fn since_excludes_a_prior_turns_final_answer() {
+        let rollout = concat!(
+            r#"{"timestamp":"2026-07-17T10:00:00.000Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-17T10:00:05.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Old answer from turn one.","phase":"final_answer"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-07-17T10:00:06.000Z","type":"event_msg","payload":{"type":"task_complete"}}"#,
+        );
+        // No gating: the old answer is visible (whole-file view, e.g. sessions <id>).
+        assert_eq!(
+            parse(rollout, None).final_answer.as_deref(),
+            Some("Old answer from turn one.")
+        );
+        // Gated to a resume that started at 11:00: the prior turn is excluded.
+        let s = parse(rollout, Some("2026-07-17T11:00:00Z"));
+        assert!(
+            s.final_answer.is_none(),
+            "stale final_answer must be gated out"
+        );
+        assert!(!s.task_complete, "prior task_complete must be gated out");
     }
 }

@@ -124,7 +124,11 @@ pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
     let base = incidents_dir()?;
     let stamp = crate::audit::chrono_now().replace(':', "-");
     let sid = inc.session_id.unwrap_or("no-session");
-    let dir = base.join(format!("{stamp}-{}-{sid}", inc.provider));
+    // A short random suffix keeps two same-second failures (e.g. two
+    // `--stagger 0` deaths before `thread.started`, both "no-session") from
+    // colliding on the same dir and overwriting each other's artifacts.
+    let nonce = crate::config::generate_short_id();
+    let dir = base.join(format!("{stamp}-{}-{sid}-{nonce}", inc.provider));
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!(
             "warning: failed to create incident dir {}: {e}",
@@ -141,7 +145,7 @@ pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
     write_file(&dir, "prompt.txt", inc.prompt.as_bytes());
     let mut full_argv = vec![inc.binary.to_string()];
     full_argv.extend(inc.argv.iter().cloned());
-    let command = replay_command(&full_argv, inc.env);
+    let command = replay_command(&full_argv, inc.env, inc.cwd, &dir.join("prompt.txt"));
 
     // Raw NDJSON stream, tail-capped. The interesting part is where it stops.
     let (stdout_slice, stdout_truncated) = tail_bytes(inc.stdout, STDOUT_TAIL_BYTES);
@@ -197,18 +201,32 @@ pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
         rate_limits,
         env,
     };
-    match serde_json::to_vec_pretty(&meta) {
+    // meta.json is the index `review incidents` reads and the file that makes
+    // the bundle self-describing. If it can't be written (quota, unwritable
+    // dir), don't advertise a path that points at a broken bundle.
+    let meta_ok = match serde_json::to_vec_pretty(&meta) {
         Ok(bytes) => write_file(&dir, "meta.json", &bytes),
-        Err(e) => eprintln!("warning: failed to serialize incident meta: {e}"),
+        Err(e) => {
+            eprintln!("warning: failed to serialize incident meta: {e}");
+            false
+        }
+    };
+    if !meta_ok {
+        return None;
     }
 
     Some(dir)
 }
 
-fn write_file(dir: &Path, name: &str, bytes: &[u8]) {
+/// Write `bytes` to `dir/name`; returns whether it succeeded.
+fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> bool {
     let path = dir.join(name);
-    if let Err(e) = std::fs::write(&path, bytes) {
-        eprintln!("warning: failed to write {}: {e}", path.display());
+    match std::fs::write(&path, bytes) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("warning: failed to write {}: {e}", path.display());
+            false
+        }
     }
 }
 
@@ -241,6 +259,10 @@ fn scan_transcript(content: &str) -> (Option<bool>, Option<serde_json::Value>) {
         };
         let payload = val.get("payload");
         match payload.and_then(|p| p.get("type")).and_then(|t| t.as_str()) {
+            // Reset per turn so a resumed turn that freezes before task_complete
+            // reports "unknown", not the prior turn's completion (which would
+            // mislabel the death as "completed" in `review incidents`).
+            Some("task_started") => final_answer_present = None,
             Some("task_complete") => {
                 let msg = payload.and_then(|p| p.get("last_agent_message"));
                 final_answer_present = Some(msg.is_some_and(|m| !m.is_null()));
@@ -258,13 +280,17 @@ fn scan_transcript(content: &str) -> (Option<bool>, Option<serde_json::Value>) {
     (final_answer_present, rate_limits)
 }
 
-/// Build a copy-pasteable shell command that reproduces the run: the env we
-/// inject (`RUST_BACKTRACE=1`) plus the profile env as a prefix, the quoted
-/// argv, and `< prompt.txt`. Secret env values become `<redacted>` so the
-/// string is safe to keep in the bundle.
+/// Build a copy-pasteable shell command that reproduces the run: `cd` to the
+/// recorded cwd (codex resolves rules/sandbox root from it), the injected
+/// `RUST_BACKTRACE=1` plus profile env, the quoted argv, and stdin redirected
+/// from the bundle's absolute `prompt.txt`. Secret env values become
+/// `<redacted>` so the string is safe to keep. Self-contained: runnable from
+/// anywhere, and it can't pick up the wrong repo or the wrong prompt.
 fn replay_command(
     full_argv: &[String],
     env: Option<&std::collections::BTreeMap<String, String>>,
+    cwd: &Path,
+    prompt_path: &Path,
 ) -> String {
     let mut parts = vec!["RUST_BACKTRACE=1".to_string()];
     if let Some(m) = env {
@@ -278,7 +304,12 @@ fn replay_command(
         }
     }
     parts.extend(full_argv.iter().map(|a| shell_quote(a)));
-    format!("{} < prompt.txt", parts.join(" "))
+    format!(
+        "cd {} && {} < {}",
+        shell_quote(&cwd.to_string_lossy()),
+        parts.join(" "),
+        shell_quote(&prompt_path.to_string_lossy()),
+    )
 }
 
 /// Minimal POSIX shell quoting: bare when safe, single-quoted otherwise.
@@ -384,6 +415,21 @@ mod tests {
     }
 
     #[test]
+    fn scan_resets_final_answer_on_new_turn() {
+        // Turn 1 completed with an answer; turn 2 started and froze (no complete).
+        // The frozen turn must read as "unknown", not inherit turn 1's success.
+        let rollout = concat!(
+            r#"{"payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"payload":{"type":"task_complete","last_agent_message":"Turn one answer."}}"#,
+            "\n",
+            r#"{"payload":{"type":"task_started"}}"#,
+        );
+        let (final_answer_present, _) = scan_transcript(rollout);
+        assert_eq!(final_answer_present, None);
+    }
+
+    #[test]
     fn secret_env_names_are_redacted() {
         assert!(looks_secret("ANTHROPIC_API_KEY"));
         assert!(looks_secret("OPENAI_TOKEN"));
@@ -406,12 +452,20 @@ mod tests {
             "ANTHROPIC_API_KEY".to_string(),
             "sk-super-secret".to_string(),
         );
-        let cmd = replay_command(&argv, Some(&env));
-        assert!(cmd.starts_with("RUST_BACKTRACE=1 "));
+        let cmd = replay_command(
+            &argv,
+            Some(&env),
+            Path::new("/home/x/proj"),
+            Path::new("/data/incidents/x/prompt.txt"),
+        );
+        assert!(cmd.starts_with("cd /home/x/proj && RUST_BACKTRACE=1 "));
         assert!(cmd.contains("CODEX_HOME=/home/x/.codex"));
         assert!(cmd.contains("ANTHROPIC_API_KEY='<redacted>'"));
         assert!(!cmd.contains("sk-super-secret"), "secret leaked: {cmd}");
-        assert!(cmd.ends_with("codex exec --sandbox read-only < prompt.txt"));
+        assert!(
+            cmd.ends_with("codex exec --sandbox read-only < /data/incidents/x/prompt.txt"),
+            "cmd was: {cmd}"
+        );
     }
 
     #[test]
