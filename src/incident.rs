@@ -11,7 +11,7 @@
 //! best-effort: every failure warns and returns, never derailing the run. Only
 //! suspicious runs write a bundle, so clean runs stay uncluttered.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Everything known about a finished provider run, handed to the bundle writer.
@@ -291,6 +291,62 @@ fn shell_quote(s: &str) -> String {
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
     }
+}
+
+/// A subset of `meta.json` read back for `review incidents`. All fields default
+/// so a partial or older bundle still lists.
+#[derive(Deserialize, Default)]
+pub struct IncidentSummary {
+    #[serde(default)]
+    pub timestamp: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub signal: Option<String>,
+    #[serde(default)]
+    pub recovered_from_transcript: bool,
+    #[serde(default)]
+    pub final_answer_present: Option<bool>,
+    #[serde(default)]
+    pub codex_version: Option<String>,
+}
+
+pub struct ListedIncident {
+    pub dir: PathBuf,
+    pub meta: IncidentSummary,
+}
+
+/// Recent incident bundles, newest first. Bundle dir names are UTC-timestamped,
+/// so a reverse lexical sort is chronological. A dir whose `meta.json` is
+/// missing or unreadable still lists (with defaults) so nothing is hidden.
+pub fn list_recent(limit: usize) -> Vec<ListedIncident> {
+    let base = match incidents_dir() {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+    let mut dirs: Vec<PathBuf> = match std::fs::read_dir(&base) {
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect(),
+        Err(_) => return Vec::new(),
+    };
+    dirs.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    dirs.truncate(limit);
+    dirs.into_iter()
+        .map(|dir| {
+            let meta = std::fs::read_to_string(dir.join("meta.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default();
+            ListedIncident { dir, meta }
+        })
+        .collect()
 }
 
 /// Best-effort `codex --version`; deaths may be version-specific.

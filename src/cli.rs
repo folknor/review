@@ -90,4 +90,11 @@ pub enum Command {
         #[arg(long, default_value = "20")]
         limit: usize,
     },
+
+    /// List recent forensic bundles written for suspicious/dead codex runs
+    Incidents {
+        /// Maximum number of incidents to list (most recent first)
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
 }

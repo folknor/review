@@ -30,6 +30,10 @@ async fn main() -> Result<()> {
         };
     }
 
+    if let Some(cli::Command::Incidents { limit }) = &cli.command {
+        return run_incidents(*limit);
+    }
+
     let archetype_name = match cli.archetype.as_deref() {
         Some(name) => name,
         None => {
@@ -476,6 +480,49 @@ async fn run_session_resume(
 
     if result.output.is_err() {
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `review incidents` - list recent forensic bundles (see `incident.rs`) so a
+/// dead run is triageable at a glance instead of buried under the incidents dir.
+fn run_incidents(limit: usize) -> Result<()> {
+    let incidents = incident::list_recent(limit);
+    if incidents.is_empty() {
+        eprintln!("no incident bundles recorded (none of your codex runs have looked suspicious)");
+        return Ok(());
+    }
+    for inc in &incidents {
+        let m = &inc.meta;
+        let exit = match m.exit_code {
+            Some(c) => c.to_string(),
+            None => "-".to_string(),
+        };
+        let verdict = if m.recovered_from_transcript {
+            "recovered from transcript"
+        } else if m.final_answer_present == Some(false) {
+            "no final answer (died)"
+        } else if m.final_answer_present == Some(true) {
+            "completed (stream/-o truncated)"
+        } else {
+            "suspicious"
+        };
+        let sig = m
+            .signal
+            .as_deref()
+            .map(|s| format!(" signal={s}"))
+            .unwrap_or_default();
+        let ver = m
+            .codex_version
+            .as_deref()
+            .map(|v| format!("  [{v}]"))
+            .unwrap_or_default();
+        let sid = m.session_id.as_deref().unwrap_or("no-session");
+        println!(
+            "{}  {} {sid}  exit={exit}{sig}  {verdict}{ver}",
+            m.timestamp, m.provider
+        );
+        println!("       {}", inc.dir.display());
     }
     Ok(())
 }
