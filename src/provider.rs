@@ -204,6 +204,7 @@ pub async fn invoke(
     effort: Option<&str>,
     sandbox: Option<&str>,
     env: Option<&std::collections::BTreeMap<String, String>>,
+    config: &[String],
     prompt: &str,
     project_root: &Path,
     oneshot: bool,
@@ -211,7 +212,8 @@ pub async fn invoke(
     let result = match provider {
         // `sandbox` is a codex-only concept (an OS filesystem sandbox). Claude's
         // `--permission-mode` is a tool-approval policy on a different axis with
-        // no honest mapping, so claude ignores it.
+        // no honest mapping, so claude ignores it. `config` (codex `-c`) is
+        // likewise codex-only.
         "claude" => {
             run_claude(
                 session_id,
@@ -231,6 +233,7 @@ pub async fn invoke(
                 effort,
                 sandbox,
                 env,
+                config,
                 prompt,
                 project_root,
                 oneshot,
@@ -381,6 +384,7 @@ async fn run_codex(
     effort: Option<&str>,
     sandbox: Option<&str>,
     env: Option<&std::collections::BTreeMap<String, String>>,
+    config: &[String],
     prompt: &str,
     project_root: &Path,
     oneshot: bool,
@@ -400,6 +404,12 @@ async fn run_codex(
     if let Some(e) = effort {
         args.push("-c".to_string());
         args.push(format!("model_reasoning_effort=\"{e}\""));
+    }
+    // Profile `config` overrides, each a verbatim `-c key=value`. Placed after
+    // effort so a profile could even override reasoning effort if it wanted.
+    for c in config {
+        args.push("-c".to_string());
+        args.push(c.clone());
     }
 
     // A fresh run captures the new session id from the stream; the `resume`

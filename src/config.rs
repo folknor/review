@@ -59,6 +59,12 @@ pub struct Profile {
     /// `read-only`, `workspace-write`). Defaults to `read-only` when unset.
     pub sandbox: Option<String>,
     pub env: Option<BTreeMap<String, String>>,
+    /// Extra codex `-c key=value` overrides, each passed verbatim as its own
+    /// `-c`. Codex-only. Lets a profile force config the CLI doesn't expose - in
+    /// particular a custom HTTP-transport provider to dodge the websocket death
+    /// path (`model_provider` + `model_providers.<name>`).
+    #[serde(default)]
+    pub config: Vec<String>,
 }
 
 impl ReviewConfig {

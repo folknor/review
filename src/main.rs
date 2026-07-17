@@ -287,6 +287,7 @@ async fn main() -> Result<()> {
             let effort = profile.and_then(|p| p.effort.clone());
             let sandbox = profile.and_then(|p| p.sandbox.clone());
             let env = profile.and_then(|p| p.env.clone());
+            let config = profile.map(|p| p.config.clone()).unwrap_or_default();
             let env_keys: Vec<String> = env
                 .as_ref()
                 .map(|m| m.keys().cloned().collect())
@@ -317,6 +318,7 @@ async fn main() -> Result<()> {
                         effort.as_deref(),
                         sandbox.as_deref(),
                         env.as_ref(),
+                        &config,
                         &prompt,
                         &root,
                         true,
@@ -341,6 +343,7 @@ async fn main() -> Result<()> {
                             effort.as_deref(),
                             sandbox.as_deref(),
                             env.as_ref(),
+                            &config,
                             RESUME_NUDGE,
                             &root,
                             false,
@@ -542,6 +545,7 @@ async fn run_session_resume(
         None,
         None,
         None,
+        &[],
         &stdin_instructions,
         &project_root,
         false,

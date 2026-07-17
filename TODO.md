@@ -42,7 +42,15 @@ requires_openai_auth = true          # reuses auth.json / ChatGPT login
 
 Or inline via two `-c` overrides (`-c model_provider="openai-http" -c model_providers.openai-http='{ ... }'`). Tradeoff: loses websocket latency optimizations. Weaker levers (retry/timeout knobs; failure-surfacing) don't help a 401.
 
-**To apply cleanly in `review`:** add a profile `-c` passthrough field (e.g. `config = ["...", "..."]` -> passed as `codex exec -c ...`) so the transport override is scoped per-profile in `.review.toml` rather than editing the global `~/.codex/config.toml`. Not yet built. (Evidence: `core/src/client.rs:930-938,1786-1823`; `model-provider-info/src/lib.rs:139-141,362,498`; `config/src/config_toml.rs:61-66,160,898-918`; `model-provider/src/provider.rs:286-320`.)
+**Applied in `review` via a profile `config` passthrough** (each string -> `codex exec -c ...`, scoped per-profile in `.review.toml`). The passthrough works and is committed.
+
+### Outcome (2026-07-17): HTTP workaround blocked by account scopes - reverted
+
+Forcing HTTP on this account (plantasjen) does switch transport - the `wss://.../responses` 401 disappears - but it hits a **hard `403 Forbidden` on `GET /v1/models`**: *"insufficient permissions ... Missing scopes: api.model.read ... restricted API key"*, and the run dies the same way (task_complete null, exit 1). Blanking `OPENAI_API_KEY` in the profile env did **not** change it - the restricted credential appears to live in `~/.codex/auth.json` (an api-key login, 4 KB), not the env - so codex uses it regardless. The websocket transport doesn't call `/v1/models` that way, which is why it works.
+
+Conclusion: the underlying issue is **auth scope**, not transport (websocket 401 <-> HTTP 403 are two faces of it). The HTTP override is a net regression here (intermittent 401 -> hard 403), so it's reverted from the profile; the passthrough mechanism stays for future use. Websocket is the working transport; the intermittent 401 deaths are handled (not prevented) by recover + auto-resume + incident bundles.
+
+To actually *prevent* the deaths, the auth must be fixed outside `review`: re-login with ChatGPT OAuth (`codex login`) or grant the API key the missing scopes (`api.model.read` + responses). (Evidence: `core/src/client.rs:930-938,1786-1823`; `model-provider-info/src/lib.rs:139-141,362,498`; `config/src/config_toml.rs:61-66,160,898-918`; `model-provider/src/provider.rs:286-320`.)
 
 ## Self-review findings (dogfood, 2026-07-17)
 

@@ -18,6 +18,11 @@ sandbox = "workspace-write"
 model = "gpt-5.6-sol"
 effort = "xhigh"
 sandbox = "read-only"
+# NB: forcing HTTP transport here (a custom openai-http provider via `config`)
+# was tried and reverted - on this account the HTTP path 403s on /v1/models
+# (missing api.model.read scope), a wall the websocket transport doesn't hit.
+# See TODO.md. Websocket is the working transport; deaths are handled, not
+# prevented, via recover + auto-resume + incident bundles.
 
 [_audit]
 id = "43fd"
