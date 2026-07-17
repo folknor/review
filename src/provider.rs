@@ -57,8 +57,14 @@ pub struct Digest {
     pub signal: Option<String>,
     /// Whether the final message came from the authoritative `-o` file (which
     /// is written only on a real final message and survives a frozen stream).
-    /// `false` means we fell back to the last streamed message, or none at all.
+    /// `false` means we fell back to the transcript or the last streamed
+    /// message, or none at all.
     pub captured: bool,
+    /// The `-o` file was empty but the real `final_answer` was salvaged from the
+    /// on-disk rollout transcript (codex finished the turn but truncated its
+    /// stream/`-o` on a shutdown-exit). The reported text is authentic, not an
+    /// interim note.
+    pub recovered_from_transcript: bool,
     pub turns: u32,
     pub usage: Usage,
     /// Non-JSON stdout lines (codex ERROR/WARN, apply_patch dumps). The harness
@@ -67,6 +73,51 @@ pub struct Digest {
     /// On-disk transcript forensics, read only when the run looks wrong
     /// (not captured, non-zero exit, or killed by a signal).
     pub transcript: Option<crate::transcript::TranscriptSummary>,
+}
+
+/// Flat, serializable projection of a `Digest` for the sidecar and audit logs.
+/// Flattened (no nested transcript) so failures are greppable after the fact -
+/// e.g. `jq 'select(.digest.captured==false)'`. Without this, a codex run that
+/// exits non-zero mid-shutdown is filed as a clean short `response` and the exit
+/// status is lost. Absent for providers without a machine-readable stream.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct DigestSummary {
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    pub captured: bool,
+    #[serde(default)]
+    pub recovered_from_transcript: bool,
+    pub turns: u32,
+    /// From the rollout transcript (codex): the turn reached `task_complete`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_complete: Option<bool>,
+    /// From the rollout transcript (codex): a `stream_error` froze the stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_error: Option<bool>,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+}
+
+impl Digest {
+    pub fn summary(&self) -> DigestSummary {
+        DigestSummary {
+            exit_code: self.exit_code,
+            signal: self.signal.clone(),
+            captured: self.captured,
+            recovered_from_transcript: self.recovered_from_transcript,
+            turns: self.turns,
+            task_complete: self.transcript.as_ref().map(|t| t.task_complete),
+            stream_error: self.transcript.as_ref().map(|t| t.stream_error),
+            input_tokens: self.usage.input_tokens,
+            cached_input_tokens: self.usage.cached_input_tokens,
+            output_tokens: self.usage.output_tokens,
+            reasoning_output_tokens: self.usage.reasoning_output_tokens,
+        }
+    }
 }
 
 pub struct ProviderResult {
@@ -436,7 +487,6 @@ async fn run_codex_json(
     let _ = tokio::fs::remove_file(&last_msg_path).await;
 
     let captured = final_from_file.is_some();
-    let final_message = final_from_file.or(stream_message);
 
     // On resume we already know the session id; on a fresh run it comes from
     // the stream.
@@ -447,6 +497,9 @@ async fn run_codex_json(
     // Only pay for transcript forensics when the run looks wrong; a clean
     // captured run needs no post-mortem. Look under the run's effective
     // CODEX_HOME (a profile env override) so a custom codex home is searched.
+    // Read before choosing the final message: codex routinely finishes the turn
+    // on disk (task_complete) yet exits non-zero and truncates both the `--json`
+    // stream and the `-o` file, so the rollout is the authoritative record.
     let suspicious = !captured || exit_code != Some(0) || signal.is_some();
     let codex_home = env.and_then(|e| e.get("CODEX_HOME")).map(String::as_str);
     let transcript = if suspicious {
@@ -457,10 +510,20 @@ async fn run_codex_json(
         None
     };
 
+    // Final-message priority:
+    //   1. the `-o` backstop - authoritative when codex managed to write it.
+    //   2. the transcript's recovered `final_answer` - the real report salvaged
+    //      when the stream/`-o` were truncated but the rollout reached the end.
+    //   3. the last streamed message - interim commentary, a last resort.
+    let recovered = transcript.as_ref().and_then(|t| t.final_answer.clone());
+    let recovered_from_transcript = final_from_file.is_none() && recovered.is_some();
+    let final_message = final_from_file.or(recovered).or(stream_message);
+
     let digest = Digest {
         exit_code,
         signal,
         captured,
+        recovered_from_transcript,
         turns,
         usage,
         log_lines,
@@ -471,12 +534,19 @@ async fn run_codex_json(
     // the very case forensics exist to explain), return the digest rather than a
     // bare error - otherwise `invoke` would drop the session id and transcript.
     let text = final_message.unwrap_or_else(|| {
+        // Distinguish "finished but emitted no report" (ended on a tool) from a
+        // genuine hard freeze, using the rollout's completion state.
+        let base = if digest.transcript.as_ref().is_some_and(|t| t.task_complete) {
+            "(codex completed the turn but emitted no final answer)"
+        } else {
+            "(codex produced no final message)"
+        };
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.trim();
         if detail.is_empty() {
-            "(codex produced no final message)".to_string()
+            base.to_string()
         } else {
-            format!("(codex produced no final message)\n{detail}")
+            format!("{base}\n{detail}")
         }
     });
     Ok(RunOutput {
@@ -525,6 +595,11 @@ fn print_digest(d: &Digest) {
         println!("signal: {sig}");
     }
     println!("captured: {}", d.captured);
+    if d.recovered_from_transcript {
+        println!("recovered: final answer restored from transcript (stream/-o truncated)");
+    } else if !d.captured && d.transcript.as_ref().is_some_and(|t| t.task_complete) {
+        println!("note: turn completed on disk but no final answer emitted (response is interim)");
+    }
     println!("turns: {}", d.turns);
     let u = &d.usage;
     println!(

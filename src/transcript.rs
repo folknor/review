@@ -20,6 +20,13 @@ pub struct TranscriptSummary {
     pub last_event: Option<String>,
     /// The last tool call with no matching output: `(name, arguments)`.
     pub last_in_flight_tool: Option<(String, String)>,
+    /// The last `final_answer`-phase agent message this turn, if any. codex
+    /// tags interim progress notes `phase="commentary"` and the real report
+    /// `phase="final_answer"`. When a shutdown-exit truncates the `--json`
+    /// stream and `-o` file (captured=false) but the rollout still reached the
+    /// answer, this is the authoritative response to recover. `None` means the
+    /// turn ended without emitting a final answer (e.g. it stopped on a tool).
+    pub final_answer: Option<String>,
 }
 
 /// Codex home directory. `override_home` is the effective `CODEX_HOME` for the
@@ -78,6 +85,7 @@ fn parse(content: &str) -> TranscriptSummary {
     let mut task_complete = false;
     let mut stream_error = false;
     let mut last_event: Option<String> = None;
+    let mut final_answer: Option<String> = None;
     // call_id -> (name, arguments), preserving insertion order via a Vec.
     let mut in_flight: Vec<(String, (String, String))> = Vec::new();
 
@@ -102,10 +110,25 @@ fn parse(content: &str) -> TranscriptSummary {
             Some("task_started") => {
                 task_complete = false;
                 stream_error = false;
+                final_answer = None;
                 in_flight.clear();
             }
             Some("task_complete") => task_complete = true,
             Some("stream_error") => stream_error = true,
+            // codex phase-tags agent messages: interim notes are "commentary",
+            // the real report is "final_answer". Keep only the latter.
+            Some("agent_message") => {
+                let is_final = payload
+                    .and_then(|p| p.get("phase"))
+                    .and_then(|p| p.as_str())
+                    == Some("final_answer");
+                if is_final {
+                    final_answer = payload
+                        .and_then(|p| p.get("message"))
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string);
+                }
+            }
             Some(pt) if pt.ends_with("_call") => {
                 if let Some(p) = payload {
                     let call_id = p
@@ -146,6 +169,7 @@ fn parse(content: &str) -> TranscriptSummary {
         stream_error,
         last_event,
         last_in_flight_tool,
+        final_answer,
     }
 }
 
@@ -201,6 +225,51 @@ mod tests {
         assert!(s.task_complete);
         assert!(!s.stream_error);
         assert!(s.last_in_flight_tool.is_none());
+    }
+
+    // A truncated run: the model emitted an interim commentary message, ran a
+    // final tool, then a real final_answer, and reached task_complete - but the
+    // exec stream/-o were cut off. The final_answer must be recoverable.
+    #[test]
+    fn recovers_final_answer_from_transcript() {
+        let run = concat!(
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"I am now running the checks.","phase":"commentary"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"c1"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"ok"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"All checks passed. No files changed.","phase":"final_answer"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+        );
+        let s = parse(run);
+        assert!(s.task_complete);
+        assert_eq!(
+            s.final_answer.as_deref(),
+            Some("All checks passed. No files changed.")
+        );
+    }
+
+    // A run that ended on a tool with only commentary - no final answer exists.
+    #[test]
+    fn no_final_answer_when_only_commentary() {
+        let run = concat!(
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"I am moving through the checks now.","phase":"commentary"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"c1"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"ok"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+        );
+        let s = parse(run);
+        assert!(s.task_complete);
+        assert!(s.final_answer.is_none());
     }
 
     // A resumed rollout: the first turn completed, then a second turn started

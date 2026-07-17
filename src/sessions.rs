@@ -25,6 +25,11 @@ struct SessionEntry<'a> {
     response: Option<String>,
     error: Option<String>,
     review_version: &'static str,
+    /// Flat run digest (codex): exit/signal/captured/turns/task_complete/usage,
+    /// so a truncated/errored run is greppable instead of masquerading as a
+    /// clean short `response`. Absent for claude (no machine-readable stream).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    digest: Option<crate::provider::DigestSummary>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -57,10 +62,13 @@ pub struct SessionRecord {
     pub assembled_prompt: String,
     #[allow(dead_code)]
     pub response: Option<String>,
-    #[allow(dead_code)]
     pub error: Option<String>,
     #[allow(dead_code)]
     pub review_version: String,
+    /// Present on codex rows written after digest persistence landed; `None` for
+    /// claude rows and for older rows.
+    #[serde(default)]
+    pub digest: Option<crate::provider::DigestSummary>,
 }
 
 fn sessions_path(private: bool) -> Option<std::path::PathBuf> {
@@ -170,6 +178,7 @@ pub fn record(
     operator_prompt: &str,
     assembled_prompt: &str,
     result: &Result<String>,
+    digest: Option<&crate::provider::DigestSummary>,
 ) {
     let path = match sessions_path(private) {
         Some(p) => p,
@@ -203,6 +212,7 @@ pub fn record(
         response: result.as_ref().ok().cloned(),
         error: result.as_ref().err().map(ToString::to_string),
         review_version: env!("CARGO_PKG_VERSION"),
+        digest: digest.cloned(),
     };
 
     let line = match serde_json::to_string(&entry) {

@@ -22,8 +22,11 @@ async fn main() -> Result<()> {
         return config::init();
     }
 
-    if let Some(cli::Command::Sessions { all, limit }) = &cli.command {
-        return run_sessions(*all, *limit);
+    if let Some(cli::Command::Sessions { id, all, limit }) = &cli.command {
+        return match id {
+            Some(sid) => run_session_show(sid),
+            None => run_sessions(*all, *limit),
+        };
     }
 
     let archetype_name = match cli.archetype.as_deref() {
@@ -273,6 +276,7 @@ async fn main() -> Result<()> {
         // Audit log always records the run; the session_id is present for
         // claude/codex (both capture it).
         let session_for_log = result.session_id.as_deref().unwrap_or("");
+        let digest_summary = result.digest.as_ref().map(provider::Digest::summary);
         audit::log_result(
             &project_root,
             cfg.audit.private,
@@ -282,6 +286,7 @@ async fn main() -> Result<()> {
             session_for_log,
             &p.prompt,
             &result.output,
+            digest_summary.as_ref(),
         );
 
         // Sidecar: record the fresh session so it can be followed up via
@@ -301,6 +306,7 @@ async fn main() -> Result<()> {
                 &p.operator_prompt,
                 &p.prompt,
                 &result.output,
+                digest_summary.as_ref(),
             );
         }
 
@@ -431,6 +437,7 @@ async fn run_session_resume(
         Err(_) => (config::generate_short_id(), false),
     };
 
+    let digest_summary = result.digest.as_ref().map(provider::Digest::summary);
     audit::log_result(
         &project_root,
         private,
@@ -440,6 +447,7 @@ async fn run_session_resume(
         session_id,
         &stdin_instructions,
         &result.output,
+        digest_summary.as_ref(),
     );
     // Only a *successful* resume refreshes the cold-cache clock. Recording a
     // failed/rejected resume would make a dead session look warm for another
@@ -459,6 +467,7 @@ async fn run_session_resume(
             &stdin_instructions,
             &stdin_instructions,
             &result.output,
+            digest_summary.as_ref(),
         );
     }
 
@@ -468,6 +477,122 @@ async fn run_session_resume(
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// `review sessions <id>` - surface one session's artifacts: its digest, the
+/// on-disk codex rollout transcript (the authoritative record), and the final
+/// response. This is the on-demand form of the post-mortem that a suspicious
+/// run prints inline - reachable for any past session by ID.
+fn run_session_show(session_id: &str) -> Result<()> {
+    let mut records: Vec<sessions::SessionRecord> = sessions::read_all()
+        .into_iter()
+        .filter(|r| r.session_id == session_id)
+        .collect();
+    if records.is_empty() {
+        bail!(
+            "no sidecar record for session {session_id}\n  \
+             (run `review sessions` to list known sessions)"
+        );
+    }
+    records.sort_by_key(|r| r.epoch_secs);
+    let latest = records.last().expect("non-empty");
+
+    let now = provider::now_epoch_secs();
+    let age = if latest.epoch_secs == 0 {
+        "?".to_string()
+    } else {
+        sessions::format_age(now.saturating_sub(latest.epoch_secs))
+    };
+
+    println!("session: {session_id}");
+    println!(
+        "provider: {} / archetype: {} ({}) / {} touch(es), last {age} ago",
+        latest.provider,
+        latest.archetype,
+        latest.kind,
+        records.len()
+    );
+    println!("project: {}", latest.project);
+    if let Some(ref model) = latest.model {
+        println!("model: {model}");
+    }
+
+    if let Some(ref d) = latest.digest {
+        print_digest_summary(d);
+    }
+
+    // The on-disk rollout is the authoritative artifact. We recorded only env
+    // var *names*, so a run that overrode CODEX_HOME can't be resolved here;
+    // fall back to the default home and report a miss plainly.
+    let transcript = if latest.provider == "codex" {
+        transcript::summarize_session(session_id, None)
+    } else {
+        None
+    };
+    if latest.provider == "codex" {
+        match transcript {
+            Some(ref t) => {
+                println!("transcript: {}", t.path);
+                println!(
+                    "  task_complete={} stream_error={}",
+                    t.task_complete, t.stream_error
+                );
+                if let Some(ref last) = t.last_event {
+                    println!("  last_event: {last}");
+                }
+                if let Some((ref name, ref args)) = t.last_in_flight_tool {
+                    let shown: String = args.chars().take(200).collect();
+                    println!("  last_in_flight_tool: {name} {shown}");
+                }
+            }
+            None => println!("transcript: (not found under default CODEX_HOME)"),
+        }
+    }
+
+    // Prefer the transcript's authoritative final_answer when it exists: it
+    // recovers the real report even for rows recorded before runtime recovery
+    // landed (whose sidecar `response` may be a truncated interim note).
+    let recovered = transcript.as_ref().and_then(|t| t.final_answer.as_deref());
+    println!("--- response ---");
+    match (recovered, &latest.response, &latest.error) {
+        (Some(fa), sidecar, _) => {
+            if sidecar.as_deref() != Some(fa) {
+                println!("(recovered final answer from transcript)");
+            }
+            println!("{fa}");
+        }
+        (None, Some(r), _) => println!("{r}"),
+        (None, None, Some(e)) => println!("(no response) error: {e}"),
+        (None, None, None) => println!("(no response recorded)"),
+    }
+    Ok(())
+}
+
+/// Print a persisted `DigestSummary` (from the sidecar) in the same shape as the
+/// inline post-mortem, so `review sessions <id>` reads like a live run.
+fn print_digest_summary(d: &provider::DigestSummary) {
+    match d.exit_code {
+        Some(code) => println!("exit: {code}"),
+        None => println!("exit: -"),
+    }
+    if let Some(ref sig) = d.signal {
+        println!("signal: {sig}");
+    }
+    println!("captured: {}", d.captured);
+    if d.recovered_from_transcript {
+        println!("recovered: final answer restored from transcript");
+    }
+    if let Some(false) = d.task_complete {
+        println!("task_complete: false");
+    }
+    if let Some(true) = d.stream_error {
+        println!("stream_error: true");
+    }
+    println!("turns: {}", d.turns);
+    println!(
+        "usage: input={} cached={} output={} reasoning={}",
+        d.input_tokens, d.cached_input_tokens, d.output_tokens, d.reasoning_output_tokens
+    );
 }
 
 /// `review sessions` - aggregate sidecar records by session_id and print

@@ -75,8 +75,13 @@ pub enum Command {
     /// Create a starter .review.toml in the current directory
     Init,
 
-    /// List recent sessions for follow-up via --session
+    /// List recent sessions, or show one session's artifacts by ID
     Sessions {
+        /// Session ID to show artifacts for (transcript, digest, response).
+        /// Omit to list recent sessions.
+        #[arg(value_name = "ID")]
+        id: Option<String>,
+
         /// List sessions across all projects, not just the current one
         #[arg(long)]
         all: bool,
