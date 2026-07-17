@@ -61,11 +61,6 @@ pub struct Cli {
     /// Seconds between each provider launch to avoid rate limits (default: 30, 0 to disable)
     #[arg(long, default_value = "30")]
     pub stagger: u64,
-
-    /// Do not auto-resume a codex run that dies without a final answer.
-    /// By default such a run is resumed once immediately (cache still warm).
-    #[arg(long)]
-    pub no_auto_resume: bool,
 }
 
 impl Cli {

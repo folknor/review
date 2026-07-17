@@ -245,7 +245,6 @@ async fn main() -> Result<()> {
 
     // Spawn all providers with staggered launches to avoid rate limits
     let stagger = std::time::Duration::from_secs(cli.stagger);
-    let auto_resume = !cli.no_auto_resume;
     // A task yields its reportable `result` plus, when auto-resume ran, the
     // *other* invocation (`also`): the initial death when the resume rescued it,
     // or the failed resume when it didn't. Both are persisted so no provider
@@ -328,8 +327,7 @@ async fn main() -> Result<()> {
                     // ended with no real final answer gets one immediate resume
                     // (cache still warm) with a nudge, reusing the same profile.
                     // A manual resume is what rescued the original Death 2.
-                    if auto_resume
-                        && prov == "codex"
+                    if prov == "codex"
                         && died_without_answer(&first)
                         && let Some(sid) = first.session_id.clone()
                     {
