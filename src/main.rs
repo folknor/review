@@ -15,6 +15,29 @@ use clap::Parser;
 
 use cli::Cli;
 
+/// Nudge sent when auto-resuming a codex run that died without a final answer.
+const RESUME_NUDGE: &str = "The previous turn ended without a final answer. \
+Continue from exactly where you left off and produce your complete final response now.";
+
+/// A codex run that ended with no real final answer - no `-o` capture and
+/// nothing recovered from the rollout. This is the death worth resuming past;
+/// a run that captured or recovered an answer is not retried.
+fn died_without_answer(r: &provider::ProviderResult) -> bool {
+    match &r.digest {
+        Some(d) => !d.captured && !d.recovered_from_transcript,
+        None => false,
+    }
+}
+
+/// A run that produced a real final answer (captured from `-o` or recovered from
+/// the rollout). Used to decide whether an auto-resume actually helped.
+fn got_final_answer(r: &provider::ProviderResult) -> bool {
+    match &r.digest {
+        Some(d) => d.captured || d.recovered_from_transcript,
+        None => false,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -176,6 +199,7 @@ async fn main() -> Result<()> {
 
     // Spawn all providers with staggered launches to avoid rate limits
     let stagger = std::time::Duration::from_secs(cli.stagger);
+    let auto_resume = !cli.no_auto_resume;
     struct PendingResult {
         archetype: String,
         prompt: String,
@@ -232,7 +256,7 @@ async fn main() -> Result<()> {
                     if !delay.is_zero() {
                         tokio::time::sleep(delay).await;
                     }
-                    provider::invoke(
+                    let first = provider::invoke(
                         &prov,
                         "",
                         model.as_deref(),
@@ -243,7 +267,42 @@ async fn main() -> Result<()> {
                         &root,
                         true,
                     )
-                    .await
+                    .await;
+                    // The "work around" for codex mid-turn deaths: a run that
+                    // ended with no real final answer gets one immediate resume
+                    // (cache still warm) with a nudge, reusing the same profile.
+                    // A manual resume is what rescued the original Death 2.
+                    if auto_resume
+                        && prov == "codex"
+                        && died_without_answer(&first)
+                        && let Some(sid) = first.session_id.clone()
+                    {
+                        eprintln!(
+                            "codex session {sid} died without a final answer - auto-resuming once"
+                        );
+                        let second = provider::invoke(
+                            &prov,
+                            &sid,
+                            model.as_deref(),
+                            effort.as_deref(),
+                            sandbox.as_deref(),
+                            env.as_ref(),
+                            RESUME_NUDGE,
+                            &root,
+                            false,
+                        )
+                        .await;
+                        if got_final_answer(&second) {
+                            let mut second = second;
+                            if let Ok(text) = second.output.as_mut() {
+                                *text = format!(
+                                    "(auto-resumed after the initial run died without a final answer)\n\n{text}"
+                                );
+                            }
+                            return second;
+                        }
+                    }
+                    first
                 }),
             });
             launch_count += 1;
