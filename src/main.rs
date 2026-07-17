@@ -2,6 +2,7 @@ mod audit;
 mod cli;
 mod config;
 mod config_write;
+mod incident;
 mod input;
 mod lock;
 mod prompt;
@@ -609,6 +610,9 @@ fn print_digest_summary(d: &provider::DigestSummary) {
         "usage: input={} cached={} output={} reasoning={}",
         d.input_tokens, d.cached_input_tokens, d.output_tokens, d.reasoning_output_tokens
     );
+    if let Some(ref path) = d.incident_path {
+        println!("incident: {path}");
+    }
 }
 
 /// `review sessions` - aggregate sidecar records by session_id and print

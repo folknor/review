@@ -1,0 +1,295 @@
+//! Forensic capture for suspicious provider runs.
+//!
+//! When a codex run looks wrong (not captured / non-zero exit / signal) the
+//! live digest + transcript summary are not enough to explain *why* it died -
+//! the investigation that motivated this module kept stalling on information
+//! `review` had thrown away: codex's stderr, the raw NDJSON stream, whether the
+//! prompt even finished writing, and (absent `RUST_BACKTRACE`) any panic trace.
+//!
+//! `write_bundle` dumps all of it to `~/.local/share/review/incidents/<dir>/`
+//! so the *next* death is over-instrumented instead of a mystery. It is
+//! best-effort: every failure warns and returns, never derailing the run. Only
+//! suspicious runs write a bundle, so clean runs stay uncluttered.
+
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+
+/// Everything known about a finished provider run, handed to the bundle writer.
+pub struct Incident<'a> {
+    pub provider: &'a str,
+    pub session_id: Option<&'a str>,
+    /// The exact argv passed to the provider binary - for verbatim replay.
+    pub argv: &'a [String],
+    pub cwd: &'a Path,
+    /// Profile env (names always recorded; values redacted when the name looks
+    /// secret, so the bundle never leaks tokens).
+    pub env: Option<&'a std::collections::BTreeMap<String, String>>,
+    pub exit_code: Option<i32>,
+    pub signal: Option<&'a str>,
+    /// `Some` if writing the prompt to the child's stdin failed (e.g. a broken
+    /// pipe because the child exited before consuming it).
+    pub stdin_write_error: Option<&'a str>,
+    pub stdout: &'a [u8],
+    pub stderr: &'a [u8],
+    pub transcript_path: Option<&'a str>,
+    pub duration_ms: u128,
+    pub captured: bool,
+    pub recovered_from_transcript: bool,
+    pub turns: u32,
+}
+
+/// Keep the last MiB of the raw NDJSON stream - the death is at the end, and a
+/// long agentic run's stream can be tens of MiB.
+const STDOUT_TAIL_BYTES: usize = 1 << 20;
+/// Raw transcript lines to keep in the tail (the full file stays on disk).
+const TRANSCRIPT_TAIL_LINES: usize = 80;
+
+#[derive(Serialize)]
+struct Meta {
+    schema: u32,
+    timestamp: String,
+    provider: String,
+    session_id: Option<String>,
+    review_version: &'static str,
+    codex_version: Option<String>,
+    argv: Vec<String>,
+    cwd: String,
+    exit_code: Option<i32>,
+    signal: Option<String>,
+    stdin_write_error: Option<String>,
+    duration_ms: u128,
+    captured: bool,
+    recovered_from_transcript: bool,
+    turns: u32,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+    stdout_truncated: bool,
+    transcript_path: Option<String>,
+    /// codex records this on `task_complete`; `Some(false)` means the turn ended
+    /// with no final answer (a death signature), `Some(true)` means it did.
+    final_answer_present: Option<bool>,
+    /// Rate-limit snapshot from the last `token_count` event (raw JSON), so a
+    /// limit-driven stop is visible without re-reading the transcript.
+    rate_limits: Option<serde_json::Value>,
+    /// Env var names configured for the run; values only when non-secret.
+    env: Vec<EnvVar>,
+}
+
+#[derive(Serialize)]
+struct EnvVar {
+    name: String,
+    value: Option<String>,
+}
+
+fn incidents_dir() -> Option<PathBuf> {
+    let data_dir = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .ok()?;
+    Some(data_dir.join("review").join("incidents"))
+}
+
+/// A name that shouldn't have its value recorded (heuristic, errs toward hiding).
+fn looks_secret(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    [
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "AUTH",
+        "COOKIE",
+        "CREDENTIAL",
+    ]
+    .iter()
+    .any(|needle| n.contains(needle))
+}
+
+/// Write a forensic bundle for a suspicious run. Returns the bundle directory on
+/// success. Best-effort: warns and returns `None` on any IO failure.
+pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
+    let base = incidents_dir()?;
+    let stamp = crate::audit::chrono_now().replace(':', "-");
+    let sid = inc.session_id.unwrap_or("no-session");
+    let dir = base.join(format!("{stamp}-{}-{sid}", inc.provider));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!(
+            "warning: failed to create incident dir {}: {e}",
+            dir.display()
+        );
+        return None;
+    }
+
+    // Full stderr - the highest-value channel we used to discard. With
+    // RUST_BACKTRACE set on the child, a panic lands here with its trace.
+    write_file(&dir, "stderr.txt", inc.stderr);
+
+    // Raw NDJSON stream, tail-capped. The interesting part is where it stops.
+    let (stdout_slice, stdout_truncated) = tail_bytes(inc.stdout, STDOUT_TAIL_BYTES);
+    write_file(&dir, "stdout.jsonl", stdout_slice);
+
+    // Transcript tail (the full rollout stays at transcript_path) plus the two
+    // scalars worth surfacing without a re-parse.
+    let mut final_answer_present = None;
+    let mut rate_limits = None;
+    if let Some(path) = inc.transcript_path
+        && let Ok(content) = std::fs::read_to_string(path)
+    {
+        let tail = tail_lines(&content, TRANSCRIPT_TAIL_LINES);
+        write_file(&dir, "transcript.tail.jsonl", tail.as_bytes());
+        (final_answer_present, rate_limits) = scan_transcript(&content);
+    }
+
+    let env = inc
+        .env
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| EnvVar {
+                    name: k.clone(),
+                    value: (!looks_secret(k)).then(|| v.clone()),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let meta = Meta {
+        schema: 1,
+        timestamp: crate::audit::chrono_now(),
+        provider: inc.provider.to_string(),
+        session_id: inc.session_id.map(str::to_string),
+        review_version: env!("CARGO_PKG_VERSION"),
+        codex_version: probe_codex_version(inc.provider),
+        argv: inc.argv.to_vec(),
+        cwd: inc.cwd.to_string_lossy().into_owned(),
+        exit_code: inc.exit_code,
+        signal: inc.signal.map(str::to_string),
+        stdin_write_error: inc.stdin_write_error.map(str::to_string),
+        duration_ms: inc.duration_ms,
+        captured: inc.captured,
+        recovered_from_transcript: inc.recovered_from_transcript,
+        turns: inc.turns,
+        stdout_bytes: inc.stdout.len(),
+        stderr_bytes: inc.stderr.len(),
+        stdout_truncated,
+        transcript_path: inc.transcript_path.map(str::to_string),
+        final_answer_present,
+        rate_limits,
+        env,
+    };
+    match serde_json::to_vec_pretty(&meta) {
+        Ok(bytes) => write_file(&dir, "meta.json", &bytes),
+        Err(e) => eprintln!("warning: failed to serialize incident meta: {e}"),
+    }
+
+    Some(dir)
+}
+
+fn write_file(dir: &Path, name: &str, bytes: &[u8]) {
+    let path = dir.join(name);
+    if let Err(e) = std::fs::write(&path, bytes) {
+        eprintln!("warning: failed to write {}: {e}", path.display());
+    }
+}
+
+/// Last `max` bytes of `data`, plus whether it was truncated.
+fn tail_bytes(data: &[u8], max: usize) -> (&[u8], bool) {
+    if data.len() <= max {
+        (data, false)
+    } else {
+        (&data[data.len() - max..], true)
+    }
+}
+
+/// Last `max` non-empty lines, rejoined.
+fn tail_lines(content: &str, max: usize) -> String {
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(max);
+    lines[start..].join("\n")
+}
+
+/// Extract the two scalars worth promoting into meta: whether the final
+/// `task_complete` carried a non-null `last_agent_message`, and the last
+/// `token_count` rate-limit snapshot.
+fn scan_transcript(content: &str) -> (Option<bool>, Option<serde_json::Value>) {
+    let mut final_answer_present = None;
+    let mut rate_limits = None;
+    for line in content.lines() {
+        let val: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let payload = val.get("payload");
+        match payload.and_then(|p| p.get("type")).and_then(|t| t.as_str()) {
+            Some("task_complete") => {
+                let msg = payload.and_then(|p| p.get("last_agent_message"));
+                final_answer_present = Some(msg.is_some_and(|m| !m.is_null()));
+            }
+            Some("token_count") => {
+                if let Some(rl) = payload.and_then(|p| p.get("rate_limits"))
+                    && !rl.is_null()
+                {
+                    rate_limits = Some(rl.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    (final_answer_present, rate_limits)
+}
+
+/// Best-effort `codex --version`; deaths may be version-specific.
+fn probe_codex_version(provider: &str) -> Option<String> {
+    let out = std::process::Command::new(provider)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_flags_null_final_answer_as_death() {
+        // task_complete with last_agent_message=null == no final answer produced.
+        let died = concat!(
+            r#"{"payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":31.0}}}}"#,
+            "\n",
+            r#"{"payload":{"type":"task_complete","last_agent_message":null}}"#,
+        );
+        let (final_answer_present, rate_limits) = scan_transcript(died);
+        assert_eq!(final_answer_present, Some(false));
+        assert!(rate_limits.is_some(), "rate_limits should be captured");
+    }
+
+    #[test]
+    fn scan_flags_real_answer_as_present() {
+        let ok = r#"{"payload":{"type":"task_complete","last_agent_message":"All done."}}"#;
+        let (final_answer_present, _) = scan_transcript(ok);
+        assert_eq!(final_answer_present, Some(true));
+    }
+
+    #[test]
+    fn secret_env_names_are_redacted() {
+        assert!(looks_secret("ANTHROPIC_API_KEY"));
+        assert!(looks_secret("OPENAI_TOKEN"));
+        assert!(looks_secret("DB_PASSWORD"));
+        assert!(!looks_secret("CODEX_HOME"));
+        assert!(!looks_secret("CARGO_TARGET_DIR"));
+    }
+
+    #[test]
+    fn tails_keep_the_end() {
+        let (slice, truncated) = tail_bytes(b"abcdef", 3);
+        assert_eq!(slice, b"def");
+        assert!(truncated);
+        let (slice, truncated) = tail_bytes(b"ab", 3);
+        assert_eq!(slice, b"ab");
+        assert!(!truncated);
+
+        assert_eq!(tail_lines("a\n\nb\nc\n", 2), "b\nc");
+    }
+}

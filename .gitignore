@@ -1,3 +1,6 @@
 target
 .plans
 .claude
+# Vendored upstream clones kept for investigation only - never ours to commit,
+# and must stay out of brokkr's tree-wide scans.
+/research/

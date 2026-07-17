@@ -73,6 +73,9 @@ pub struct Digest {
     /// On-disk transcript forensics, read only when the run looks wrong
     /// (not captured, non-zero exit, or killed by a signal).
     pub transcript: Option<crate::transcript::TranscriptSummary>,
+    /// Directory of the forensic bundle written for a suspicious run (stderr,
+    /// raw stream, transcript tail, argv, codex version). `None` on clean runs.
+    pub incident_path: Option<String>,
 }
 
 /// Flat, serializable projection of a `Digest` for the sidecar and audit logs.
@@ -100,6 +103,9 @@ pub struct DigestSummary {
     pub cached_input_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_output_tokens: u64,
+    /// Forensic-bundle directory for a suspicious run (see `incident.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incident_path: Option<String>,
 }
 
 impl Digest {
@@ -116,6 +122,7 @@ impl Digest {
             cached_input_tokens: self.usage.cached_input_tokens,
             output_tokens: self.usage.output_tokens,
             reasoning_output_tokens: self.usage.reasoning_output_tokens,
+            incident_path: self.incident_path.clone(),
         }
     }
 }
@@ -401,20 +408,29 @@ async fn run_codex_json(
     let mut cmd = Command::new("codex");
     cmd.args(&args)
         .current_dir(project_root)
+        // Make a codex panic legible: without this it exits 1 with no trace,
+        // which is exactly the "no recorded reason" we kept hitting. Set before
+        // the profile env so an explicit override still wins.
+        .env("RUST_BACKTRACE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(vars) = env {
         cmd.envs(vars);
     }
+    let start = std::time::Instant::now();
     let mut child = cmd.spawn().context("failed to spawn codex")?;
 
     let stdin = child.stdin.take().context("failed to open codex stdin")?;
     let write_result = write_stdin(stdin, prompt.as_bytes().to_vec());
     let output = child.wait_with_output();
 
-    let (_write_res, output) = tokio::join!(write_result, output);
+    let (write_res, output) = tokio::join!(write_result, output);
     let output = output.context("failed to wait for codex")?;
+    let duration_ms = start.elapsed().as_millis();
+    // A failed prompt write (e.g. broken pipe because codex exited first) is a
+    // forensic signal, not a fatal error - the digest still reports what ran.
+    let stdin_write_error = write_res.err().map(|e| e.to_string());
 
     // Parse the NDJSON stream: session id, streamed final message, turn count,
     // summed usage, and any non-JSON log lines. We do NOT bail on a non-zero
@@ -519,6 +535,32 @@ async fn run_codex_json(
     let recovered_from_transcript = final_from_file.is_none() && recovered.is_some();
     let final_message = final_from_file.or(recovered).or(stream_message);
 
+    // Dump a full forensic bundle for the same suspicious runs we post-mortem -
+    // stderr (with backtraces), the raw stream, the transcript tail, the exact
+    // argv, and codex's version - so the next death is over-instrumented.
+    let incident_path = if suspicious {
+        crate::incident::write_bundle(&crate::incident::Incident {
+            provider: "codex",
+            session_id: session_id.as_deref(),
+            argv: &args,
+            cwd: project_root,
+            env,
+            exit_code,
+            signal: signal.as_deref(),
+            stdin_write_error: stdin_write_error.as_deref(),
+            stdout: &output.stdout,
+            stderr: &output.stderr,
+            transcript_path: transcript.as_ref().map(|t| t.path.as_str()),
+            duration_ms,
+            captured,
+            recovered_from_transcript,
+            turns,
+        })
+        .map(|p| p.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+
     let digest = Digest {
         exit_code,
         signal,
@@ -528,6 +570,7 @@ async fn run_codex_json(
         usage,
         log_lines,
         transcript,
+        incident_path,
     };
 
     // Even when no message came back (a hard freeze before any agent_message,
@@ -636,6 +679,9 @@ fn print_digest(d: &Digest) {
         if let Some((ref name, ref args)) = t.last_in_flight_tool {
             println!("  last_in_flight_tool: {name} {}", truncate(args, 200));
         }
+    }
+    if let Some(ref path) = d.incident_path {
+        println!("incident: {path}");
     }
 }
 
