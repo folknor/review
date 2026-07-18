@@ -583,13 +583,19 @@ async fn run_session_resume(
         &result.output,
         digest_summary.as_ref(),
     );
-    // Only a *successful* resume refreshes the cold-cache clock. codex failures
-    // come back as `Ok`-with-a-death-digest, so `output.is_ok()` alone would let
-    // a dead resume mark the session warm for another ~55 minutes and defeat the
-    // gate. Require that it produced a real final answer (claude has no digest,
-    // so `died_without_answer` is false and `output.is_ok()` still governs it).
-    let resume_succeeded = result.output.is_ok() && !died_without_answer(&result);
-    if resume_succeeded {
+    // Any resume that actually *ran* refreshes the cold-cache clock, because the
+    // clock tracks prompt-cache warmth, not answer quality. Reprocessing the
+    // session prefix warms the cache regardless of whether the turn produced a
+    // real final answer - a codex mid-turn death (which comes back as
+    // `Ok`-with-a-death-digest) warmed it just as much as a clean run. Gating on
+    // "did we get a good answer" (the old `!died_without_answer` clause) meant a
+    // dead intermediate resume left the clock pinned to the last *successful*
+    // touch, so the next resume of a genuinely-warm session was wrongly refused
+    // as stale. `output.is_ok()` is the honest proxy for "reached the provider
+    // and got output back"; a hard launch failure (`Err`, cache never warmed)
+    // still doesn't refresh.
+    let resume_ran = result.output.is_ok();
+    if resume_ran {
         sessions::record(
             &project_root,
             private,
