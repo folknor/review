@@ -19,6 +19,22 @@ use cli::Cli;
 const RESUME_NUDGE: &str = "The previous turn ended without a final answer. \
 Continue from exactly where you left off and produce your complete final response now.";
 
+/// Format the wall-clock runtime printed when `review` returns: sub-minute runs
+/// get a decimal second (short runs differ by fractions), longer ones roll up to
+/// m/s then h/m/s. `sessions::format_age` is deliberately not reused - it floors
+/// anything under a minute to "now", which is most of a resume's runtime.
+fn format_runtime(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        return format!("{:.1}s", d.as_secs_f64());
+    }
+    let (mins, rem_s) = (secs / 60, secs % 60);
+    if mins < 60 {
+        return format!("{mins}m{rem_s:02}s");
+    }
+    format!("{}h{:02}m{rem_s:02}s", mins / 60, mins % 60)
+}
+
 /// A codex run that ended with no real final answer - no `-o` capture and
 /// nothing recovered from the rollout. This is the death worth resuming past;
 /// a run that captured or recovered an answer is not retried.
@@ -87,6 +103,10 @@ fn record_run(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Total wall clock, started before anything else runs. This deliberately
+    // includes the stdin read and the global-lock wait: it is what the operator
+    // waited, not just what the providers spent.
+    let started = std::time::Instant::now();
     let cli = Cli::parse();
 
     if matches!(cli.command, Some(cli::Command::Init)) {
@@ -129,7 +149,14 @@ async fn main() -> Result<()> {
                 providers.len()
             ),
         };
-        return run_session_resume(archetype_name, provider_name, session_id, cli.dry_run).await;
+        return run_session_resume(
+            archetype_name,
+            provider_name,
+            session_id,
+            cli.dry_run,
+            started,
+        )
+        .await;
     }
 
     let (mut cfg, project_root) = config::load()?;
@@ -456,6 +483,8 @@ async fn main() -> Result<()> {
         provider::print_result(result);
     }
 
+    println!("\nruntime: {}", format_runtime(started.elapsed()));
+
     // A codex run that died without a final answer returns Ok (so its session
     // id + digest survive), but it is a failure for exit-code purposes - a dead
     // review that exits 0 lies to scripts and CI. Count it as failed.
@@ -478,6 +507,7 @@ async fn run_session_resume(
     provider_name: &str,
     session_id: &str,
     dry_run: bool,
+    started: std::time::Instant,
 ) -> Result<()> {
     if !config::KNOWN_PROVIDERS.contains(&provider_name) {
         bail!(
@@ -615,6 +645,7 @@ async fn run_session_resume(
     }
 
     provider::print_result(&result);
+    println!("\nruntime: {}", format_runtime(started.elapsed()));
 
     if result.output.is_err() {
         std::process::exit(1);
