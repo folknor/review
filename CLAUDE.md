@@ -24,9 +24,7 @@ Do not use your Memory functionality. Update CLAUDE.md instead. This project is 
 - Has `Cargo.lock` changed? Commit it.
 - Never `git push` unless the user explicitly asks. Stop after the commit.
 
-### Subagents
-- Always launch subagents in the foreground (never use `run_in_background: true`) so the user can approve tool requests.
-- Do NOT use worktree isolation for parallel agents. Worktrees create merge conflicts that silently drop agent work. Instead, launch agents in the same tree with strict file ownership - zero overlap.
+### Subagents- Do NOT use worktree isolation for parallel agents. Worktrees create merge conflicts that silently drop agent work. Instead, launch agents in the same tree with strict file ownership - zero overlap.
 
 ## What this project is
 
@@ -104,3 +102,37 @@ sandbox = "workspace-write"
 # Optional: extra codex `-c key=value` overrides, each passed verbatim (codex-only).
 config = ['model_provider="openai-http"']
 ```
+
+## Document folders
+
+The standing layout, across every project. Three live folders plus one retired,
+split by durability first, subject second.
+
+| Folder | Contents | Rule |
+|---|---|---|
+| `reference/` | Durable in-repo reference for anyone working on or with the code - how the thing is built and why: `architecture.md`, `technical-implementation-spec.md`, `performance.md` (the durable record of measured numbers over time), invariants, protocol contracts | Citable from source as a source of truth. What it says must be true. |
+| `docs/` | Durable in-repo documentation of how the thing is used - guides, CLI reference, the consumer-facing API surface. Sometimes exposed as a hand-edited VitePress gh-pages site | Same must-be-true rule. |
+| `notes/` | Transient - work items (`todo.md`), future plans, hypotheticals, bug reports, research, analysis. Things that will die | No truth guarantee. Nothing durable cites it. |
+| `plans/` | Retired | Plan documents are transient: they go in `notes/`. |
+
+`reference/` and `docs/` are both durable and both binding. The difference is
+subject, not audience: `reference/` covers how the thing is built and why - what
+you need in order to change it safely - while `docs/` covers how it is used. A
+developer or library consumer reads both. Where a project publishes a site,
+`docs/` is what gets published; the folder means the same thing either way.
+`notes/` is neither durable nor binding, which is the whole point of keeping it
+separate: a document that may be wrong must not sit where a document that must
+be right is expected.
+
+The dependency direction is therefore one-way. `notes/` may cite `docs/` and
+`reference/`; nothing durable may cite `notes/` - not a code comment, not
+`docs/`, not `reference/`. A code comment must carry its full context, because
+it outlives the note.
+
+**Root-level convention files are exempt.** `AGENTS.md`, `CLAUDE.md`,
+`README.md`, `LICENSE`, `CHANGELOG.md` and their kin are found by tooling and by
+convention at the repository root, and stay there. These folders govern
+documents we chose where to put, not files whose location is dictated.
+
+In `notes/`, `docs/` and `reference/` alike, avoid citing source line numbers -
+they drift fast.
