@@ -249,12 +249,12 @@ pub fn install_signal_supervisor() {
         }
         let pids_to_kill = pids.clone();
         for pid in pids {
-            terminate_group(pid, SIGKILL_ESCALATION);
+            terminate_group(pid, crate::timings::SIGKILL_ESCALATION);
         }
         // Give SIGTERM a brief moment to land before we go; the escalation to
         // SIGKILL inside `terminate_group` dies with us, so this is the only
         // window codex gets to shut down cleanly.
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::time::sleep(crate::timings::SIGTERM_WINDOW).await;
         // SIGKILL the *original* snapshot, deliberately not a fresh read of the
         // registry. If codex exits promptly on SIGTERM its waiter unregisters
         // the group, so a re-read would omit precisely the case that matters: a
@@ -274,11 +274,6 @@ pub fn install_signal_supervisor() {
         std::process::exit(if name == "SIGINT" { 130 } else { 143 });
     });
 }
-
-/// How long a process group gets to honour `SIGTERM` before we escalate to
-/// `SIGKILL`. A codex stuck in an unbounded shutdown await may never process
-/// the first signal.
-const SIGKILL_ESCALATION: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Terminate a codex child *and everything it spawned* by signalling its whole
 /// process group, escalating to `SIGKILL` after a grace period.
@@ -506,8 +501,8 @@ impl Default for CodexRuntime {
         Self {
             binary: "codex".to_string(),
             timings: crate::watchdog::Timings::default(),
-            drain_grace: std::time::Duration::from_secs(5),
-            sigkill_escalation: SIGKILL_ESCALATION,
+            drain_grace: crate::timings::DRAIN_GRACE,
+            sigkill_escalation: crate::timings::SIGKILL_ESCALATION,
             data_root: None,
         }
     }

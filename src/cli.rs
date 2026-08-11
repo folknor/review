@@ -59,7 +59,9 @@ pub struct Cli {
     pub provider: Option<Vec<String>>,
 
     /// Seconds between each provider launch to avoid rate limits (default: 30, 0 to disable)
-    #[arg(long, default_value = "30")]
+    // Default sourced from `timings` so every production timing value has one
+    // home; clap needs a `&'static str`, hence the const rather than the literal.
+    #[arg(long, default_value = crate::timings::STAGGER_SECS_STR)]
     pub stagger: u64,
 }
 

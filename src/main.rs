@@ -9,6 +9,7 @@ mod lock;
 mod prompt;
 mod provider;
 mod sessions;
+mod timings;
 mod transcript;
 mod watchdog;
 
@@ -572,10 +573,9 @@ async fn run_session_resume(
     // `--session` is the *warm* follow-up path, so a cold resume is refused: do
     // a fresh run with restated context instead. When there's no sidecar record
     // we can't determine age, so we proceed rather than block.
-    const STALE_SESSION_SECS: u64 = 55 * 60;
     if let Some(record) = sessions::latest_for_session(session_id) {
         if let Some(age) = sessions::age_secs(&record) {
-            if age > STALE_SESSION_SECS {
+            if age > timings::STALE_SESSION.as_secs() {
                 bail!(
                     "session last touched {} ago - its prompt cache is cold.\n  \
                      Resuming would reprocess the whole session prefix at full cost.\n  \

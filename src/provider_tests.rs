@@ -191,9 +191,11 @@ fn fast_runtime(scratch: &Scratch, binary: String) -> CodexRuntime {
         timings: crate::watchdog::Timings {
             poll_interval: std::time::Duration::from_millis(50),
             quiet_grace: std::time::Duration::from_millis(250),
-            // Comfortably longer than `quiet_grace`, mirroring the production
-            // ordering (3 min vs 15 min): an answered run must reach the
-            // stranded branch well before the stall branch could apply.
+            // Mirrors the production ordering (3 min vs 15 min) for realism.
+            // It is *not* required for correctness: the two verdicts are
+            // mutually exclusive on whether an answer exists, so a shorter
+            // stall grace cannot steal an answered run - see
+            // `an_answered_run_is_stranded_even_with_a_shorter_stall_grace`.
             stall_grace: Some(std::time::Duration::from_millis(600)),
         },
         drain_grace: std::time::Duration::from_millis(300),
@@ -204,8 +206,16 @@ fn fast_runtime(scratch: &Scratch, binary: String) -> CodexRuntime {
     }
 }
 
-/// Run the stub through the real codex path as a fresh (oneshot) run.
+/// Run the stub through the real codex path as a fresh (oneshot) run, with the
+/// default fast timings.
 async fn run_stub(scratch: &Scratch, binary: String) -> Result<RunOutput> {
+    let runtime = fast_runtime(scratch, binary);
+    run_stub_with(scratch, &runtime).await
+}
+
+/// As `run_stub`, but with an explicit runtime - for tests that vary the
+/// timings themselves.
+async fn run_stub_with(scratch: &Scratch, runtime: &CodexRuntime) -> Result<RunOutput> {
     let out_file = new_output_file().expect("create -o file");
     let mut env = BTreeMap::new();
     env.insert(
@@ -224,6 +234,7 @@ async fn run_stub(scratch: &Scratch, binary: String) -> Result<RunOutput> {
             .to_string_lossy()
             .into_owned(),
     );
+    let project = scratch.project();
     run_codex_json(
         vec![
             "exec".to_string(),
@@ -237,9 +248,9 @@ async fn run_stub(scratch: &Scratch, binary: String) -> Result<RunOutput> {
         None,
         Some(&env),
         "review this",
-        &scratch.project(),
+        &project,
         None,
-        &fast_runtime(scratch, binary),
+        runtime,
     )
     .await
 }
@@ -327,6 +338,45 @@ sleep 3600
     );
 }
 
+/// The two verdicts are mutually exclusive on whether an answer exists, so
+/// `stall_grace` shorter than `quiet_grace` is not a misconfiguration: an
+/// answered run matches neither branch until `quiet_grace` and is then
+/// `Stranded`, with its answer recovered. Pinned because the alternative -
+/// the stall branch stealing an answered run and reporting a recovered result
+/// as a failure - is silent and plausible-looking, the worst kind of wrong.
+#[tokio::test]
+async fn an_answered_run_is_stranded_even_with_a_shorter_stall_grace() {
+    let scratch = Scratch::new();
+    let stub = scratch.write_stub(&format!(
+        r#"{preamble}
+printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"ANSWER","phase":"final_answer"}}}}' >> "$ROLL"
+sleep 3600
+"#,
+        preamble = stub_preamble()
+    ));
+
+    let mut runtime = fast_runtime(&scratch, stub);
+    // Inverted relative to production: the stall grace elapses first.
+    runtime.timings.quiet_grace = std::time::Duration::from_millis(500);
+    runtime.timings.stall_grace = Some(std::time::Duration::from_millis(100));
+
+    let run = run_stub_with(&scratch, &runtime)
+        .await
+        .expect("run completes");
+
+    let digest = run.digest.expect("digest");
+    let why = digest.terminated_by_review.unwrap_or_default();
+    assert!(
+        why.contains("stranded"),
+        "an answered run must be stranded, not stalled; got {why:?}"
+    );
+    assert!(
+        !why.contains("stall timeout"),
+        "the stall branch must not claim a run that produced an answer"
+    );
+    assert_eq!(run.text, "ANSWER", "the answer must still be recovered");
+}
+
 /// 2. Mid-turn wedge: codex goes silent having written only interim commentary,
 ///    never a final answer. The stall timeout must kill it, leave an incident
 ///    bundle, record the silence duration and last event, and - critically -
@@ -405,36 +455,13 @@ sleep 3600
     let mut runtime = fast_runtime(&scratch, stub);
     runtime.timings.stall_grace = None;
 
-    let out_file = new_output_file().expect("create -o file");
-    let mut env = BTreeMap::new();
-    env.insert(
-        "CODEX_HOME".to_string(),
-        scratch.codex_home().to_string_lossy().into_owned(),
-    );
-    env.insert("LAST_MSG".to_string(), out_file.clone());
-    env.insert(
-        "LINGER_PID".to_string(),
-        scratch
-            .root
-            .join("linger.pid")
-            .to_string_lossy()
-            .into_owned(),
-    );
-    let project = scratch.project();
-    let run = run_codex_json(
-        vec!["exec".to_string(), "--json".to_string()],
-        &out_file,
-        None,
-        Some(&env),
-        "review this",
-        &project,
-        None,
-        &runtime,
-    );
-
     // Give the poller many times the stall grace it *would* have used. The run
     // must still be going: with the branch disabled, nothing can end it.
-    let outcome = tokio::time::timeout(std::time::Duration::from_millis(2_000), run).await;
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(2_000),
+        run_stub_with(&scratch, &runtime),
+    )
+    .await;
     assert!(
         outcome.is_err(),
         "with the stall timeout disabled, a wedged run must not be killed"

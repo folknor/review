@@ -96,9 +96,9 @@ pub struct Timings {
 impl Default for Timings {
     fn default() -> Self {
         Self {
-            poll_interval: Duration::from_secs(15),
-            quiet_grace: Duration::from_secs(180),
-            stall_grace: Some(Duration::from_secs(900)),
+            poll_interval: crate::timings::POLL_INTERVAL,
+            quiet_grace: crate::timings::QUIET_GRACE,
+            stall_grace: Some(crate::timings::STALL_GRACE),
         }
     }
 }
