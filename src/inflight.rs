@@ -55,6 +55,27 @@ fn dir() -> Option<PathBuf> {
     Some(data_dir.join("review").join("inflight"))
 }
 
+/// Is `id` safe to use as a filename component?
+///
+/// The session id reaches here straight from `--session <id>` on the command
+/// line, and `review` deliberately delegates session-id validation to the
+/// provider - so by the time we see it, it is arbitrary operator input. Using it
+/// unchecked as a path component let `--session ../foo` escape the marker
+/// directory and write (and then, via `Guard::drop`, *delete*) a file elsewhere
+/// under the data dir.
+///
+/// Provider session ids are UUIDs, so an allowlist of hex, dashes and
+/// underscores is comfortably permissive while excluding `/`, `.` and anything
+/// else that could traverse. An allowlist rather than a "reject `..`" denylist
+/// because only the former is safe by construction.
+fn is_safe_filename_component(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// Is `pid` a live process? Signal 0 performs permission and existence checks
 /// without delivering anything. `ESRCH` means gone; `EPERM` means it exists but
 /// belongs to someone else, which still counts as alive.
@@ -85,6 +106,14 @@ impl Drop for Guard {
 /// silently degrades to the old no-visibility behaviour instead of failing the
 /// run.
 pub fn mark(session_id: &str, provider: &str, project: &str) -> Guard {
+    // Refuse to build a path out of anything that is not plainly a session id.
+    // Skipping the marker only costs liveness reporting for that run; letting it
+    // through would let a crafted `--session` write and delete an arbitrary
+    // file.
+    if !is_safe_filename_component(session_id) {
+        eprintln!("warning: session id is not a safe filename; skipping in-flight marker");
+        return Guard(None);
+    }
     let Some(dir) = dir() else {
         return Guard(None);
     };
@@ -92,7 +121,7 @@ pub fn mark(session_id: &str, provider: &str, project: &str) -> Guard {
         eprintln!("warning: failed to create inflight dir: {e}");
         return Guard(None);
     }
-    // The session id is a UUID, so it is safe as a filename and unique per run.
+    // Validated above as a bare filename component, so this cannot escape `dir`.
     let path = dir.join(format!("{session_id}.json"));
     let marker = Marker {
         session_id: session_id.to_string(),
@@ -141,4 +170,35 @@ pub fn read_live() -> Vec<Marker> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_provider_session_ids() {
+        assert!(is_safe_filename_component(
+            "019fefb0-227c-7c83-a398-380011b8e66a"
+        ));
+        assert!(is_safe_filename_component("abc_123-DEF"));
+    }
+
+    #[test]
+    fn rejects_path_traversal() {
+        // `--session ../sessions` would otherwise write and then delete a file
+        // outside the marker directory.
+        assert!(!is_safe_filename_component("../sessions"));
+        assert!(!is_safe_filename_component("../../etc/passwd"));
+        assert!(!is_safe_filename_component("a/b"));
+        assert!(!is_safe_filename_component("."));
+        assert!(!is_safe_filename_component(".."));
+        assert!(!is_safe_filename_component("with.dot"));
+        assert!(!is_safe_filename_component(""));
+    }
+
+    #[test]
+    fn rejects_absurdly_long_ids() {
+        assert!(!is_safe_filename_component(&"a".repeat(129)));
+    }
 }

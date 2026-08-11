@@ -72,8 +72,16 @@ pub struct Stranded {
     pub reason: String,
 }
 
-/// Does the rollout contain a real final answer for the turn that started at or
-/// after `since`?
+/// Does the region of the rollout written by *this* run contain a real final
+/// answer?
+///
+/// `bytes` must already be sliced to start at the run's baseline offset (see
+/// `scan_from_baseline`), which is how "this run" is delimited. A byte offset is
+/// used rather than a timestamp comparison because rollout events carry
+/// millisecond stamps while our own clock string is second-resolution: a turn
+/// that completed within the same second as this run's launch would slip past a
+/// time-based filter, and its stale answer would then license killing a resume
+/// that had produced nothing.
 ///
 /// Deliberately *not* `transcript::parse`: that function answers "what is the
 /// state of the current turn", resetting at every `task_started`. Here the
@@ -86,7 +94,10 @@ pub struct Stranded {
 /// Requires the answer to be phase-tagged `final_answer`; codex tags interim
 /// progress notes `commentary`, and killing a live run on the strength of an
 /// "I am now doing X" note would be exactly wrong.
-fn has_final_answer(content: &str, since: &str) -> bool {
+fn has_final_answer(bytes: &[u8]) -> bool {
+    // Lossy is safe here: a baseline that lands mid-line leaves one unparseable
+    // fragment, which is skipped like any other malformed line.
+    let content = String::from_utf8_lossy(bytes);
     for line in content.lines() {
         if line.trim().is_empty() {
             continue;
@@ -94,13 +105,6 @@ fn has_final_answer(content: &str, since: &str) -> bool {
         let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        // Events older than this run belong to a previous turn in the same
-        // rollout (a resume appends to it) and must never count.
-        if let Some(ts) = event.get("timestamp").and_then(|t| t.as_str())
-            && ts.get(..19).unwrap_or(ts) < since.get(..19).unwrap_or(since)
-        {
-            continue;
-        }
         let payload = event.get("payload");
         if payload.and_then(|p| p.get("type")).and_then(|t| t.as_str()) != Some("agent_message") {
             continue;
@@ -116,6 +120,13 @@ fn has_final_answer(content: &str, since: &str) -> bool {
     false
 }
 
+/// Slice a rollout's raw bytes to the region this run appended. Shares
+/// `transcript`'s helper so the watchdog and transcript recovery can never
+/// disagree about where a run's events begin.
+fn scan_from_baseline(bytes: &[u8], baseline: u64) -> &[u8] {
+    crate::transcript::slice_from_offset(bytes, Some(baseline))
+}
+
 /// Watch `session_id`'s rollout until it looks stranded, then resolve.
 ///
 /// Resolves *only* on the stranded verdict - on any other condition (no session
@@ -125,13 +136,21 @@ fn has_final_answer(content: &str, since: &str) -> bool {
 ///
 /// `session_rx` is a watch channel because a fresh run does not know its session
 /// id until `thread.started` arrives on the NDJSON stream; on a resume it is
-/// populated from the start. `since` is the run's spawn timestamp, used to scope
-/// the answer scan to this run's turn.
+/// populated from the start. `baseline` is the rollout's size at spawn, which
+/// scopes the answer scan to this run's own events.
 pub async fn wait_for_stranded_completion(
     mut session_rx: tokio::sync::watch::Receiver<Option<String>>,
     codex_home: Option<String>,
-    since: String,
+    baseline: Option<u64>,
 ) -> Stranded {
+    // No trustworthy baseline means we cannot tell this run's events from an
+    // earlier turn's, so we cannot safely judge anything: never fire. Scanning
+    // the whole history instead would let a previous turn's `final_answer`
+    // authorise killing a run that has produced nothing.
+    let baseline: u64 = match baseline {
+        Some(b) => b,
+        None => std::future::pending().await,
+    };
     // Fingerprint of the rollout at the last observed change, plus when that
     // change was seen. Length alone is enough: the rollout is append-only.
     let mut last_len: u64 = 0;
@@ -169,10 +188,10 @@ pub async fn wait_for_stranded_completion(
         if last_change.elapsed() < QUIET_GRACE {
             continue;
         }
-        let Ok(content) = tokio::fs::read_to_string(&path).await else {
+        let Ok(bytes) = tokio::fs::read(&path).await else {
             continue;
         };
-        if !has_final_answer(&content, &since) {
+        if !has_final_answer(scan_from_baseline(&bytes, baseline)) {
             // Quiet, but with nothing to show for it. That is the mid-turn
             // wedge (or a legitimately long-thinking model), and we refuse to
             // guess: killing here could discard real in-progress work. Keep
@@ -202,48 +221,76 @@ pub async fn wait_for_stranded_completion(
 mod tests {
     use super::*;
 
-    const SINCE: &str = "2026-08-11T07:00:00Z";
+    const TASK_STARTED: &str = r#"{"timestamp":"2026-08-11T07:25:08.000Z","type":"event_msg","payload":{"type":"task_started"}}"#;
+    const FINAL_ANSWER: &str = r#"{"timestamp":"2026-08-11T07:42:20.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}"#;
+    const COMMENTARY: &str = r#"{"timestamp":"2026-08-11T07:30:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"I am now regenerating the pilot.","phase":"commentary"}}"#;
+
+    fn scan(rollout: &str, baseline: u64) -> bool {
+        has_final_answer(scan_from_baseline(rollout.as_bytes(), baseline))
+    }
 
     #[test]
     fn detects_a_final_answer_from_this_run() {
-        let rollout = concat!(
-            r#"{"timestamp":"2026-08-11T07:25:08.000Z","type":"event_msg","payload":{"type":"task_started"}}"#,
-            "\n",
-            r#"{"timestamp":"2026-08-11T07:42:20.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}"#,
-        );
-        assert!(has_final_answer(rollout, SINCE));
+        let rollout = format!("{TASK_STARTED}\n{FINAL_ANSWER}\n");
+        assert!(scan(&rollout, 0));
     }
 
     #[test]
     fn commentary_alone_is_not_an_answer() {
         // The mid-turn wedge case: interim notes only. Killing here would throw
         // away a run that never reported.
-        let rollout = concat!(
-            r#"{"timestamp":"2026-08-11T07:25:08.000Z","type":"event_msg","payload":{"type":"task_started"}}"#,
-            "\n",
-            r#"{"timestamp":"2026-08-11T07:30:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"I am now regenerating the pilot.","phase":"commentary"}}"#,
-        );
-        assert!(!has_final_answer(rollout, SINCE));
+        let rollout = format!("{TASK_STARTED}\n{COMMENTARY}\n");
+        assert!(!scan(&rollout, 0));
     }
 
     #[test]
     fn a_previous_turns_answer_does_not_count() {
         // A resume appends to the same rollout. The prior turn's answer must not
         // make us kill a resume that has produced nothing yet.
-        let rollout = concat!(
-            r#"{"timestamp":"2026-08-11T06:10:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Old answer.","phase":"final_answer"}}"#,
-            "\n",
-            r#"{"timestamp":"2026-08-11T07:25:08.000Z","type":"event_msg","payload":{"type":"task_started"}}"#,
-        );
-        assert!(!has_final_answer(rollout, SINCE));
+        let prior = format!("{TASK_STARTED}\n{FINAL_ANSWER}\n");
+        let baseline = u64::try_from(prior.len()).expect("test fixture fits in u64");
+        let rollout = format!("{prior}{TASK_STARTED}\n{COMMENTARY}\n");
+        assert!(!scan(&rollout, baseline));
+        // Sanity: without the baseline the stale answer would have counted,
+        // which is exactly the misfire the offset prevents.
+        assert!(scan(&rollout, 0));
+    }
+
+    // The offset is immune to clock resolution: an earlier turn that completed
+    // in the *same second* as this run's launch is still excluded, where a
+    // second-truncated timestamp comparison would have let it through and
+    // licensed killing a resume that had produced nothing.
+    #[test]
+    fn a_prior_answer_in_the_same_second_does_not_count() {
+        let same_second_answer = r#"{"timestamp":"2026-08-11T07:25:08.100Z","type":"event_msg","payload":{"type":"agent_message","message":"Old answer.","phase":"final_answer"}}"#;
+        let prior = format!("{same_second_answer}\n");
+        let baseline = u64::try_from(prior.len()).expect("test fixture fits in u64");
+        let launched_same_second = r#"{"timestamp":"2026-08-11T07:25:08.900Z","type":"event_msg","payload":{"type":"task_started"}}"#;
+        let rollout = format!("{prior}{launched_same_second}\n");
+        assert!(!scan(&rollout, baseline));
     }
 
     #[test]
     fn malformed_lines_are_skipped() {
-        let rollout = concat!(
-            "not json at all\n",
-            r#"{"timestamp":"2026-08-11T07:42:20.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}"#,
-        );
-        assert!(has_final_answer(rollout, SINCE));
+        let rollout = format!("not json at all\n{FINAL_ANSWER}\n");
+        assert!(scan(&rollout, 0));
+    }
+
+    // A baseline landing mid-line leaves an unparseable fragment, which must be
+    // skipped without hiding the answer that follows it.
+    #[test]
+    fn a_baseline_inside_a_line_skips_only_that_fragment() {
+        let rollout = format!("{TASK_STARTED}\n{FINAL_ANSWER}\n");
+        let baseline = u64::try_from(TASK_STARTED.len() / 2).expect("fits");
+        assert!(scan(&rollout, baseline));
+    }
+
+    // A rollout shorter than the baseline was rotated or replaced; scanning it
+    // whole could read another run's turn, so it must yield nothing.
+    #[test]
+    fn a_truncated_rollout_yields_nothing() {
+        let rollout = format!("{FINAL_ANSWER}\n");
+        let baseline = u64::try_from(rollout.len() + 1000).expect("fits");
+        assert!(!scan(&rollout, baseline));
     }
 }

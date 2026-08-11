@@ -358,6 +358,9 @@ async fn main() -> Result<()> {
                         &prompt,
                         &root,
                         true,
+                        // The fan-out path serializes launches with its own
+                        // stagger sleep, so it needs no launch handshake.
+                        None,
                     )
                     .await;
                     // The "work around" for codex mid-turn deaths: a run that
@@ -382,6 +385,8 @@ async fn main() -> Result<()> {
                             RESUME_NUDGE,
                             &root,
                             false,
+                            // Auto-resume runs inside an already-launched task.
+                            None,
                         )
                         .await;
                         if got_final_answer(&second) {
@@ -582,14 +587,17 @@ async fn run_session_resume(
     // host indefinitely - every later invocation sat printing "Waiting for
     // another review to finish..." behind a process that would never return.
     // A hung run should cost you that run, not the tool.
-    {
-        let lock_path = std::env::temp_dir().join("review.lock");
-        let lock_file = lock::open_lock_file(&lock_path)?;
-        lock::acquire_blocking(&lock_file)?;
-        drop(lock_file);
-    }
+    //
+    // It *is* held across the spawn, via the launch handshake: releasing it
+    // before calling `invoke` would leave a critical section guarding nothing,
+    // letting every queued resume through to spawn simultaneously - the rate
+    // limiting the lock exists to provide.
+    let lock_path = std::env::temp_dir().join("review.lock");
+    let lock_file = lock::open_lock_file(&lock_path)?;
+    lock::acquire_blocking(&lock_file)?;
 
-    let result = provider::invoke(
+    let (launched_tx, launched_rx) = tokio::sync::oneshot::channel();
+    let invoke = provider::invoke(
         provider_name,
         session_id,
         None,
@@ -600,8 +608,24 @@ async fn run_session_resume(
         &stdin_instructions,
         &project_root,
         false,
-    )
-    .await;
+        Some(launched_tx),
+    );
+    tokio::pin!(invoke);
+
+    // Release the lock as soon as the process is spawned. `launched_rx` also
+    // resolves (as an error) if the sender is dropped without sending, i.e. the
+    // spawn failed - which is equally a reason to stop holding the lock. The
+    // `invoke` arm covers a provider that returns before signalling at all.
+    let result = tokio::select! {
+        result = &mut invoke => {
+            drop(lock_file);
+            result
+        }
+        _ = launched_rx => {
+            drop(lock_file);
+            invoke.await
+        }
+    };
 
     // Resolve audit_id/private for the logs. Load config opportunistically (and
     // persist a generated id when a config exists), but fall back so logging

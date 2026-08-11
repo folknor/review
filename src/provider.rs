@@ -43,28 +43,70 @@ fn new_output_file() -> Result<String> {
 const STDOUT_CAPTURE_CAP: usize = 64 << 20; // 64 MiB
 const STDERR_CAPTURE_CAP: usize = 8 << 20; // 8 MiB
 
-/// Read `r` to EOF, buffering at most `cap` bytes but continuing to drain the
-/// rest (so the child never blocks on a full pipe). Returns the buffered prefix.
-async fn read_capped<R>(mut r: R, cap: usize) -> Vec<u8>
+/// Buffer shared between a reader task and the runner.
+///
+/// The reader appends as bytes arrive rather than returning at EOF, so the
+/// runner can take whatever has been captured *so far* even if the reader never
+/// finishes. That matters because the drain grace can expire with real output
+/// already in hand - the NDJSON stream, and with it the log lines and the
+/// forensic `stdout.jsonl` - and throwing it away would blind exactly the
+/// failure this code exists to diagnose.
+type SharedBuf = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+fn new_shared_buf() -> SharedBuf {
+    std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
+/// Append `chunk` to a shared buffer, respecting `cap`. The lock is taken and
+/// released inside this call and never held across an await.
+fn push_capped(buf: &SharedBuf, chunk: &[u8], cap: usize) {
+    if let Ok(mut guard) = buf.lock()
+        && guard.len() < cap
+    {
+        let take = (cap - guard.len()).min(chunk.len());
+        guard.extend_from_slice(&chunk[..take]);
+    }
+}
+
+/// Read `r` to EOF into `out`, buffering at most `cap` bytes but continuing to
+/// drain the rest (so the child never blocks on a full pipe).
+async fn read_capped<R>(mut r: R, cap: usize, out: SharedBuf)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
-    let mut buf = Vec::new();
     let mut chunk = [0u8; 16384];
     loop {
         match r.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if buf.len() < cap {
-                    let take = (cap - buf.len()).min(n);
-                    buf.extend_from_slice(&chunk[..take]);
-                }
-                // Past the cap: keep reading (drain) but stop buffering.
-            }
+            Ok(n) => push_capped(&out, &chunk[..n], cap),
         }
     }
-    buf
+}
+
+/// Take a reader's output once the child is reaped, without waiting on it
+/// forever.
+///
+/// Pipe EOF needs *every* holder of the write end to close it, so a reader can
+/// outlive the child. We give it `grace` to finish, then abort it - an aborted
+/// task stops reading, whereas simply dropping the `JoinHandle` would detach it
+/// and leave it running - and take whatever it has buffered either way.
+async fn collect_reader(
+    mut handle: tokio::task::JoinHandle<()>,
+    buf: &SharedBuf,
+    grace: std::time::Duration,
+    what: &str,
+) -> Vec<u8> {
+    if tokio::time::timeout(grace, &mut handle).await.is_err() {
+        handle.abort();
+        eprintln!(
+            "warning: codex {what} was still open {}s after the process was reaped \
+             (something inherited the pipe); using the {} bytes captured so far",
+            grace.as_secs(),
+            buf.lock().map(|b| b.len()).unwrap_or(0)
+        );
+    }
+    buf.lock().map(|b| b.clone()).unwrap_or_default()
 }
 
 /// Read codex's stdout to EOF exactly like `read_capped`, but additionally scan
@@ -77,17 +119,21 @@ where
 /// stream had hit EOF, which is precisely the thing that never happens on a
 /// wedged run. Scanning stops as soon as the id is found, so the steady-state
 /// cost is the same byte-copy loop as before.
+///
+/// The published id also survives a reader that never reaches EOF: it goes out
+/// on the watch channel as soon as it is seen, so a truncated `stdout_buf` can
+/// no longer cost us the session id (and with it the transcript, the recovery
+/// path and the sidecar row).
 async fn read_capped_stdout<R>(
     mut r: R,
     cap: usize,
+    out: SharedBuf,
     sid_tx: tokio::sync::watch::Sender<Option<String>>,
     mut scanning: bool,
-) -> Vec<u8>
-where
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
-    let mut buf = Vec::new();
     let mut chunk = [0u8; 16384];
     // Carry for a line split across two reads; only maintained while scanning.
     let mut partial: Vec<u8> = Vec::new();
@@ -117,15 +163,12 @@ where
                         partial.clear();
                     }
                 }
-                if buf.len() < cap {
-                    let take = (cap - buf.len()).min(n);
-                    buf.extend_from_slice(&chunk[..take]);
-                }
-                // Past the cap: keep reading (drain) but stop buffering.
+                // Past the cap this keeps draining but stops buffering, so the
+                // child never blocks on a full pipe.
+                push_capped(&out, &chunk[..n], cap);
             }
         }
     }
-    buf
 }
 
 /// Process groups of codex children currently running under this `review`.
@@ -200,6 +243,7 @@ pub fn install_signal_supervisor() {
                 pids.len()
             );
         }
+        let pids_to_kill = pids.clone();
         for pid in pids {
             terminate_group(pid);
         }
@@ -207,12 +251,13 @@ pub fn install_signal_supervisor() {
         // SIGKILL inside `terminate_group` dies with us, so this is the only
         // window codex gets to shut down cleanly.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        for pid in CODEX_GROUPS
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|s| s.iter().copied().collect::<Vec<_>>()))
-            .unwrap_or_default()
-        {
+        // SIGKILL the *original* snapshot, deliberately not a fresh read of the
+        // registry. If codex exits promptly on SIGTERM its waiter unregisters
+        // the group, so a re-read would omit precisely the case that matters: a
+        // descendant that ignored SIGTERM and is still alive in that group.
+        // `process::exit` below cancels `terminate_group`'s deferred escalation,
+        // making this the last chance to reap them.
+        for pid in pids_to_kill {
             if let Ok(pid) = i32::try_from(pid) {
                 // SAFETY: negative pid addresses the process group; codex was
                 // spawned with `process_group(0)` so this cannot reach `review`.
@@ -397,6 +442,15 @@ struct RunOutput {
     digest: Option<Digest>,
 }
 
+/// Signals the caller that the provider process has actually been spawned.
+///
+/// The global lock exists to space out provider *launches*, so it has to be held
+/// until the spawn has happened - releasing it beforehand leaves a critical
+/// section that protects nothing, and lets every queued invocation through to
+/// launch simultaneously. Sending on this (or dropping it, on a failed spawn)
+/// is what tells the caller it is safe to release.
+pub type LaunchSignal = tokio::sync::oneshot::Sender<()>;
+
 #[allow(clippy::too_many_arguments)]
 pub async fn invoke(
     provider: &str,
@@ -409,6 +463,7 @@ pub async fn invoke(
     prompt: &str,
     project_root: &Path,
     oneshot: bool,
+    launched: Option<LaunchSignal>,
 ) -> ProviderResult {
     let result = match provider {
         // `sandbox` is a codex-only concept (an OS filesystem sandbox). Claude's
@@ -424,6 +479,7 @@ pub async fn invoke(
                 prompt,
                 project_root,
                 oneshot,
+                launched,
             )
             .await
         }
@@ -438,6 +494,7 @@ pub async fn invoke(
                 prompt,
                 project_root,
                 oneshot,
+                launched,
             )
             .await
         }
@@ -518,6 +575,7 @@ async fn run_claude(
     prompt: &str,
     project_root: &Path,
     oneshot: bool,
+    launched: Option<LaunchSignal>,
 ) -> Result<RunOutput> {
     // In oneshot mode, generate a UUID up front and pass it via --session-id
     // so the fresh session is persistable and the operator can follow up via
@@ -569,6 +627,11 @@ async fn run_claude(
         cmd.envs(vars);
     }
     let child = cmd.spawn().context("failed to spawn claude")?;
+    // Launch has happened: the caller may release the global lock. Dropping the
+    // sender instead (on the `?` above) tells it the same thing.
+    if let Some(signal) = launched {
+        let _ = signal.send(());
+    }
 
     let text = run_with_stdout(child, prompt, "claude").await?;
     Ok(RunOutput {
@@ -589,6 +652,7 @@ async fn run_codex(
     prompt: &str,
     project_root: &Path,
     oneshot: bool,
+    launched: Option<LaunchSignal>,
 ) -> Result<RunOutput> {
     let last_msg_path = new_output_file()?;
 
@@ -637,6 +701,7 @@ async fn run_codex(
         env,
         prompt,
         project_root,
+        launched,
     )
     .await
 }
@@ -654,6 +719,7 @@ async fn run_codex_json(
     env: Option<&std::collections::BTreeMap<String, String>>,
     prompt: &str,
     project_root: &Path,
+    launched: Option<LaunchSignal>,
 ) -> Result<RunOutput> {
     let mut cmd = Command::new("codex");
     cmd.args(&args)
@@ -680,12 +746,52 @@ async fn run_codex_json(
     if let Some(vars) = env {
         cmd.envs(vars);
     }
+    // Size of the rollout transcript *before* this run appends to it. A resume
+    // writes into the same file as every earlier turn, so the watchdog needs to
+    // know where this run's events begin - otherwise a previous turn's
+    // `final_answer` would look like proof that this run had finished, and a
+    // quiet mid-turn wedge would be killed as a "stranded completion".
+    //
+    // A byte offset rather than a timestamp on purpose: rollout timestamps carry
+    // milliseconds but our own clock string is second-resolution, so a turn that
+    // completed in the same second as this run's launch would slip through a
+    // time-based filter. The offset has no such race - it is exact. Zero for a
+    // fresh run, whose rollout does not exist yet.
+    // `None` means "no trustworthy baseline", which disables both the watchdog
+    // and transcript recovery for this run. It is emphatically not the same as
+    // `Some(0)`: falling back to zero for a *resume* whose rollout could not be
+    // read would scope the scan to the entire session history, and an old
+    // `final_answer` from a previous turn could then authorise killing a genuine
+    // mid-turn wedge, or be recovered as this run's answer.
+    let codex_home_for_baseline = env.and_then(|e| e.get("CODEX_HOME")).map(String::as_str);
+    let rollout_baseline: Option<u64> = match known_session_id.as_deref() {
+        // Fresh run: a new session id, so its rollout does not exist yet and
+        // every byte in it will be ours. Zero is exact here, not a fallback.
+        None => Some(0),
+        // Resume: the rollout already holds earlier turns, so we must know
+        // exactly where they end. If we cannot stat it, we do not guess.
+        Some(sid) => crate::transcript::find_transcript_path(sid, codex_home_for_baseline)
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len()),
+    };
+    if rollout_baseline.is_none() {
+        eprintln!(
+            "warning: could not read the rollout for session {} before launch; \
+             completion watchdog and transcript recovery are disabled for this run",
+            known_session_id.as_deref().unwrap_or("?")
+        );
+    }
+
     let start = std::time::Instant::now();
-    // Wall-clock at spawn, used to gate transcript recovery to this run's turn:
-    // any final_answer in the rollout stamped before now belongs to an earlier
-    // turn (a resume appends to the same file) and must not be recovered.
-    let started_at = crate::audit::chrono_utc(now_epoch_secs());
+    // (Gating transcript recovery to this run's turn is done by byte offset -
+    // `rollout_baseline` above - not by a wall-clock stamp, which was too coarse
+    // to separate a resume from an answer written in the same second.)
     let mut child = cmd.spawn().context("failed to spawn codex")?;
+    // Launch has happened: the caller may release the global lock. Dropping the
+    // sender instead (on the `?` above) tells it the same thing.
+    if let Some(signal) = launched {
+        let _ = signal.send(());
+    }
     // Clean up the `-o` temp file on every exit path - spawn succeeded so it
     // exists, and an error before the read below would otherwise leak it.
     let _output_cleanup = RemoveOnDrop(last_msg_path.to_string());
@@ -699,6 +805,9 @@ async fn run_codex_json(
     // needs it to find the rollout transcript.
     let (sid_tx, sid_rx) = tokio::sync::watch::channel(known_session_id.clone());
     let scanning_for_session_id = known_session_id.is_none();
+    // Kept for after the wait, so the id survives a stdout reader that never
+    // reached EOF (see where `session_id` is resolved).
+    let sid_rx_final = sid_rx.clone();
 
     // Mark the run as in flight so `review sessions` can report "turn in flight
     // since <time>" instead of showing the *previous* turn's response while this
@@ -736,13 +845,20 @@ async fn run_codex_json(
     // These are spawned rather than joined inline because the wait below has to
     // be interruptible, and because pipe EOF is *not* a reliable completion
     // signal - see the reaping comment further down.
+    let stdout_shared = new_shared_buf();
+    let stderr_shared = new_shared_buf();
     let stdout_task = tokio::spawn(read_capped_stdout(
         stdout_pipe,
         STDOUT_CAPTURE_CAP,
+        std::sync::Arc::clone(&stdout_shared),
         sid_tx,
         scanning_for_session_id,
     ));
-    let stderr_task = tokio::spawn(read_capped(stderr_pipe, STDERR_CAPTURE_CAP));
+    let stderr_task = tokio::spawn(read_capped(
+        stderr_pipe,
+        STDERR_CAPTURE_CAP,
+        std::sync::Arc::clone(&stderr_shared),
+    ));
     let write_task = tokio::spawn(write_stdin(stdin, prompt.as_bytes().to_vec()));
 
     let child_pid = child.id();
@@ -771,7 +887,7 @@ async fn run_codex_json(
         let watchdog = crate::watchdog::wait_for_stranded_completion(
             sid_rx,
             env.and_then(|e| e.get("CODEX_HOME")).cloned(),
-            started_at.clone(),
+            rollout_baseline,
         );
         tokio::pin!(watchdog);
         loop {
@@ -801,6 +917,7 @@ async fn run_codex_json(
     if let Some(pid) = child_pid {
         unregister_group(pid);
     }
+    let watched_session_id = sid_rx_final.borrow().clone();
     let status = status.context("failed to wait for codex")?;
 
     // The child is reaped, so the run is over regardless of what the pipes do.
@@ -814,14 +931,8 @@ async fn run_codex_json(
     // children null/piped stdio - so this is defence in depth rather than a
     // known live path.)
     const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-    let stdout_buf = match tokio::time::timeout(DRAIN_GRACE, stdout_task).await {
-        Ok(Ok(buf)) => buf,
-        Ok(Err(_)) | Err(_) => Vec::new(),
-    };
-    let stderr_buf = match tokio::time::timeout(DRAIN_GRACE, stderr_task).await {
-        Ok(Ok(buf)) => buf,
-        Ok(Err(_)) | Err(_) => Vec::new(),
-    };
+    let stdout_buf = collect_reader(stdout_task, &stdout_shared, DRAIN_GRACE, "stdout").await;
+    let stderr_buf = collect_reader(stderr_task, &stderr_shared, DRAIN_GRACE, "stderr").await;
     let write_res = match write_task.await {
         Ok(r) => r,
         Err(e) => Err(anyhow::anyhow!("stdin write task panicked: {e}")),
@@ -904,8 +1015,14 @@ async fn run_codex_json(
     let captured = final_from_file.is_some();
 
     // On resume we already know the session id; on a fresh run it comes from
-    // the stream.
-    let session_id = known_session_id.or(parsed_session_id);
+    // the stream. `watched_session_id` is the same id as published live by the
+    // stdout reader, and is the fallback for when that reader was aborted before
+    // EOF: `parsed_session_id` comes from re-parsing `stdout_buf`, which a
+    // truncated capture can leave without the `thread.started` line. Losing the
+    // id would cost us the transcript, the recovery path and the sidecar row.
+    let session_id = known_session_id
+        .or(parsed_session_id)
+        .or(watched_session_id);
 
     let exit_code = status.code();
     let signal = signal_name(&status);
@@ -917,10 +1034,20 @@ async fn run_codex_json(
     // stream and the `-o` file, so the rollout is the authoritative record.
     let suspicious = !captured || exit_code != Some(0) || signal.is_some();
     let codex_home = env.and_then(|e| e.get("CODEX_HOME")).map(String::as_str);
+    // An untrustworthy baseline must not degrade to "scan everything": scope to
+    // a point past the end of the file so nothing is attributed to this run.
+    // `u64::MAX` is exact for that purpose - `slice_from_offset` yields an empty
+    // slice for any offset beyond the file.
+    let recovery_scope = Some(rollout_baseline.unwrap_or(u64::MAX));
     let transcript = if suspicious {
-        session_id.as_deref().and_then(|sid| {
-            crate::transcript::summarize_session(sid, codex_home, Some(&started_at))
-        })
+        // Scoped to the bytes this run appended (see `rollout_baseline`), so a
+        // previous turn's `final_answer` can never be recovered as ours. When
+        // the baseline is untrustworthy this yields nothing rather than the
+        // whole history, which is the safe direction: no recovery beats a wrong
+        // answer that also suppresses auto-resume.
+        session_id
+            .as_deref()
+            .and_then(|sid| crate::transcript::summarize_session(sid, codex_home, recovery_scope))
     } else {
         None
     };
