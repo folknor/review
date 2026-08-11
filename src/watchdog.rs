@@ -55,16 +55,28 @@
 
 use std::time::{Duration, Instant};
 
-/// How often to stat/read the rollout. Cheap (a stat, plus a read only when the
-/// file grew), and slow enough to be invisible next to a multi-minute turn.
-const POLL_INTERVAL: Duration = Duration::from_secs(15);
+/// Polling and patience settings, injectable so tests can drive the whole
+/// watchdog in milliseconds instead of minutes.
+#[derive(Clone, Copy)]
+pub struct Timings {
+    /// How often to stat/read the rollout. Cheap (a stat, plus a read only when
+    /// the file grew), and slow enough to be invisible next to a long turn.
+    pub poll_interval: Duration,
+    /// How long the rollout must stay byte-for-byte unchanged, *after* a final
+    /// answer exists, before we call it stranded. The cost of firing early is
+    /// killing a run that was about to continue; the cost of firing late is a
+    /// few idle minutes.
+    pub quiet_grace: Duration,
+}
 
-/// How long the rollout must stay byte-for-byte unchanged, *after* a final
-/// answer exists, before we call it stranded. Generous on purpose: codex writes
-/// token_count events throughout a turn, so a genuinely-working run touches the
-/// file far more often than this. The cost of firing early is killing a run
-/// that was about to continue; the cost of firing late is a few idle minutes.
-const QUIET_GRACE: Duration = Duration::from_secs(180);
+impl Default for Timings {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(15),
+            quiet_grace: Duration::from_secs(180),
+        }
+    }
+}
 
 /// Verdict handed back to the runner when the watchdog fires.
 pub struct Stranded {
@@ -142,6 +154,7 @@ pub async fn wait_for_stranded_completion(
     mut session_rx: tokio::sync::watch::Receiver<Option<String>>,
     codex_home: Option<String>,
     baseline: Option<u64>,
+    timings: Timings,
 ) -> Stranded {
     // No trustworthy baseline means we cannot tell this run's events from an
     // earlier turn's, so we cannot safely judge anything: never fire. Scanning
@@ -157,7 +170,7 @@ pub async fn wait_for_stranded_completion(
     let mut last_change = Instant::now();
 
     loop {
-        tokio::time::sleep(POLL_INTERVAL).await;
+        tokio::time::sleep(timings.poll_interval).await;
 
         // Still waiting to learn which session this is (fresh run, pre-
         // `thread.started`). Nothing to watch yet.
@@ -185,7 +198,7 @@ pub async fn wait_for_stranded_completion(
 
         // The file has not grown since the previous poll. Only now is it worth
         // reading and parsing - a working run never reaches this branch.
-        if last_change.elapsed() < QUIET_GRACE {
+        if last_change.elapsed() < timings.quiet_grace {
             continue;
         }
         let Ok(bytes) = tokio::fs::read(&path).await else {
@@ -210,7 +223,7 @@ pub async fn wait_for_stranded_completion(
                  and the rollout has not advanced in {}s.\n  \
                  Treating the run as complete and terminating codex.\n  \
                  transcript: {}",
-                QUIET_GRACE.as_secs(),
+                timings.quiet_grace.as_secs(),
                 path.display()
             ),
         };

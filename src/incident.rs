@@ -38,6 +38,10 @@ pub struct Incident<'a> {
     pub stderr: &'a [u8],
     pub transcript_path: Option<&'a str>,
     pub duration_ms: u128,
+    /// Overrides the XDG data root the bundle is written under. `None` in
+    /// production; set by tests so a stub run cannot write into the operator's
+    /// real incident directory.
+    pub data_root: Option<&'a Path>,
     pub captured: bool,
     pub recovered_from_transcript: bool,
     pub turns: u32,
@@ -93,11 +97,18 @@ struct EnvVar {
     value: Option<String>,
 }
 
-fn incidents_dir() -> Option<PathBuf> {
-    let data_dir = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .ok()?;
+/// Where bundles are written. `data_root` overrides the real XDG location and
+/// exists so the test harness cannot deposit stub bundles in the operator's
+/// actual `~/.local/share/review/incidents` - it did exactly that before this
+/// was injectable, because redirecting `CODEX_HOME` only redirects the *child*.
+fn incidents_dir(data_root: Option<&Path>) -> Option<PathBuf> {
+    let data_dir = match data_root {
+        Some(root) => root.to_path_buf(),
+        None => std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+            .ok()?,
+    };
     Some(data_dir.join("review").join("incidents"))
 }
 
@@ -121,7 +132,7 @@ fn looks_secret(name: &str) -> bool {
 /// Write a forensic bundle for a suspicious run. Returns the bundle directory on
 /// success. Best-effort: warns and returns `None` on any IO failure.
 pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
-    let base = incidents_dir()?;
+    let base = incidents_dir(inc.data_root)?;
     let stamp = crate::audit::chrono_now().replace(':', "-");
     let sid = inc.session_id.unwrap_or("no-session");
     // A short random suffix keeps two same-second failures (e.g. two
@@ -181,7 +192,7 @@ pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
         provider: inc.provider.to_string(),
         session_id: inc.session_id.map(str::to_string),
         review_version: env!("CARGO_PKG_VERSION"),
-        codex_version: probe_codex_version(inc.provider),
+        codex_version: probe_codex_version(inc.binary),
         argv: full_argv,
         command,
         cwd: inc.cwd.to_string_lossy().into_owned(),
@@ -355,7 +366,8 @@ pub struct ListedIncident {
 /// so a reverse lexical sort is chronological. A dir whose `meta.json` is
 /// missing or unreadable still lists (with defaults) so nothing is hidden.
 pub fn list_recent(limit: usize) -> Vec<ListedIncident> {
-    let base = match incidents_dir() {
+    // Always the real location: `review incidents` is an operator-facing view.
+    let base = match incidents_dir(None) {
         Some(b) => b,
         None => return Vec::new(),
     };
@@ -380,10 +392,21 @@ pub fn list_recent(limit: usize) -> Vec<ListedIncident> {
         .collect()
 }
 
-/// Best-effort `codex --version`; deaths may be version-specific.
-fn probe_codex_version(provider: &str) -> Option<String> {
-    let out = std::process::Command::new(provider)
+/// Best-effort `<binary> --version`; deaths may be version-specific.
+///
+/// Probes the binary that was actually executed, not the provider name. Those
+/// differ whenever the binary is overridden (the test harness runs a stub), and
+/// probing the *name* meant a stub run recorded the host's real `codex
+/// --version` - metadata describing a process that never ran.
+fn probe_codex_version(binary: &str) -> Option<String> {
+    let out = std::process::Command::new(binary)
         .arg("--version")
+        // Never inherit our stdin. `output()` would otherwise hand the probe
+        // whatever `review` is reading from, and a binary that reads stdin
+        // before parsing its arguments then blocks forever - taking the incident
+        // write, and the run, with it. A version probe has no business reading
+        // input, so close it.
+        .stdin(std::process::Stdio::null())
         .output()
         .ok()?;
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();

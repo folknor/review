@@ -1,6 +1,9 @@
 target
 .plans
 .claude
+# brokkr's local scratch: hung-test snapshots and similar diagnostics. This
+# project has no results.db, so nothing under here is ours to keep.
+.brokkr/
 # Vendored upstream clones kept for investigation only - never ours to commit,
 # and must stay out of brokkr's tree-wide scans.
 /research/

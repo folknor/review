@@ -14,7 +14,37 @@ Do not use your Memory functionality. Update CLAUDE.md instead. This project is 
 
 ### Bash rules
 - Never capture stdout into env vars (`UUID=$(...)`).
-- Never run raw cargo, curl, pkill. Use `brokkr`.
+- Never run raw cargo, curl, pkill. Use `brokkr`. **This means never, including
+  during iteration.** `cargo build` / `cargo test` while working, "just to check
+  quickly", is the same violation as shipping with them - `brokkr` is the only
+  supported entry point, and reaching past it means running a different build
+  configuration from the one that gates the commit. The mapping is total; there
+  is no case that needs raw cargo:
+
+  | instead of | run |
+  |---|---|
+  | `cargo build` / `cargo clippy` / `cargo test` | `brokkr check` (gremlins + clippy + tests, the full gate) |
+  | `cargo test <name>` | `brokkr test <name>` |
+  | `cargo test <name>` repeatedly (flaky hunt) | `brokkr test <name> -N <count>` |
+  | `cargo run -- <args>` | `brokkr run -- <args>` |
+  | `cargo fmt` | `brokkr fmt` |
+  | `cargo install --path .` | `brokkr install` |
+
+- `brokkr check` is the gate; run it before every commit, not just at the end.
+- `brokkr test <NAME>` is a substring filter over the package's unit *and*
+  integration tests, release profile by default (`--debug` for dev). It always
+  passes `--include-ignored --nocapture --test-threads=1`.
+- **There is a 20-second per-test watchdog**, shared by `brokkr check`'s test
+  phase and `brokkr test`. A test that runs longer is killed and reported as
+  hung. `brokkr test --timeout <SECS>` raises it to at most 280s, and only for a
+  name that matches exactly one test. This is why fixture timings in
+  `src/provider_tests.rs` are injectable rather than real-world durations - a
+  test that waited out the production 10s `SIGKILL` escalation would sit right
+  under the ceiling and eventually trip it on a loaded machine.
+- `brokkr man` lists bundled docs (`man check`, `man config`, `man clippy`,
+  `man run`, `man results`, ...). Read those rather than guessing at flags.
+- Waiting on a long command: just run it and stop. It wakes you on exit. Never
+  poll it with `sleep`, `until`, or a watch loop.
 
 ### git commit rules
 - Always run `brokkr fmt` before a commit.
@@ -34,7 +64,16 @@ Per-project config via `.review.toml`: archetypes (name → priming prompt), gro
 
 ## Build and run
 
-Use `brokkr` for build/test/clippy (`brokkr check`) and running (`brokkr run -- ...`).
+`brokkr` is the only entry point - never raw `cargo` (see Bash rules for the
+full mapping and the 20s per-test watchdog).
+
+```
+brokkr check                    # the gate: gremlins + clippy + tests
+brokkr test <name>              # one test by substring; -N <n> to repeat
+brokkr run -- <args>            # run the binary
+brokkr fmt                      # before every commit
+brokkr man check                # bundled docs for the pipeline
+```
 
 ```
 brokkr check
@@ -54,6 +93,7 @@ Single binary crate, no workspace.
 - `src/transcript.rs` - Codex on-disk transcript forensics. Locates `$CODEX_HOME/sessions/**/rollout-*-<session_id>.jsonl` by filename (the session ID is captured, so no cwd/mtime heuristic) and parses it for `task_complete`, `stream_error`, the last event, the last in-flight tool call (a `function_call` with no matching `_call_output` = what was running when it stopped), and `final_answer` (the last `agent_message` whose `phase == "final_answer"` - codex tags interim notes `commentary` and the real report `final_answer`). Per-turn state (including `final_answer`) resets on each `task_started` so a resumed rollout reflects the current turn. Scoping a summary to one run's events is the caller's job, via `slice_from_offset(bytes, from_offset)` - the rollout's size at that run's launch, shared with `watchdog` so the two can never disagree about where a run begins. Passing `None` summarizes the whole file (`review sessions <id>`). Read when a run looks wrong (not captured / non-zero exit / signal), so clean runs stay uncluttered.
 - `src/incident.rs` - Forensic bundle writer for suspicious codex runs (same `!captured || exit!=0 || signal` gate as the transcript). `write_bundle` dumps `~/.local/share/review/incidents/<utc>-codex-<sid>/` with `stderr.txt` (the channel we used to discard - and with `RUST_BACKTRACE=1` set on the child, a panic lands here with its trace), `stdout.jsonl` (raw NDJSON, last 1 MiB), `transcript.tail.jsonl` (last 80 rollout lines), `prompt.txt` (the exact stdin), and `meta.json` (full argv incl. argv[0], a copy-pasteable `command` string = injected env prefix + quoted argv + `< prompt.txt`, cwd, exit/signal, stdin-write error, durations, `codex --version`, `final_answer_present`/`rate_limits` scanned from the rollout, and profile env - names always, values redacted when the name looks secret). The `command` + `prompt.txt` make the run replayable verbatim (secret env values show as `<redacted>`). `review incidents [--limit N]` lists recent bundles newest-first with a one-line verdict (`no final answer (died)` / `recovered` / `completed (truncated)`) and the bundle path; `list_recent` reads each `meta.json` back via `IncidentSummary`. Best-effort: every failure warns, never derails the run. The bundle dir is surfaced on the digest (`incident:` line) and persisted in the sidecar/audit digest.
 - `src/watchdog.rs` - Rollout-completion watchdog for codex runs. Polls the rollout while codex runs; when a real `final_answer` for *this* run's turn exists on disk **and** the rollout has stopped growing for `QUIET_GRACE` (180s), it concludes codex has produced everything it is going to and is stuck in teardown, and the runner kills the process group. "This run's turn" is delimited by a **byte offset** (the rollout's size at spawn), not a timestamp: rollout events carry millisecond stamps while our own clock string is second-resolution, so a prior turn completing in the same second as launch would slip past a time filter and its stale answer would license killing a resume that had produced nothing. The offset is exact and has no such race. The baseline is an `Option<u64>`, and `None` (a resume whose rollout could not be statted before launch) **disables the watchdog entirely** rather than degrading to `Some(0)`: scanning the whole session history would let a previous turn's `final_answer` authorise killing a genuine mid-turn wedge. A fresh run's `Some(0)` is exact, not a fallback - its rollout does not exist yet. Explicitly **not** a timeout: it never fires on a run that has not already produced its answer, however long that run takes. `has_final_answer` is deliberately separate from `transcript::parse` - parse answers "state of the current turn" (resetting at each `task_started`), the watchdog asks "has this run produced an answer at any point since it began", which must survive the trailing micro-turns codex appends after the substantive turn. A genuine mid-turn wedge is *not* covered; that needs a stall detector, which is a real timeout and a separate decision (marked `TODO(stall-detector)`).
+- `src/provider_tests.rs` - End-to-end tests of the codex runner against a **stub `codex`** shell script (included into `provider.rs` as a `#[cfg(test)]` module so it can reach private items). The behaviours under test are *process* behaviours - finishing work then refusing to exit, wedging mid-turn, leaving a descendant that holds stdout open or ignores `SIGTERM` - none of which can be faked with a mocked return value; they need a real child, pipe, process group and kill. `CodexRuntime` (binary, watchdog `Timings`, `drain_grace`, `sigkill_escalation`, `data_root`) is the injection point that makes a 3-minute detection and 10-second escalation resolve in under a second. `data_root` is load-bearing, not tidiness: `CODEX_HOME` only redirects the *child*, so `review`'s own paths otherwise resolve from the real `HOME`/`XDG_DATA_HOME` - an earlier version of this suite wrote stub incident bundles into the operator's real `~/.local/share/review/incidents`. Coverage: stranded completion is killed and recovered; an advancing rollout is never killed (answer present *and* still writing - the advancement gate, not the answer gate); a pipe-retaining child blocks neither reaping nor output capture; group escalation actually reaps a `SIGTERM`-ignoring descendant. Scratch lives in `target/test-scratch/<uuid>/`; stubs record any deliberately-left-running pid to `$LINGER_PID` so tests clean up after themselves.
 - `src/inflight.rs` - Marker files at `~/.local/share/review/inflight/<session_id>.json` written once a run's session ID is known and removed when it returns, so `review sessions` can print `[in flight] ... turn in flight since <age>`. The sidecar is only written on return, so without this a running (or wedged) turn is indistinguishable from an idle session showing its previous response. Each marker records the owning `review` pid; `read_live` treats a marker whose pid is gone as stale, and deletes it. The session ID is validated as a bare filename component (alphanumerics, `-`, `_`) before being used as a path - it arrives straight from `--session <id>`, whose validation `review` otherwise delegates to the provider, so unchecked it let `--session ../foo` escape the marker directory and write then *delete* a file elsewhere. An allowlist, not a `..` denylist, because only the former is safe by construction. Best-effort throughout - never derails a run.
 - `src/sessions.rs` - Append-only sidecar log at `~/.local/share/review/sessions.jsonl` (or `sessions-private.jsonl` if `audit.private`). One row per run that captured a session ID (`kind = "run"`), one per `--session` resume (`kind = "session"`). Rows carry timestamp + epoch_secs, project, hostname, audit_id, provider, archetype, session_id, model, env var *names* (not values - those can carry secrets), operator prompt, assembled prompt, response or error, review version, and (codex) the flat `DigestSummary`. Read helpers (`read_all`, `latest_for_session`, `age_secs`, `format_age`) drive the cache-age gate in `--session` mode and the `review sessions` subcommand.
 - `src/config_write.rs` - `append_audit_id` (the only writer left; archetypes/profiles are hand-edited).

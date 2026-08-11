@@ -33,7 +33,7 @@
 //! liveness hint must never be able to derail an actual run.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize)]
 pub struct Marker {
@@ -47,11 +47,18 @@ pub struct Marker {
     pub pid: u32,
 }
 
-fn dir() -> Option<PathBuf> {
-    let data_dir = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .ok()?;
+/// Where markers live. `data_root` overrides the real XDG location and exists so
+/// the test harness cannot leave stub markers in the operator's actual
+/// `~/.local/share/review/inflight` - redirecting `CODEX_HOME` only redirects
+/// the *child*, not the paths `review` itself resolves.
+fn dir(data_root: Option<&Path>) -> Option<PathBuf> {
+    let data_dir = match data_root {
+        Some(root) => root.to_path_buf(),
+        None => std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+            .ok()?,
+    };
     Some(data_dir.join("review").join("inflight"))
 }
 
@@ -105,7 +112,7 @@ impl Drop for Guard {
 /// marker when dropped; a `Guard(None)` on any failure, so a broken data dir
 /// silently degrades to the old no-visibility behaviour instead of failing the
 /// run.
-pub fn mark(session_id: &str, provider: &str, project: &str) -> Guard {
+pub fn mark(session_id: &str, provider: &str, project: &str, data_root: Option<&Path>) -> Guard {
     // Refuse to build a path out of anything that is not plainly a session id.
     // Skipping the marker only costs liveness reporting for that run; letting it
     // through would let a crafted `--session` write and delete an arbitrary
@@ -114,7 +121,7 @@ pub fn mark(session_id: &str, provider: &str, project: &str) -> Guard {
         eprintln!("warning: session id is not a safe filename; skipping in-flight marker");
         return Guard(None);
     }
-    let Some(dir) = dir() else {
+    let Some(dir) = dir(data_root) else {
         return Guard(None);
     };
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -148,7 +155,8 @@ pub fn mark(session_id: &str, provider: &str, project: &str) -> Guard {
 /// is gone are stale (killed mid-run) and are both skipped and cleaned up here,
 /// so the directory cannot accumulate lies over time.
 pub fn read_live() -> Vec<Marker> {
-    let Some(dir) = dir() else {
+    // Always the real location: `review sessions` is an operator-facing view.
+    let Some(dir) = dir(None) else {
         return Vec::new();
     };
     let Ok(entries) = std::fs::read_dir(&dir) else {

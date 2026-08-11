@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "provider_tests.rs"]
+mod provider_tests;
+
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Stdio;
@@ -245,7 +249,7 @@ pub fn install_signal_supervisor() {
         }
         let pids_to_kill = pids.clone();
         for pid in pids {
-            terminate_group(pid);
+            terminate_group(pid, SIGKILL_ESCALATION);
         }
         // Give SIGTERM a brief moment to land before we go; the escalation to
         // SIGKILL inside `terminate_group` dies with us, so this is the only
@@ -271,6 +275,11 @@ pub fn install_signal_supervisor() {
     });
 }
 
+/// How long a process group gets to honour `SIGTERM` before we escalate to
+/// `SIGKILL`. A codex stuck in an unbounded shutdown await may never process
+/// the first signal.
+const SIGKILL_ESCALATION: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Terminate a codex child *and everything it spawned* by signalling its whole
 /// process group, escalating to `SIGKILL` after a grace period.
 ///
@@ -279,7 +288,7 @@ pub fn install_signal_supervisor() {
 /// exactly the case where those are still alive. Killing the pid alone would
 /// orphan them. `run_codex_json` puts codex in its own group so `pgid` equals
 /// the child pid and this cannot reach back and signal `review` itself.
-fn terminate_group(pid: u32) {
+fn terminate_group(pid: u32, escalate_after: std::time::Duration) {
     let Ok(pid) = i32::try_from(pid) else {
         return;
     };
@@ -289,10 +298,9 @@ fn terminate_group(pid: u32) {
     unsafe {
         libc::kill(-pid, libc::SIGTERM);
     }
-    // Escalate if SIGTERM is ignored - a codex stuck in an unbounded shutdown
-    // await may never process it.
+    // Escalate if SIGTERM is ignored.
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tokio::time::sleep(escalate_after).await;
         // SAFETY: as above. Harmless if the group is already gone (ESRCH).
         unsafe {
             libc::kill(-pid, libc::SIGKILL);
@@ -442,6 +450,43 @@ struct RunOutput {
     digest: Option<Digest>,
 }
 
+/// Knobs on how a codex run is executed, injectable so tests can drive the real
+/// `run_codex_json` path against a stub binary in milliseconds rather than
+/// minutes. Production always uses `Default`.
+#[derive(Clone)]
+pub struct CodexRuntime {
+    /// The binary to exec. Overridden in tests by a stub that reproduces the
+    /// hang shapes (answer-then-hang, hang-with-no-answer, pipe-retaining
+    /// descendant) deterministically.
+    pub binary: String,
+    /// Watchdog polling/patience.
+    pub timings: crate::watchdog::Timings,
+    /// How long a pipe reader gets to finish after the child is reaped before
+    /// it is aborted and we take whatever it buffered.
+    pub drain_grace: std::time::Duration,
+    /// How long a process group gets to honour `SIGTERM` before `SIGKILL`.
+    pub sigkill_escalation: std::time::Duration,
+    /// Overrides the XDG data root used for in-flight markers and incident
+    /// bundles. `None` in production. Tests set it because redirecting
+    /// `CODEX_HOME` only redirects the *child* - `review`'s own paths are
+    /// resolved from the test process's real `HOME`/`XDG_DATA_HOME`, so without
+    /// this the suite wrote stub incident bundles into the operator's real
+    /// `~/.local/share/review/incidents`.
+    pub data_root: Option<std::path::PathBuf>,
+}
+
+impl Default for CodexRuntime {
+    fn default() -> Self {
+        Self {
+            binary: "codex".to_string(),
+            timings: crate::watchdog::Timings::default(),
+            drain_grace: std::time::Duration::from_secs(5),
+            sigkill_escalation: SIGKILL_ESCALATION,
+            data_root: None,
+        }
+    }
+}
+
 /// Signals the caller that the provider process has actually been spawned.
 ///
 /// The global lock exists to space out provider *launches*, so it has to be held
@@ -495,6 +540,7 @@ pub async fn invoke(
                 project_root,
                 oneshot,
                 launched,
+                &CodexRuntime::default(),
             )
             .await
         }
@@ -653,6 +699,7 @@ async fn run_codex(
     project_root: &Path,
     oneshot: bool,
     launched: Option<LaunchSignal>,
+    runtime: &CodexRuntime,
 ) -> Result<RunOutput> {
     let last_msg_path = new_output_file()?;
 
@@ -702,6 +749,7 @@ async fn run_codex(
         prompt,
         project_root,
         launched,
+        runtime,
     )
     .await
 }
@@ -712,6 +760,12 @@ async fn run_codex(
 /// backstop. `known_session_id` is `Some` on resume (we already know it) and
 /// `None` on a fresh run (parsed from `thread.started`). Never bails on a
 /// non-zero exit: a halted/errored run still reports what it produced.
+// Every argument here is an independent axis of one invocation (argv, the `-o`
+// path, the known session id, env, prompt, cwd, the launch handshake, the
+// injectable runtime). Bundling them into a struct would add a type whose only
+// purpose is to be destructured immediately, so the lint is waived rather than
+// worked around.
+#[allow(clippy::too_many_arguments)]
 async fn run_codex_json(
     args: Vec<String>,
     last_msg_path: &str,
@@ -720,8 +774,9 @@ async fn run_codex_json(
     prompt: &str,
     project_root: &Path,
     launched: Option<LaunchSignal>,
+    runtime: &CodexRuntime,
 ) -> Result<RunOutput> {
-    let mut cmd = Command::new("codex");
+    let mut cmd = Command::new(&runtime.binary);
     cmd.args(&args)
         .current_dir(project_root)
         // Make a codex panic legible: without this it exits 1 with no trace,
@@ -822,11 +877,13 @@ async fn run_codex_json(
     let marker_task = tokio::spawn({
         let mut rx = sid_rx.clone();
         let project = project_root.to_string_lossy().into_owned();
+        let data_root = runtime.data_root.clone();
         async move {
             loop {
                 let current = rx.borrow_and_update().clone();
                 if let Some(sid) = current {
-                    let _guard = crate::inflight::mark(&sid, "codex", &project);
+                    let _guard =
+                        crate::inflight::mark(&sid, "codex", &project, data_root.as_deref());
                     // Hold the marker until this task is aborted.
                     std::future::pending::<()>().await;
                 }
@@ -888,6 +945,7 @@ async fn run_codex_json(
             sid_rx,
             env.and_then(|e| e.get("CODEX_HOME")).cloned(),
             rollout_baseline,
+            runtime.timings,
         );
         tokio::pin!(watchdog);
         loop {
@@ -904,7 +962,7 @@ async fn run_codex_json(
                     eprintln!("watchdog: {}", stranded.reason);
                     terminated_by_review = Some("watchdog: stranded completion".to_string());
                     if let Some(pid) = child_pid {
-                        terminate_group(pid);
+                        terminate_group(pid, runtime.sigkill_escalation);
                     }
                 }
             }
@@ -930,9 +988,10 @@ async fn run_codex_json(
     // `Stdio::inherit` on the exec path - `codex-rs/core/src/spawn.rs` gives
     // children null/piped stdio - so this is defence in depth rather than a
     // known live path.)
-    const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-    let stdout_buf = collect_reader(stdout_task, &stdout_shared, DRAIN_GRACE, "stdout").await;
-    let stderr_buf = collect_reader(stderr_task, &stderr_shared, DRAIN_GRACE, "stderr").await;
+    let stdout_buf =
+        collect_reader(stdout_task, &stdout_shared, runtime.drain_grace, "stdout").await;
+    let stderr_buf =
+        collect_reader(stderr_task, &stderr_shared, runtime.drain_grace, "stderr").await;
     let write_res = match write_task.await {
         Ok(r) => r,
         Err(e) => Err(anyhow::anyhow!("stdin write task panicked: {e}")),
@@ -1067,7 +1126,10 @@ async fn run_codex_json(
     let incident_path = if suspicious {
         crate::incident::write_bundle(&crate::incident::Incident {
             provider: "codex",
-            binary: "codex",
+            // The binary actually executed, which is not always "codex": a
+            // stub overrides it. `command` in meta.json has to replay the
+            // process that really ran.
+            binary: &runtime.binary,
             session_id: session_id.as_deref(),
             argv: &args,
             prompt,
@@ -1080,6 +1142,7 @@ async fn run_codex_json(
             stderr: &stderr_buf,
             transcript_path: transcript.as_ref().map(|t| t.path.as_str()),
             duration_ms,
+            data_root: runtime.data_root.as_deref(),
             captured,
             recovered_from_transcript,
             turns,
