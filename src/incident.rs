@@ -45,6 +45,14 @@ pub struct Incident<'a> {
     pub captured: bool,
     pub recovered_from_transcript: bool,
     pub turns: u32,
+    /// Why `review` killed the run, when it did (watchdog verdict or operator
+    /// signal). `None` means codex ended on its own.
+    pub terminated_by_review: Option<&'a str>,
+    /// How long the rollout had been unchanged when the watchdog acted, and the
+    /// last event it saw. The pair that makes a stall-timeout misfire on a
+    /// healthy run diagnosable after the fact.
+    pub quiet_secs: Option<u64>,
+    pub last_rollout_event: Option<&'a str>,
 }
 
 /// Keep the last MiB of the raw NDJSON stream - the death is at the end, and a
@@ -77,6 +85,9 @@ struct Meta {
     captured: bool,
     recovered_from_transcript: bool,
     turns: u32,
+    terminated_by_review: Option<String>,
+    quiet_secs: Option<u64>,
+    last_rollout_event: Option<String>,
     stdout_bytes: usize,
     stderr_bytes: usize,
     stdout_truncated: bool,
@@ -204,6 +215,9 @@ pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
         captured: inc.captured,
         recovered_from_transcript: inc.recovered_from_transcript,
         turns: inc.turns,
+        terminated_by_review: inc.terminated_by_review.map(str::to_string),
+        quiet_secs: inc.quiet_secs,
+        last_rollout_event: inc.last_rollout_event.map(str::to_string),
         stdout_bytes: inc.stdout.len(),
         stderr_bytes: inc.stderr.len(),
         stdout_truncated,

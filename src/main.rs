@@ -280,6 +280,11 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Codex run settings from project config: today just the stall timeout,
+    // which is tunable (and disableable) because it rests on an empirical codex
+    // property rather than a documented contract.
+    let codex_runtime = provider::CodexRuntime::from_config(cfg.defaults.stall_timeout_secs);
+
     // Spawn all providers with staggered launches to avoid rate limits
     let stagger = std::time::Duration::from_secs(cli.stagger);
     // A task yields its reportable `result` plus, when auto-resume ran, the
@@ -332,6 +337,7 @@ async fn main() -> Result<()> {
             let prov = prov_name.clone();
             let prompt = assembled.clone();
             let root = project_root.clone();
+            let runtime = codex_runtime.clone();
             let delay = stagger * launch_count;
 
             let prompt_for_audit = prompt.clone();
@@ -361,6 +367,7 @@ async fn main() -> Result<()> {
                         // The fan-out path serializes launches with its own
                         // stagger sleep, so it needs no launch handshake.
                         None,
+                        &runtime,
                     )
                     .await;
                     // The "work around" for codex mid-turn deaths: a run that
@@ -387,6 +394,7 @@ async fn main() -> Result<()> {
                             false,
                             // Auto-resume runs inside an already-launched task.
                             None,
+                            &runtime,
                         )
                         .await;
                         if got_final_answer(&second) {
@@ -548,6 +556,15 @@ async fn run_session_resume(
         bail!("'{provider_name}' not found on PATH");
     }
 
+    // `--session` bypasses .review.toml for prompt/profile purposes, but the
+    // stall timeout is a safety setting rather than a prompt input, so it is
+    // still honoured when a config happens to be present.
+    let codex_runtime = provider::CodexRuntime::from_config(
+        config::load()
+            .ok()
+            .and_then(|(cfg, _)| cfg.defaults.stall_timeout_secs),
+    );
+
     // Cache-age gate. The sidecar tells us how long it's been since the session
     // last ended; past ~55 minutes (the realistic cap on Anthropic's prompt
     // cache TTL - 5 min default, ~1h with the right env vars) the cache is cold,
@@ -609,6 +626,7 @@ async fn run_session_resume(
         &project_root,
         false,
         Some(launched_tx),
+        &codex_runtime,
     );
     tokio::pin!(invoke);
 
@@ -692,7 +710,11 @@ async fn run_session_resume(
     provider::print_result(&result);
     println!("\nruntime: {}", format_runtime(started.elapsed()));
 
-    if result.output.is_err() {
+    // A stalled or dead resume comes back as `Ok` (so its session id, digest and
+    // incident survive), but it is a failure for exit-code purposes - exiting 0
+    // on a wedged run lies to scripts and CI, exactly as it did on the fan-out
+    // path before this was fixed there.
+    if result.output.is_err() || died_without_answer(&result) {
         std::process::exit(1);
     }
     Ok(())

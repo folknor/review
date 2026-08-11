@@ -363,6 +363,13 @@ pub struct Digest {
     /// fate - without this field a watchdog kill would be indistinguishable
     /// from codex being killed by something else.
     pub terminated_by_review: Option<String>,
+    /// How long the rollout had been unchanged when the watchdog decided to act.
+    /// Recorded so a stall-timeout misfire on a healthy run shows how close the
+    /// call was, rather than only that it happened.
+    pub quiet_secs: Option<u64>,
+    /// `type/payload.type` of the last rollout event - what codex was doing when
+    /// it went silent.
+    pub last_rollout_event: Option<String>,
 }
 
 /// Flat, serializable projection of a `Digest` for the sidecar and audit logs.
@@ -398,6 +405,10 @@ pub struct DigestSummary {
     /// `jq 'select(.digest.terminated_by_review != null)'`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminated_by_review: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_rollout_event: Option<String>,
 }
 
 impl Digest {
@@ -416,6 +427,8 @@ impl Digest {
             reasoning_output_tokens: self.usage.reasoning_output_tokens,
             incident_path: self.incident_path.clone(),
             terminated_by_review: self.terminated_by_review.clone(),
+            quiet_secs: self.quiet_secs,
+            last_rollout_event: self.last_rollout_event.clone(),
         }
     }
 }
@@ -475,6 +488,19 @@ pub struct CodexRuntime {
     pub data_root: Option<std::path::PathBuf>,
 }
 
+impl CodexRuntime {
+    /// Build from project config. `stall_timeout_secs` comes from
+    /// `[_defaults].stall_timeout_secs`: `None` keeps the built-in default,
+    /// `Some(0)` disables the stall branch, anything else sets it.
+    pub fn from_config(stall_timeout_secs: Option<u64>) -> Self {
+        let mut rt = Self::default();
+        if let Some(secs) = stall_timeout_secs {
+            rt.timings.stall_grace = (secs > 0).then(|| std::time::Duration::from_secs(secs));
+        }
+        rt
+    }
+}
+
 impl Default for CodexRuntime {
     fn default() -> Self {
         Self {
@@ -509,6 +535,7 @@ pub async fn invoke(
     project_root: &Path,
     oneshot: bool,
     launched: Option<LaunchSignal>,
+    runtime: &CodexRuntime,
 ) -> ProviderResult {
     let result = match provider {
         // `sandbox` is a codex-only concept (an OS filesystem sandbox). Claude's
@@ -540,7 +567,7 @@ pub async fn invoke(
                 project_root,
                 oneshot,
                 launched,
-                &CodexRuntime::default(),
+                runtime,
             )
             .await
         }
@@ -926,6 +953,10 @@ async fn run_codex_json(
     }
     // Records that *we* ended the run, and why. See `Digest::terminated_by_review`.
     let mut terminated_by_review: Option<String> = None;
+    // Forensics from the watchdog verdict, carried onto the digest and into the
+    // incident bundle.
+    let mut quiet_secs: Option<u64> = None;
+    let mut last_rollout_event: Option<String> = None;
 
     // Wait for codex, but stay interruptible.
     //
@@ -958,9 +989,21 @@ async fn run_codex_json(
                 // and the recovered `final_answer` is reported as usual. The
                 // guard disables this arm once it has fired, so the completed
                 // future is never polled again.
-                stranded = &mut watchdog, if terminated_by_review.is_none() => {
-                    eprintln!("watchdog: {}", stranded.reason);
-                    terminated_by_review = Some("watchdog: stranded completion".to_string());
+                verdict = &mut watchdog, if terminated_by_review.is_none() => {
+                    eprintln!("watchdog: {}", verdict.reason);
+                    terminated_by_review = Some(match verdict.kind {
+                        crate::watchdog::Kind::Stranded => {
+                            "watchdog: stranded completion".to_string()
+                        }
+                        // Named a stall *timeout* on purpose: it is one, and
+                        // saying so keeps a future codex cadence change
+                        // diagnosable instead of mysterious.
+                        crate::watchdog::Kind::Stalled => {
+                            format!("watchdog: stall timeout ({}s silent)", verdict.quiet_secs)
+                        }
+                    });
+                    quiet_secs = Some(verdict.quiet_secs);
+                    last_rollout_event = verdict.last_event.clone();
                     if let Some(pid) = child_pid {
                         terminate_group(pid, runtime.sigkill_escalation);
                     }
@@ -1146,6 +1189,9 @@ async fn run_codex_json(
             captured,
             recovered_from_transcript,
             turns,
+            terminated_by_review: terminated_by_review.as_deref(),
+            quiet_secs,
+            last_rollout_event: last_rollout_event.as_deref(),
         })
         .map(|p| p.to_string_lossy().into_owned())
     } else {
@@ -1163,6 +1209,8 @@ async fn run_codex_json(
         transcript,
         incident_path,
         terminated_by_review,
+        quiet_secs,
+        last_rollout_event,
     };
 
     // Even when no message came back (a hard freeze before any agent_message,
@@ -1235,6 +1283,12 @@ fn print_digest(d: &Digest) {
     // otherwise read as codex dying on its own when in fact we killed it.
     if let Some(ref why) = d.terminated_by_review {
         println!("terminated by review: {why}");
+        if let Some(secs) = d.quiet_secs {
+            println!("  rollout silent for: {secs}s");
+        }
+        if let Some(ref ev) = d.last_rollout_event {
+            println!("  last rollout event: {ev}");
+        }
     }
     if d.recovered_from_transcript {
         println!("recovered: final answer restored from transcript (stream/-o truncated)");

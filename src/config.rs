@@ -24,6 +24,17 @@ pub struct AuditConfig {
 pub struct DefaultsConfig {
     #[serde(default)]
     pub providers: Vec<String>,
+    /// Seconds of rollout silence, with no final answer written, after which a
+    /// codex run is treated as stalled: killed, bundled, and reported as a
+    /// failure. `0` disables the check; omitted uses the built-in default
+    /// (see `watchdog::Timings`).
+    ///
+    /// This is a genuine timeout resting on an *empirical* property of codex -
+    /// that it wakes itself every few minutes and cannot stay silent - so it is
+    /// deliberately tunable per project, and switchable off, in case a future
+    /// codex changes cadence. codex-only; claude has no rollout to watch.
+    #[serde(default)]
+    pub stall_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug)]

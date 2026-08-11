@@ -34,24 +34,42 @@
 //!
 //! # What it does
 //!
-//! While codex runs, poll its rollout file. When *both* hold:
+//! One poller over the rollout file, with two verdicts:
 //!
-//! - a real final answer for **this** run's turn exists on disk, and
-//! - the rollout has stopped growing for `QUIET_GRACE`,
+//! - **`Stranded`** - a real final answer for *this* run exists on disk and the
+//!   rollout has stopped growing for `quiet_grace`. codex has produced
+//!   everything we came for and is stuck in teardown, so kill it; the
+//!   `final_answer` is then reported through the normal transcript-recovery
+//!   path and the operator gets the real report instead of an indefinite hang.
+//! - **`Stalled`** - no answer was ever written and the rollout has been silent
+//!   for `stall_grace`. The run is lost: kill it, write the incident bundle,
+//!   and report failure.
 //!
-//! conclude that codex has produced everything we came for and is now stuck in
-//! teardown, and tell the caller to kill it. The recovered `final_answer` is
-//! then reported through the normal transcript-recovery path, so the operator
-//! gets the real report instead of an indefinite hang.
+//! `Stranded` is not a timeout. It cannot fire on a run that has not already
+//! produced its answer, and it cannot fire while the rollout is still growing,
+//! however long the run takes. The trigger is "we demonstrably have the result
+//! and the process has gone quiet".
 //!
-//! # What it deliberately is *not*
+//! # `Stalled` *is* a timeout, and is named like one
 //!
-//! This is **not** a timeout on the provider. It never fires while codex is
-//! working, however long that takes, and it never fires on a run that has not
-//! already produced its answer. The trigger is "we demonstrably have the
-//! result and the process has gone quiet", not elapsed wall-clock time. A
-//! genuine mid-turn wedge (failure 2 above) is *not* covered - that needs a
-//! stall detector, which is a real timeout and is a separate decision.
+//! It rests on an empirical property of codex rather than a documented
+//! contract: **codex cannot stay silent.** It wakes itself every 2-5 minutes
+//! even while babysitting a long-running task - the field rollout that motivated
+//! this module shows `wait` calls with `yield_time_ms: 30000`, and events
+//! landing every 5-15 seconds throughout the working portion of the turn. The
+//! wedge, by contrast, was silent for hours. Two to three orders of magnitude
+//! separate them, which is what makes a 15-minute default safe.
+//!
+//! That asymmetry is codex-specific and does not generalise. Claude legitimately
+//! goes silent while waiting on a backgrounded task, so none of this applies to
+//! it - and nothing here runs for claude anyway, which has no rollout.
+//!
+//! Because the invariant is empirical, a future codex could change its cadence
+//! and start tripping this on healthy runs. Hence: the honest name (a rename to
+//! something softer would make that day harder to diagnose), the configurable
+//! and disableable threshold (`[_defaults].stall_timeout_secs`, `0` to turn it
+//! off), and `quiet_secs` + `last_event` recorded on every verdict so a misfire
+//! shows exactly how close the call was and what codex was last doing.
 
 use std::time::{Duration, Instant};
 
@@ -67,6 +85,12 @@ pub struct Timings {
     /// killing a run that was about to continue; the cost of firing late is a
     /// few idle minutes.
     pub quiet_grace: Duration,
+    /// How long the rollout must stay unchanged with *no* answer written before
+    /// we call the run stalled. `None` disables the stall branch entirely.
+    ///
+    /// This one is a timeout, and is named as such deliberately - see the module
+    /// docs for why the honest name matters.
+    pub stall_grace: Option<Duration>,
 }
 
 impl Default for Timings {
@@ -74,14 +98,34 @@ impl Default for Timings {
         Self {
             poll_interval: Duration::from_secs(15),
             quiet_grace: Duration::from_secs(180),
+            stall_grace: Some(Duration::from_secs(900)),
         }
     }
 }
 
+/// Which of the two failure shapes the poller detected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// The answer is on disk and codex will not exit. Recoverable: killing it
+    /// costs nothing, because everything we came for has already been written.
+    Stranded,
+    /// No answer was ever written and the rollout has gone silent far longer
+    /// than codex's own wake cadence. The run is lost; kill it and fail.
+    Stalled,
+}
+
 /// Verdict handed back to the runner when the watchdog fires.
-pub struct Stranded {
+pub struct Verdict {
+    pub kind: Kind,
     /// Operator-facing explanation, printed before we kill the child.
     pub reason: String,
+    /// How long the rollout had been unchanged when we decided. Recorded on the
+    /// digest and in the incident bundle: if the stall branch ever misfires on a
+    /// healthy run, this is the number that shows how close the call was.
+    pub quiet_secs: u64,
+    /// `type/payload.type` of the last event in the rollout - what codex was
+    /// doing when it went quiet.
+    pub last_event: Option<String>,
 }
 
 /// Does the region of the rollout written by *this* run contain a real final
@@ -155,7 +199,7 @@ pub async fn wait_for_stranded_completion(
     codex_home: Option<String>,
     baseline: Option<u64>,
     timings: Timings,
-) -> Stranded {
+) -> Verdict {
     // No trustworthy baseline means we cannot tell this run's events from an
     // earlier turn's, so we cannot safely judge anything: never fire. Scanning
     // the whole history instead would let a previous turn's `final_answer`
@@ -196,38 +240,93 @@ pub async fn wait_for_stranded_completion(
             continue;
         }
 
-        // The file has not grown since the previous poll. Only now is it worth
-        // reading and parsing - a working run never reaches this branch.
-        if last_change.elapsed() < timings.quiet_grace {
-            continue;
-        }
-        let Ok(bytes) = tokio::fs::read(&path).await else {
-            continue;
-        };
-        if !has_final_answer(scan_from_baseline(&bytes, baseline)) {
-            // Quiet, but with nothing to show for it. That is the mid-turn
-            // wedge (or a legitimately long-thinking model), and we refuse to
-            // guess: killing here could discard real in-progress work. Keep
-            // waiting.
-            //
-            // TODO(stall-detector): this is the hook for the optional
-            // "rollout has not advanced in N minutes -> incident bundle and
-            // exit nonzero" behaviour. That one *is* a timeout, so it stays
-            // opt-in and off by default until explicitly enabled.
+        // The file has not grown since the previous poll. How long it has been
+        // quiet decides which (if either) branch applies.
+        let quiet = last_change.elapsed();
+        let stall_due = timings.stall_grace.is_some_and(|grace| quiet >= grace);
+        if quiet < timings.quiet_grace && !stall_due {
             continue;
         }
 
-        return Stranded {
-            reason: format!(
-                "codex has written a final answer to its rollout but has not exited, \
-                 and the rollout has not advanced in {}s.\n  \
-                 Treating the run as complete and terminating codex.\n  \
-                 transcript: {}",
-                timings.quiet_grace.as_secs(),
-                path.display()
-            ),
+        // Only now is it worth reading and parsing - a working run never gets
+        // this far, because its rollout keeps growing.
+        let Ok(bytes) = tokio::fs::read(&path).await else {
+            continue;
         };
+        // Both helpers see only what *this* run appended. Scoping the answer
+        // check but not the last-event probe would make the forensic field lie
+        // precisely when it matters: a resume that stalls before writing any
+        // parseable event would report the *previous* turn's last event as its
+        // own activity. `None` here honestly means "this run wrote nothing".
+        let ours = scan_from_baseline(&bytes, baseline);
+        let answered = has_final_answer(ours);
+        let quiet_secs = quiet.as_secs();
+        let last_event = last_event(ours);
+
+        if answered && quiet >= timings.quiet_grace {
+            return Verdict {
+                kind: Kind::Stranded,
+                reason: format!(
+                    "codex has written a final answer to its rollout but has not exited, \
+                     and the rollout has not advanced in {quiet_secs}s.\n  \
+                     Treating the run as complete and terminating codex.\n  \
+                     transcript: {}",
+                    path.display()
+                ),
+                quiet_secs,
+                last_event,
+            };
+        }
+
+        if !answered && stall_due {
+            return Verdict {
+                kind: Kind::Stalled,
+                reason: format!(
+                    "stall timeout: codex has written nothing to its rollout in \
+                     {quiet_secs}s and has produced no final answer.\n  \
+                     codex wakes itself every few minutes even while waiting on a \
+                     long tool call, so silence this long means the run is wedged, \
+                     not working.\n  \
+                     Terminating it and reporting failure.\n  \
+                     last rollout event: {}\n  \
+                     transcript: {}",
+                    last_event.as_deref().unwrap_or("(none)"),
+                    path.display()
+                ),
+                quiet_secs,
+                last_event,
+            };
+        }
+
+        // Quiet, but not yet conclusive: either an answered run inside its
+        // grace, or an unanswered one that has not reached the stall timeout
+        // (or has it disabled). Keep waiting - killing an unanswered run early
+        // discards real in-progress work.
+        continue;
     }
+}
+
+/// `type/payload.type` of the last parseable event. Recorded with a verdict so a
+/// kill says *what codex was doing* when it went silent, rather than only that
+/// it did.
+///
+/// `bytes` must already be sliced to this run's region (`scan_from_baseline`),
+/// exactly like `has_final_answer`. Scanning the whole rollout would make a
+/// resume that stalled before writing anything report the *previous* turn's
+/// last event as its own - the one case where this field is most needed and
+/// would be most misleading. `None` honestly means "this run wrote nothing".
+fn last_event(bytes: &[u8]) -> Option<String> {
+    let content = String::from_utf8_lossy(bytes);
+    content.lines().rev().find_map(|line| {
+        let event: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+        let top = event.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+        let ptype = event
+            .get("payload")
+            .and_then(|p| p.get("type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("?");
+        Some(format!("{top}/{ptype}"))
+    })
 }
 
 #[cfg(test)]
@@ -281,6 +380,40 @@ mod tests {
         let launched_same_second = r#"{"timestamp":"2026-08-11T07:25:08.900Z","type":"event_msg","payload":{"type":"task_started"}}"#;
         let rollout = format!("{prior}{launched_same_second}\n");
         assert!(!scan(&rollout, baseline));
+    }
+
+    // The last-event probe must be scoped to this run's bytes, like the answer
+    // check. A resume that stalls before writing anything parseable must report
+    // no event of its own rather than inheriting the previous turn's - that
+    // field's whole purpose is saying what *this* run was doing when it froze.
+    #[test]
+    fn last_event_is_scoped_to_this_run() {
+        let prior = format!("{TASK_STARTED}\n{FINAL_ANSWER}\n");
+        let baseline = u64::try_from(prior.len()).expect("test fixture fits in u64");
+
+        // A resume that has written nothing of its own yet.
+        let bytes = prior.clone().into_bytes();
+        assert_eq!(
+            last_event(scan_from_baseline(&bytes, baseline)),
+            None,
+            "a run that wrote nothing must not inherit the prior turn's event"
+        );
+        // Unscoped, it would have reported the previous turn's answer event -
+        // the misreport this scoping prevents.
+        assert_eq!(
+            last_event(&bytes).as_deref(),
+            Some("event_msg/agent_message")
+        );
+
+        // Once the run does write, its own last event is reported.
+        let tool_call =
+            r#"{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec"}}"#;
+        let resumed = format!("{prior}{TASK_STARTED}\n{tool_call}\n");
+        let bytes = resumed.into_bytes();
+        assert_eq!(
+            last_event(scan_from_baseline(&bytes, baseline)).as_deref(),
+            Some("response_item/custom_tool_call")
+        );
     }
 
     #[test]

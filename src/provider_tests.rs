@@ -168,6 +168,9 @@ if [ "$1" = "--version" ]; then
   printf '%s\n' 'codex-stub 0.0.0'
   exit 0
 fi
+# Record our own pid so a test that deliberately leaves this process unreaped
+# can kill its process group afterwards.
+printf '%s\n' "$$" > "$CODEX_HOME/pid"
 # Drain the prompt so review's stdin write completes rather than seeing EPIPE.
 cat > /dev/null
 ROLL_DIR="$CODEX_HOME/sessions/2026/01/01"
@@ -188,6 +191,10 @@ fn fast_runtime(scratch: &Scratch, binary: String) -> CodexRuntime {
         timings: crate::watchdog::Timings {
             poll_interval: std::time::Duration::from_millis(50),
             quiet_grace: std::time::Duration::from_millis(250),
+            // Comfortably longer than `quiet_grace`, mirroring the production
+            // ordering (3 min vs 15 min): an answered run must reach the
+            // stranded branch well before the stall branch could apply.
+            stall_grace: Some(std::time::Duration::from_millis(600)),
         },
         drain_grace: std::time::Duration::from_millis(300),
         // Short enough to keep the escalation test fast, long enough that a
@@ -318,6 +325,130 @@ sleep 3600
         Some(STUB_SESSION),
         "session id must survive the kill"
     );
+}
+
+/// 2. Mid-turn wedge: codex goes silent having written only interim commentary,
+///    never a final answer. The stall timeout must kill it, leave an incident
+///    bundle, record the silence duration and last event, and - critically -
+///    recover *no* answer, so the run reads as the failure it is.
+#[tokio::test]
+async fn a_mid_turn_wedge_trips_the_stall_timeout() {
+    let scratch = Scratch::new();
+    let stub = scratch.write_stub(&format!(
+        r#"{preamble}
+# An interim note only. codex tags these "commentary"; treating one as a result
+# would report "I am now doing X" as the review.
+printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"I am now regenerating the pilot.","phase":"commentary"}}}}' >> "$ROLL"
+printf '%s\n' '{{"type":"response_item","payload":{{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"{{}}"}}}}' >> "$ROLL"
+# Wedged mid-tool-call: silent from here, exactly like the field rollout that
+# stopped dead with a background cell still running.
+sleep 3600
+"#,
+        preamble = stub_preamble()
+    ));
+
+    let run = run_stub(&scratch, stub).await.expect("run completes");
+
+    let digest = run.digest.expect("digest");
+    assert!(
+        digest
+            .terminated_by_review
+            .as_deref()
+            .is_some_and(|why| why.contains("stall timeout")),
+        "the stall timeout must be what ended this run, got {:?}",
+        digest.terminated_by_review
+    );
+    // The whole point of the answer gate: nothing was produced, so nothing may
+    // be reported as a result.
+    assert!(
+        !digest.captured && !digest.recovered_from_transcript,
+        "a wedged run must not report an answer (captured={}, recovered={})",
+        digest.captured,
+        digest.recovered_from_transcript
+    );
+    assert!(
+        !run.text.contains("regenerating the pilot"),
+        "interim commentary must not be surfaced as the result, got {:?}",
+        run.text
+    );
+    // Forensics that make a misfire on a healthy run diagnosable.
+    assert!(
+        digest.quiet_secs.is_some(),
+        "the observed silence duration must be recorded"
+    );
+    assert_eq!(
+        digest.last_rollout_event.as_deref(),
+        Some("response_item/custom_tool_call"),
+        "the last thing codex was doing must be recorded"
+    );
+    assert_eq!(
+        scratch.incident_dirs().len(),
+        1,
+        "a stalled run must leave exactly one forensic bundle"
+    );
+}
+
+/// The stall timeout is disableable, because it rests on an empirical codex
+/// property rather than a documented contract. With it off, the same wedge must
+/// hang rather than be killed - proving the switch actually reaches the poller.
+#[tokio::test]
+async fn a_disabled_stall_timeout_never_fires() {
+    let scratch = Scratch::new();
+    let stub = scratch.write_stub(&format!(
+        r#"{preamble}
+printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"working","phase":"commentary"}}}}' >> "$ROLL"
+sleep 3600
+"#,
+        preamble = stub_preamble()
+    ));
+
+    let mut runtime = fast_runtime(&scratch, stub);
+    runtime.timings.stall_grace = None;
+
+    let out_file = new_output_file().expect("create -o file");
+    let mut env = BTreeMap::new();
+    env.insert(
+        "CODEX_HOME".to_string(),
+        scratch.codex_home().to_string_lossy().into_owned(),
+    );
+    env.insert("LAST_MSG".to_string(), out_file.clone());
+    env.insert(
+        "LINGER_PID".to_string(),
+        scratch
+            .root
+            .join("linger.pid")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let project = scratch.project();
+    let run = run_codex_json(
+        vec!["exec".to_string(), "--json".to_string()],
+        &out_file,
+        None,
+        Some(&env),
+        "review this",
+        &project,
+        None,
+        &runtime,
+    );
+
+    // Give the poller many times the stall grace it *would* have used. The run
+    // must still be going: with the branch disabled, nothing can end it.
+    let outcome = tokio::time::timeout(std::time::Duration::from_millis(2_000), run).await;
+    assert!(
+        outcome.is_err(),
+        "with the stall timeout disabled, a wedged run must not be killed"
+    );
+
+    // Nothing reaped the stub, so clean it up via its own process group. The
+    // pid is the group leader (`process_group(0)` at spawn).
+    let stub_pid = std::fs::read_to_string(scratch.codex_home().join("pid"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i32>().ok());
+    if let Some(pid) = stub_pid {
+        // SAFETY: negative pid addresses the group this test's stub leads.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
 }
 
 /// 3. A run that keeps writing to its rollout must never be touched, however
