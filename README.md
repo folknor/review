@@ -67,7 +67,7 @@ Use `all` to fan out to every configured archetype, or define **groups** to fan 
 | Flag | Description |
 |------|-------------|
 | `--profile <name>` | Apply a named profile's `model`/`effort`/`env` overrides. Resolved per launched provider from `[<host>.<provider>.<profile>]`. |
-| `--session <id>` | Resume a specific session. Sends raw stdin (no prime prepended). Requires a single `--provider`. |
+| `--session <id>` | Resume a specific session. Sends raw stdin (no prime prepended). `--provider` is optional - the owning provider is read from the sidecar. |
 | `--dry-run` | Print what would be sent instead of sending it |
 | `--provider <list>` | Limit to specific providers (comma-separated) |
 | `--stagger <secs>` | Seconds between each provider launch (default: 30, 0 to disable) |
@@ -114,9 +114,31 @@ echo "what's the worst of those for a single-account user?" | \
   review bugs --provider claude --session 019deabc-0def-7000-8000-abcdef012345
 ```
 
-Constraints:
+Session IDs are provider-scoped, but you rarely need to say which: the sidecar
+records who owns each session, so `--provider` is a filter over a known answer
+rather than a required declaration.
 
-- Requires exactly one `--provider`. Session IDs are provider-scoped.
+```
+review bugs --session 019deabc-...                          # provider inferred
+review bugs --session 019deabc-... --provider claude,codex   # list is fine
+```
+
+The second form matters because those flags carry over verbatim from the fresh
+run that created the session - and a codex session can only be resumed by
+codex, so naming both is not ambiguous.
+
+Two things are still errors: naming a provider the session does not belong to,
+and naming several with no sidecar record to choose between them.
+
+```
+$ review bugs --session 019deabc-... --provider claude
+Error: this session belongs to 'codex', but --provider says 'claude'
+  A session can only be resumed by the provider that created it.
+  Drop --provider to use 'codex'.
+```
+
+Other constraints:
+
 - Bypasses `.review.toml` entirely - no profile overrides are applied.
 - Validation of the session ID is delegated to the provider; an unknown ID produces a provider-specific error, not a `review` error.
 
@@ -160,8 +182,14 @@ proceeds.
 
 **2. `review sessions` listing.** Aggregates by `session_id` and shows recent sessions for the current project (or `--all` projects), most recent first:
 
+A turn that is running right now appears first, so a long run is
+distinguishable from an idle session:
+
 ```
 $ review sessions
+[in flight] codex / turn in flight since 6m
+       session: 019f5f70-b2ca-7590-8a61-be66d9d7cf07
+
 [14m] claude / bugs (run) / 3 touches
        session: 019deabc-0def-7000-8000-abcdef012345
        opened:  review the new sync code
@@ -210,6 +238,84 @@ the turn reached `task_complete`, whether a `stream_error` occurred, the last
 event, and the last in-flight tool call (what was running when it stopped).
 Clean runs skip this.
 
+### When codex hangs
+
+Some codex versions can stop making progress without exiting - either after
+finishing the work, or partway through it. `review` watches the rollout
+transcript while a run is in flight and handles the two cases differently.
+
+**Finished but stuck.** The final answer is already on disk and codex simply
+will not exit. `review` recovers the answer from the rollout, terminates codex,
+and reports normally:
+
+```
+--- codex ---
+exit: -
+signal: SIGTERM
+captured: false
+terminated by review: watchdog: stranded completion
+  rollout silent for: 183s
+  last rollout event: event_msg/task_complete
+recovered: final answer restored from transcript (stream/-o truncated)
+<the real review content>
+```
+
+This is not a timeout. It cannot fire on a run that has not already produced
+its answer, however long that run takes, and it cannot fire while the rollout
+is still growing.
+
+**Wedged with nothing produced.** No answer was ever written and the rollout
+has gone silent. This *is* a timeout, defaulting to 15 minutes:
+
+```
+--- codex ---
+terminated by review: watchdog: stall timeout (900s silent)
+  rollout silent for: 900s
+  last rollout event: response_item/custom_tool_call
+note: review terminated the run; the text below is whatever codex had produced by then
+```
+
+A stalled run writes a forensic bundle (see `review incidents`) and exits
+non-zero, so scripts and CI see a failure rather than a silent success.
+
+(Both digests above are abridged - the usual `turns`, `usage`, `transcript` and
+`incident` lines still print alongside.)
+
+The 15 minutes rests on codex waking itself every few minutes even while
+waiting on a long tool call - not on a documented guarantee. Tune or disable it
+if that ever stops holding:
+
+```toml
+[_defaults]
+stall_timeout_secs = 900   # 0 disables the check entirely
+```
+
+Both are codex-only; claude has no rollout to watch, and legitimately goes
+quiet while waiting on a backgrounded task.
+
+Killing `review` (Ctrl-C or `SIGTERM`) now takes codex and everything it
+spawned with it, rather than leaving it running detached.
+
+### `review incidents`
+
+Any codex run that looks wrong - no capture, non-zero exit, killed by a signal
+- writes a forensic bundle to `~/.local/share/review/incidents/`, holding
+codex's stderr (with backtraces), the raw NDJSON stream, a transcript tail, the
+exact prompt, and a `meta.json` with a copy-pasteable command that replays the
+run verbatim. Clean runs write nothing.
+
+```
+$ review incidents --limit 2
+2026-07-31T10:22:25Z  codex 019fb7b0-cac2-7a02-b121-08af9e2bf626  exit=1  no final answer (died)  [codex-cli 0.146.0]
+       /home/folk/.local/share/review/incidents/2026-07-31T10-22-25Z-codex-019fb7b0-…-f008
+```
+
+Newest first, `--limit <N>` capping the count (default 20). The verdict is one
+of `recovered from transcript`, `no final answer (died)`, `completed (stream/-o
+truncated)`, or `suspicious`, and the codex version is recorded because deaths
+have been version-specific. The bundle path is also printed on the digest of
+the run that produced it.
+
 When using `all` or groups, archetype headers are added:
 
 ```
@@ -237,6 +343,7 @@ tippecanoe = "You are a tippecanoe maintainer weighing tradeoffs."
 
 [_defaults]
 providers = ["claude", "codex"]    # used when --provider is omitted
+stall_timeout_secs = 900           # codex-only; 0 disables. See "When codex hangs".
 
 [_groups]
 sweep = ["security", "bugs"]
@@ -299,9 +406,18 @@ If you're hitting rate limits, increase the stagger. If you're only running 1-2 
 
 ## Concurrency
 
-A global file lock (`/tmp/review.lock`) ensures only one `review` invocation runs providers at a time. Additional invocations queue and wait automatically. This prevents thrashing when multiple projects or terminals launch reviews simultaneously.
+A global file lock (`/tmp/review.lock`) serializes provider **launches**, not
+whole runs. An invocation holds it until its providers have been spawned (the
+fan-out path through its staggered launches, a `--session` resume through the
+single spawn), then releases it and lets the runs proceed concurrently.
+Additional invocations queue and wait for the launch window only.
 
-Note: the lock is shared across all users on the machine. On shared dev machines, one user's review will block another's.
+That distinction is deliberate. Holding the lock for a run's full duration
+meant one wedged provider froze every other `review` on the machine
+indefinitely - a hung run should cost you that run, not the tool.
+
+Note: the lock is shared across all users on the machine. On shared dev
+machines, one user's launch will briefly block another's.
 
 ## License
 

@@ -151,18 +151,9 @@ async fn main() -> Result<()> {
                  can't be applied"
             );
         }
-        let providers = cli.provider.as_deref().unwrap_or(&[]);
-        let provider_name = match providers {
-            [one] => one.as_str(),
-            [] => bail!("--session requires --provider <name> (single provider)"),
-            _ => bail!(
-                "--session requires exactly one --provider, got {}",
-                providers.len()
-            ),
-        };
         return run_session_resume(
             archetype_name,
-            provider_name,
+            cli.provider.as_deref().unwrap_or(&[]),
             session_id,
             cli.dry_run,
             started,
@@ -522,22 +513,96 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Decide which provider a `--session` resume should talk to.
+///
+/// A session belongs to exactly one provider, and the sidecar already records
+/// which. So `--provider` here is a *filter over a known answer*, not a
+/// declaration - which means the old rule ("exactly one `--provider`, or
+/// error") rejected two cases it had no reason to:
+///
+/// - **No `--provider` at all.** The answer is on record; asking the operator
+///   to restate it is busywork, and getting it wrong is an error we could
+///   simply not have.
+/// - **A list that contains the right one.** `--provider claude,codex` against
+///   a codex session is not ambiguous - only codex can resume it. This matters
+///   because the same flags otherwise carry over verbatim from the fresh run
+///   that created the session.
+///
+/// What remains an error is a genuine contradiction (a `--provider` the session
+/// does not belong to) or genuine ambiguity (several named providers and no
+/// record to choose between them).
+fn resolve_session_provider(requested: &[String], recorded: Option<&str>) -> Result<String> {
+    // `--provider codex,codex` names one provider, not two.
+    let mut wanted: Vec<&str> = Vec::new();
+    for p in requested {
+        if !wanted.contains(&p.as_str()) {
+            wanted.push(p.as_str());
+        }
+    }
+
+    let chosen: String = match (wanted.as_slice(), recorded) {
+        // Nothing requested: take the recorded owner.
+        ([], Some(rec)) => rec.to_string(),
+        ([], None) => bail!(
+            "--session requires --provider <name>\n  \
+             There is no sidecar record for this session, so the provider \
+             can't be inferred."
+        ),
+        // One requested, and it disagrees with the record: a real conflict.
+        // Resuming under the wrong provider cannot work, so refuse rather than
+        // guess which of the two the operator meant.
+        ([one], Some(rec)) if *one != rec => bail!(
+            "this session belongs to '{rec}', but --provider says '{one}'\n  \
+             A session can only be resumed by the provider that created it.\n  \
+             Drop --provider to use '{rec}'."
+        ),
+        ([one], _) => (*one).to_string(),
+        // Several requested and the record picks one out: not a conflict.
+        (many, Some(rec)) if many.contains(&rec) => rec.to_string(),
+        (many, Some(rec)) => bail!(
+            "session belongs to '{rec}', which is not among --provider {}\n  \
+             A session can only be resumed by the provider that created it.",
+            many.join(",")
+        ),
+        (many, None) => bail!(
+            "--session requires a single --provider, got {}\n  \
+             There is no sidecar record for this session, so the right one \
+             can't be inferred.",
+            many.join(",")
+        ),
+    };
+
+    if !config::KNOWN_PROVIDERS.contains(&chosen.as_str()) {
+        bail!(
+            "unknown provider '{chosen}'\n  supported: {}",
+            config::KNOWN_PROVIDERS.join(", ")
+        );
+    }
+    Ok(chosen)
+}
+
 /// `--session <id>` mode: resume a specific provider session and send raw
 /// stdin. No `.review.toml` lookup, no prime - the session already has its
 /// grounding from the original interaction. Single provider, single archetype
 /// (the archetype is cosmetic context for audit).
 async fn run_session_resume(
     archetype: &str,
-    provider_name: &str,
+    requested_providers: &[String],
     session_id: &str,
     dry_run: bool,
     started: std::time::Instant,
 ) -> Result<()> {
-    if !config::KNOWN_PROVIDERS.contains(&provider_name) {
-        bail!(
-            "unknown provider '{provider_name}'\n  supported: {}",
-            config::KNOWN_PROVIDERS.join(", ")
-        );
+    // The sidecar knows which provider owns this session, so `--provider` is a
+    // filter rather than a required declaration. Looked up once and reused by
+    // the cache-age gate below.
+    let record = sessions::latest_for_session(session_id);
+    let provider_name = resolve_session_provider(
+        requested_providers,
+        record.as_ref().map(|r| r.provider.as_str()),
+    )?;
+    let provider_name = provider_name.as_str();
+    if requested_providers.is_empty() {
+        eprintln!("provider: {provider_name} (from the session record)");
     }
 
     let stdin_instructions = input::read_stdin()?;
@@ -573,8 +638,8 @@ async fn run_session_resume(
     // `--session` is the *warm* follow-up path, so a cold resume is refused: do
     // a fresh run with restated context instead. When there's no sidecar record
     // we can't determine age, so we proceed rather than block.
-    if let Some(record) = sessions::latest_for_session(session_id) {
-        if let Some(age) = sessions::age_secs(&record) {
+    if let Some(ref record) = record {
+        if let Some(age) = sessions::age_secs(record) {
             if age > timings::STALE_SESSION.as_secs() {
                 bail!(
                     "session last touched {} ago - its prompt cache is cold.\n  \
@@ -1022,4 +1087,96 @@ fn first_line_truncated(s: &str, max_chars: usize) -> String {
     let mut out: String = line.chars().take(max_chars).collect();
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn infers_the_provider_from_the_session_record() {
+        // The common case: `review goal --session <id>` with no --provider at
+        // all. The answer is on record, so requiring it was busywork.
+        let got = resolve_session_provider(&[], Some("codex")).expect("inferred");
+        assert_eq!(got, "codex");
+    }
+
+    #[test]
+    fn a_list_containing_the_owner_is_not_a_conflict() {
+        // The reason this matters: --provider claude,codex carries over verbatim
+        // from the fresh run that created the session. Only codex can resume a
+        // codex session, so there is nothing ambiguous to reject.
+        let got = resolve_session_provider(&req(&["claude", "codex"]), Some("codex"))
+            .expect("resolved to the owner");
+        assert_eq!(got, "codex");
+    }
+
+    #[test]
+    fn a_single_matching_provider_is_accepted() {
+        let got = resolve_session_provider(&req(&["codex"]), Some("codex")).expect("accepted");
+        assert_eq!(got, "codex");
+    }
+
+    #[test]
+    fn repeats_collapse_to_one_provider() {
+        let got = resolve_session_provider(&req(&["codex", "codex"]), None).expect("accepted");
+        assert_eq!(got, "codex");
+    }
+
+    #[test]
+    fn a_contradicting_provider_is_refused() {
+        // Resuming under the wrong provider cannot work, so this stays an error
+        // rather than being silently corrected to the recorded owner.
+        let err = resolve_session_provider(&req(&["claude"]), Some("codex"))
+            .expect_err("must refuse a provider the session does not belong to");
+        let msg = err.to_string();
+        assert!(msg.contains("codex"), "names the owner: {msg}");
+        assert!(msg.contains("claude"), "names what was asked for: {msg}");
+    }
+
+    #[test]
+    fn a_list_missing_the_owner_is_refused() {
+        // Deliberately more than one name, so this exercises the multi-provider
+        // arm rather than collapsing into the single-provider contradiction
+        // case above.
+        let err = resolve_session_provider(&req(&["claude", "opencode"]), Some("codex"))
+            .expect_err("must refuse when the owner is absent from the list");
+        let msg = err.to_string();
+        assert!(msg.contains("codex"), "names the owner: {msg}");
+        assert!(msg.contains("claude,opencode"), "names the list: {msg}");
+    }
+
+    #[test]
+    fn ambiguity_without_a_record_is_refused() {
+        // No record to choose between them, so this is genuinely ambiguous.
+        let err = resolve_session_provider(&req(&["claude", "codex"]), None)
+            .expect_err("must refuse genuine ambiguity");
+        assert!(err.to_string().contains("single --provider"));
+    }
+
+    #[test]
+    fn no_provider_and_no_record_is_refused() {
+        let err = resolve_session_provider(&[], None)
+            .expect_err("nothing to infer from and nothing requested");
+        assert!(err.to_string().contains("--provider"));
+    }
+
+    #[test]
+    fn an_unknown_provider_is_refused() {
+        let err = resolve_session_provider(&req(&["kilo"]), None).expect_err("unknown provider");
+        assert!(err.to_string().contains("supported"));
+    }
+
+    #[test]
+    fn an_unknown_recorded_provider_is_refused() {
+        // A sidecar row naming a provider we no longer support (kilo/opencode
+        // were removed) must not be inferred into an unrunnable invocation.
+        let err = resolve_session_provider(&[], Some("opencode"))
+            .expect_err("recorded provider must still be validated");
+        assert!(err.to_string().contains("supported"));
+    }
 }

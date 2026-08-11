@@ -1,16 +1,8 @@
 # TODO
 
-## `--session` and `--provider` shouldn't clash when they agree
-
-`--session` currently requires exactly one `--provider` and errors on more, but it should not treat a `--provider` list that resolves to the *matching* provider as a conflict. If the named provider matches the session's provider, accept it instead of erroring.
-
 ## `review --help` should print the configured profiles
 
 `--profile <name>` is only discoverable by reading `.review.toml`. Have `--help` list the profiles available for the current host, so an operator can see what `--profile` accepts without opening the config.
-
-## Stall detector for the mid-turn wedge
-
-The rollout-completion watchdog (`src/watchdog.rs`) covers a codex run that finished its answer and then hung. It does *not* cover a run that wedges mid-turn with no answer written - the rollout simply stops advancing. Detecting that means "no rollout growth in N minutes -> incident bundle + nonzero exit", which is a genuine timeout rather than a completion signal, so it stays opt-in and off by default. Hook is marked `TODO(stall-detector)` in `wait_for_stranded_completion`.
 
 ## `review add`
 
