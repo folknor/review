@@ -35,6 +35,16 @@
 //! Any process a stub deliberately leaves running records its pid to
 //! `$LINGER_PID`, so the test can assert on it and clean it up rather than
 //! leaking it into the rest of the suite.
+//!
+//! The generated stub is passed as data to `/bin/sh`; it is never exec'd
+//! directly. In a parallel test process, another thread can fork while
+//! `write_stub` still has a write descriptor open, and that child inherits the
+//! descriptor until its own exec. Directly exec'ing the freshly-written stub in
+//! that window fails with `ETXTBSY`. Exec'ing the system shell avoids the race
+//! by construction while preserving the real child/process-group behaviour.
+//! Suspicious runs consequently probe `/bin/sh --version`, not the script;
+//! `incident::probe_codex_version` must keep its stdin set to null so a shell
+//! that handles an unknown option by reading stdin cannot hang the bundle write.
 
 use super::*;
 use std::collections::BTreeMap;
@@ -117,7 +127,12 @@ impl Scratch {
         }
     }
 
-    /// Write an executable stub `codex` and return its path.
+    /// Write a stub shell script and return its path.
+    ///
+    /// The harness passes this path to `/bin/sh` as data; it must not exec the
+    /// freshly-written file directly (see the module-level `ETXTBSY` note). The
+    /// executable mode is retained only so a failed fixture is convenient to
+    /// invoke by hand while debugging.
     fn write_stub(&self, body: &str) -> String {
         let path = self.root.join("codex-stub.sh");
         let script = format!("#!/bin/sh\n{body}\n");
@@ -159,15 +174,6 @@ impl Drop for Scratch {
 fn stub_preamble() -> String {
     format!(
         r#"
-# Answer the version probe and exit. The incident writer runs `<binary>
-# --version` when a run looks suspicious, and every suspicious run here is a
-# stub run - so without this the probe would re-enter the stub body and hang on
-# its `sleep`, taking the incident write and the whole test with it. Real codex
-# answers --version immediately, so the stub must too.
-if [ "$1" = "--version" ]; then
-  printf '%s\n' 'codex-stub 0.0.0'
-  exit 0
-fi
 # Record our own pid so a test that deliberately leaves this process unreaped
 # can kill its process group afterwards.
 printf '%s\n' "$$" > "$CODEX_HOME/pid"
@@ -185,9 +191,12 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_started"}}}}' >> "$
 /// Fast timings: the whole watchdog cycle completes in well under a second,
 /// while preserving the ordering the production values encode (poll interval
 /// comfortably shorter than the quiet grace).
-fn fast_runtime(scratch: &Scratch, binary: String) -> CodexRuntime {
+fn fast_runtime(scratch: &Scratch) -> CodexRuntime {
     CodexRuntime {
-        binary,
+        // Execute the stable system shell, not the fixture file another test
+        // thread may still have open for writing. The script path is argv[0]
+        // from the shell's perspective; see `run_stub_with`.
+        binary: "/bin/sh".to_string(),
         timings: crate::watchdog::Timings {
             poll_interval: std::time::Duration::from_millis(50),
             quiet_grace: std::time::Duration::from_millis(250),
@@ -208,14 +217,18 @@ fn fast_runtime(scratch: &Scratch, binary: String) -> CodexRuntime {
 
 /// Run the stub through the real codex path as a fresh (oneshot) run, with the
 /// default fast timings.
-async fn run_stub(scratch: &Scratch, binary: String) -> Result<RunOutput> {
-    let runtime = fast_runtime(scratch, binary);
-    run_stub_with(scratch, &runtime).await
+async fn run_stub(scratch: &Scratch, script: String) -> Result<RunOutput> {
+    let runtime = fast_runtime(scratch);
+    run_stub_with(scratch, &script, &runtime).await
 }
 
 /// As `run_stub`, but with an explicit runtime - for tests that vary the
 /// timings themselves.
-async fn run_stub_with(scratch: &Scratch, runtime: &CodexRuntime) -> Result<RunOutput> {
+async fn run_stub_with(
+    scratch: &Scratch,
+    script: &str,
+    runtime: &CodexRuntime,
+) -> Result<RunOutput> {
     let out_file = new_output_file().expect("create -o file");
     let mut env = BTreeMap::new();
     env.insert(
@@ -237,6 +250,7 @@ async fn run_stub_with(scratch: &Scratch, runtime: &CodexRuntime) -> Result<RunO
     let project = scratch.project();
     run_codex_json(
         vec![
+            script.to_string(),
             "exec".to_string(),
             "--json".to_string(),
             "-o".to_string(),
@@ -355,12 +369,12 @@ sleep 3600
         preamble = stub_preamble()
     ));
 
-    let mut runtime = fast_runtime(&scratch, stub);
+    let mut runtime = fast_runtime(&scratch);
     // Inverted relative to production: the stall grace elapses first.
     runtime.timings.quiet_grace = std::time::Duration::from_millis(500);
     runtime.timings.stall_grace = Some(std::time::Duration::from_millis(100));
 
-    let run = run_stub_with(&scratch, &runtime)
+    let run = run_stub_with(&scratch, &stub, &runtime)
         .await
         .expect("run completes");
 
@@ -452,14 +466,14 @@ sleep 3600
         preamble = stub_preamble()
     ));
 
-    let mut runtime = fast_runtime(&scratch, stub);
+    let mut runtime = fast_runtime(&scratch);
     runtime.timings.stall_grace = None;
 
     // Give the poller many times the stall grace it *would* have used. The run
     // must still be going: with the branch disabled, nothing can end it.
     let outcome = tokio::time::timeout(
         std::time::Duration::from_millis(2_000),
-        run_stub_with(&scratch, &runtime),
+        run_stub_with(&scratch, &stub, &runtime),
     )
     .await;
     assert!(
