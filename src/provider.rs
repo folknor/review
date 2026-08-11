@@ -67,6 +67,194 @@ where
     buf
 }
 
+/// Read codex's stdout to EOF exactly like `read_capped`, but additionally scan
+/// the NDJSON for the `thread.started` event and publish the session id on
+/// `sid_tx` the moment it appears.
+///
+/// The watchdog (`crate::watchdog`) needs the session id to locate the rollout
+/// transcript. On a resume we already know it, but on a fresh run codex only
+/// reveals it mid-stream - and the old code could not see it until the whole
+/// stream had hit EOF, which is precisely the thing that never happens on a
+/// wedged run. Scanning stops as soon as the id is found, so the steady-state
+/// cost is the same byte-copy loop as before.
+async fn read_capped_stdout<R>(
+    mut r: R,
+    cap: usize,
+    sid_tx: tokio::sync::watch::Sender<Option<String>>,
+    mut scanning: bool,
+) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16384];
+    // Carry for a line split across two reads; only maintained while scanning.
+    let mut partial: Vec<u8> = Vec::new();
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if scanning {
+                    partial.extend_from_slice(&chunk[..n]);
+                    // Process whole lines; keep the trailing fragment.
+                    while let Some(nl) = partial.iter().position(|b| *b == b'\n') {
+                        let line: Vec<u8> = partial.drain(..=nl).collect();
+                        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&line)
+                            && val.get("type").and_then(|t| t.as_str()) == Some("thread.started")
+                            && let Some(id) = val.get("thread_id").and_then(|t| t.as_str())
+                        {
+                            // A closed receiver just means nobody is watching.
+                            let _ = sid_tx.send(Some(id.to_string()));
+                            scanning = false;
+                            partial = Vec::new();
+                            break;
+                        }
+                    }
+                    // Guard against a pathological unterminated first line
+                    // growing without bound while we wait for a newline.
+                    if partial.len() > 1 << 20 {
+                        partial.clear();
+                    }
+                }
+                if buf.len() < cap {
+                    let take = (cap - buf.len()).min(n);
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+                // Past the cap: keep reading (drain) but stop buffering.
+            }
+        }
+    }
+    buf
+}
+
+/// Process groups of codex children currently running under this `review`.
+///
+/// Needed because codex is spawned into its *own* process group (see
+/// `run_codex_json`), so a terminal `SIGINT` no longer reaches it implicitly and
+/// a `SIGTERM` aimed at `review` never did. Without explicit forwarding, killing
+/// `review` leaves codex running detached - observed in the field, where the
+/// abandoned codex kept working and editing the tree for hours after its
+/// operator thought it had been stopped.
+static CODEX_GROUPS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
+    std::sync::Mutex::new(None);
+
+fn register_group(pid: u32) {
+    if let Ok(mut guard) = CODEX_GROUPS.lock() {
+        guard.get_or_insert_with(Default::default).insert(pid);
+    }
+}
+
+fn unregister_group(pid: u32) {
+    if let Ok(mut guard) = CODEX_GROUPS.lock()
+        && let Some(set) = guard.as_mut()
+    {
+        set.remove(&pid);
+    }
+}
+
+/// Install the one process-wide handler for `SIGINT`/`SIGTERM`: kill every live
+/// codex process group, then exit.
+///
+/// This is deliberately a single global supervisor rather than a `select!` arm
+/// inside each run. Tokio's signal registration is process-wide and permanent -
+/// once a `SignalKind::terminate()` stream has been created, the default
+/// "terminate the process" behaviour is gone for the rest of the run, even after
+/// the stream is dropped. Installing it per-run would therefore have left
+/// `review` quietly ignoring every `SIGTERM` after its first codex invocation,
+/// i.e. *harder* to kill than before - the opposite of the intent.
+///
+/// Exiting here means we forfeit the digest and incident bundle for the
+/// interrupted run. That is the right trade: the operator asked us to stop, and
+/// the rollout transcript is on disk regardless, so `review sessions <id>` can
+/// still show what codex produced.
+pub fn install_signal_supervisor() {
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    tokio::spawn(async move {
+        let name = match sigterm.as_mut() {
+            Some(term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => "SIGINT",
+                    _ = term.recv() => "SIGTERM",
+                }
+            }
+            // SIGTERM handler unavailable: still forward Ctrl-C, and leave
+            // SIGTERM on its OS default (which kills us, orphaning codex - the
+            // old behaviour, and better than not handling anything).
+            None => {
+                let _ = tokio::signal::ctrl_c().await;
+                "SIGINT"
+            }
+        };
+        // Snapshot and release the lock before signalling; never hold it across
+        // the kills.
+        let pids: Vec<u32> = CODEX_GROUPS
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.iter().copied().collect()))
+            .unwrap_or_default();
+        if !pids.is_empty() {
+            eprintln!(
+                "\n{name}: terminating {} running codex process group(s)",
+                pids.len()
+            );
+        }
+        for pid in pids {
+            terminate_group(pid);
+        }
+        // Give SIGTERM a brief moment to land before we go; the escalation to
+        // SIGKILL inside `terminate_group` dies with us, so this is the only
+        // window codex gets to shut down cleanly.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        for pid in CODEX_GROUPS
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.iter().copied().collect::<Vec<_>>()))
+            .unwrap_or_default()
+        {
+            if let Ok(pid) = i32::try_from(pid) {
+                // SAFETY: negative pid addresses the process group; codex was
+                // spawned with `process_group(0)` so this cannot reach `review`.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+        }
+        // 128 + signal number, the conventional shell encoding.
+        std::process::exit(if name == "SIGINT" { 130 } else { 143 });
+    });
+}
+
+/// Terminate a codex child *and everything it spawned* by signalling its whole
+/// process group, escalating to `SIGKILL` after a grace period.
+///
+/// The group, not the pid: codex spawns exec-server processes, unified-exec
+/// background "cells", network proxies and MCP servers, and a wedged codex is
+/// exactly the case where those are still alive. Killing the pid alone would
+/// orphan them. `run_codex_json` puts codex in its own group so `pgid` equals
+/// the child pid and this cannot reach back and signal `review` itself.
+fn terminate_group(pid: u32) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    // SAFETY: a negative pid addresses the process group with that id. codex was
+    // spawned with `process_group(0)`, so this group contains codex and its
+    // descendants and nothing else.
+    unsafe {
+        libc::kill(-pid, libc::SIGTERM);
+    }
+    // Escalate if SIGTERM is ignored - a codex stuck in an unbounded shutdown
+    // await may never process it.
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        // SAFETY: as above. Harmless if the group is already gone (ESRCH).
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    });
+}
+
 /// Removes a path on drop, so the codex `-o` temp file is cleaned up on every
 /// exit path of the runner - including error returns before the normal read.
 struct RemoveOnDrop(String);
@@ -115,6 +303,13 @@ pub struct Digest {
     /// Directory of the forensic bundle written for a suspicious run (stderr,
     /// raw stream, transcript tail, argv, codex version). `None` on clean runs.
     pub incident_path: Option<String>,
+    /// Set when `review` killed codex rather than waiting for it to exit on its
+    /// own: either the rollout watchdog fired (codex had written its final
+    /// answer but would not exit) or the operator signalled us. The exit
+    /// code/signal below will therefore describe *our* kill, not codex's own
+    /// fate - without this field a watchdog kill would be indistinguishable
+    /// from codex being killed by something else.
+    pub terminated_by_review: Option<String>,
 }
 
 /// Flat, serializable projection of a `Digest` for the sidecar and audit logs.
@@ -145,6 +340,11 @@ pub struct DigestSummary {
     /// Forensic-bundle directory for a suspicious run (see `incident.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incident_path: Option<String>,
+    /// Why `review` killed codex, when it did. Persisted so the hang class is
+    /// greppable after the fact:
+    /// `jq 'select(.digest.terminated_by_review != null)'`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminated_by_review: Option<String>,
 }
 
 impl Digest {
@@ -162,6 +362,7 @@ impl Digest {
             output_tokens: self.usage.output_tokens,
             reasoning_output_tokens: self.usage.reasoning_output_tokens,
             incident_path: self.incident_path.clone(),
+            terminated_by_review: self.terminated_by_review.clone(),
         }
     }
 }
@@ -461,6 +662,18 @@ async fn run_codex_json(
         // which is exactly the "no recorded reason" we kept hitting. Set before
         // the profile env so an explicit override still wins.
         .env("RUST_BACKTRACE", "1")
+        // Put codex in its own process group so we can signal it *and every
+        // process it spawned* (exec-server, unified-exec background cells, MCP
+        // servers) as a unit, without the signal reaching `review` itself. This
+        // is what makes the watchdog's kill effective: a wedged codex typically
+        // still has live children, and killing the pid alone would orphan them.
+        //
+        // The cost is that a terminal SIGINT no longer reaches codex
+        // implicitly, since it is no longer in the foreground process group -
+        // so `run_codex_json` installs its own handler and forwards it. Without
+        // that forwarding this change would *cause* the orphaning it exists to
+        // prevent.
+        .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -480,18 +693,139 @@ async fn run_codex_json(
     let stdin = child.stdin.take().context("failed to open codex stdin")?;
     let stdout_pipe = child.stdout.take().context("failed to open codex stdout")?;
     let stderr_pipe = child.stderr.take().context("failed to open codex stderr")?;
-    let write_result = write_stdin(stdin, prompt.as_bytes().to_vec());
-    // Bound in-memory buffering: `wait_with_output` holds the entire stream, so a
-    // runaway/noisy provider could OOM `review` long before the 1 MiB forensic
-    // tail is applied. Buffer up to a generous cap and keep draining past it so
-    // codex never blocks on a full pipe. Real reviews are far under the cap.
-    let (write_res, status, stdout_buf, stderr_buf) = tokio::join!(
-        write_result,
-        child.wait(),
-        read_capped(stdout_pipe, STDOUT_CAPTURE_CAP),
-        read_capped(stderr_pipe, STDERR_CAPTURE_CAP),
-    );
+
+    // Publishes the session id as soon as it is known: immediately on a resume,
+    // or when `thread.started` arrives on stdout for a fresh run. The watchdog
+    // needs it to find the rollout transcript.
+    let (sid_tx, sid_rx) = tokio::sync::watch::channel(known_session_id.clone());
+    let scanning_for_session_id = known_session_id.is_none();
+
+    // Mark the run as in flight so `review sessions` can report "turn in flight
+    // since <time>" instead of showing the *previous* turn's response while this
+    // one runs - the exact ambiguity that made a 10-hour hang look identical to
+    // an idle session.
+    //
+    // This lives in its own task because a fresh run does not learn its session
+    // id until `thread.started` arrives mid-stream. The task parks forever
+    // holding the marker guard; aborting it after the run drops the guard, which
+    // deletes the marker. That covers every normal exit path, and `read_live`
+    // discards markers whose owning pid is gone for the ones it cannot.
+    let marker_task = tokio::spawn({
+        let mut rx = sid_rx.clone();
+        let project = project_root.to_string_lossy().into_owned();
+        async move {
+            loop {
+                let current = rx.borrow_and_update().clone();
+                if let Some(sid) = current {
+                    let _guard = crate::inflight::mark(&sid, "codex", &project);
+                    // Hold the marker until this task is aborted.
+                    std::future::pending::<()>().await;
+                }
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // Bound in-memory buffering: a runaway/noisy provider could otherwise OOM
+    // `review` long before the 1 MiB forensic tail is applied. Buffer up to a
+    // generous cap and keep draining past it so codex never blocks on a full
+    // pipe. Real reviews are far under the cap.
+    //
+    // These are spawned rather than joined inline because the wait below has to
+    // be interruptible, and because pipe EOF is *not* a reliable completion
+    // signal - see the reaping comment further down.
+    let stdout_task = tokio::spawn(read_capped_stdout(
+        stdout_pipe,
+        STDOUT_CAPTURE_CAP,
+        sid_tx,
+        scanning_for_session_id,
+    ));
+    let stderr_task = tokio::spawn(read_capped(stderr_pipe, STDERR_CAPTURE_CAP));
+    let write_task = tokio::spawn(write_stdin(stdin, prompt.as_bytes().to_vec()));
+
+    let child_pid = child.id();
+    // Make this run's process group visible to the signal supervisor, so an
+    // operator killing `review` takes codex with it instead of orphaning it.
+    if let Some(pid) = child_pid {
+        register_group(pid);
+    }
+    // Records that *we* ended the run, and why. See `Digest::terminated_by_review`.
+    let mut terminated_by_review: Option<String> = None;
+
+    // Wait for codex, but stay interruptible.
+    //
+    // Before this loop the code was a plain `join!` on the child plus both
+    // pipes, which had two failure modes, both observed:
+    //   - codex finishes its turn (final answer on disk, `task_complete`
+    //     recorded) and then never exits. `review` blocked for 10+ hours with
+    //     the answer sitting in the rollout the whole time, and produced no
+    //     digest, no incident bundle and no sidecar row, because all of that is
+    //     computed below this point.
+    //   - the operator kills `review`, and codex - a separate process - keeps
+    //     running detached, still modifying the tree.
+    // The watchdog arm below fixes the first; the second is handled process-wide
+    // by `install_signal_supervisor`.
+    let status = {
+        let watchdog = crate::watchdog::wait_for_stranded_completion(
+            sid_rx,
+            env.and_then(|e| e.get("CODEX_HOME")).cloned(),
+            started_at.clone(),
+        );
+        tokio::pin!(watchdog);
+        loop {
+            tokio::select! {
+                // Normal path: codex exited on its own.
+                status = child.wait() => break status,
+
+                // codex has demonstrably produced its answer but will not exit.
+                // Kill the group; the loop then reaps it on the next iteration
+                // and the recovered `final_answer` is reported as usual. The
+                // guard disables this arm once it has fired, so the completed
+                // future is never polled again.
+                stranded = &mut watchdog, if terminated_by_review.is_none() => {
+                    eprintln!("watchdog: {}", stranded.reason);
+                    terminated_by_review = Some("watchdog: stranded completion".to_string());
+                    if let Some(pid) = child_pid {
+                        terminate_group(pid);
+                    }
+                }
+            }
+        }
+    };
+    // Run is over: drop the in-flight marker (aborting the task drops its guard)
+    // and stop advertising the group to the signal supervisor. Both happen
+    // before the `?` below so a failed wait cannot leak either.
+    marker_task.abort();
+    if let Some(pid) = child_pid {
+        unregister_group(pid);
+    }
     let status = status.context("failed to wait for codex")?;
+
+    // The child is reaped, so the run is over regardless of what the pipes do.
+    //
+    // Waiting on pipe EOF here would reintroduce a hang of its own: EOF needs
+    // *every* holder of the write end to close it, which includes any process
+    // codex spawned that inherited the descriptors. Reaping is the authoritative
+    // signal; give the readers a moment to drain what is already buffered, then
+    // take what they have. (Investigation of codex 0.147.0 found no production
+    // `Stdio::inherit` on the exec path - `codex-rs/core/src/spawn.rs` gives
+    // children null/piped stdio - so this is defence in depth rather than a
+    // known live path.)
+    const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+    let stdout_buf = match tokio::time::timeout(DRAIN_GRACE, stdout_task).await {
+        Ok(Ok(buf)) => buf,
+        Ok(Err(_)) | Err(_) => Vec::new(),
+    };
+    let stderr_buf = match tokio::time::timeout(DRAIN_GRACE, stderr_task).await {
+        Ok(Ok(buf)) => buf,
+        Ok(Err(_)) | Err(_) => Vec::new(),
+    };
+    let write_res = match write_task.await {
+        Ok(r) => r,
+        Err(e) => Err(anyhow::anyhow!("stdin write task panicked: {e}")),
+    };
     let duration_ms = start.elapsed().as_millis();
     // A failed prompt write (e.g. broken pipe because codex exited first) is a
     // forensic signal, not a fatal error - the digest still reports what ran.
@@ -638,6 +972,7 @@ async fn run_codex_json(
         log_lines,
         transcript,
         incident_path,
+        terminated_by_review,
     };
 
     // Even when no message came back (a hard freeze before any agent_message,
@@ -706,13 +1041,24 @@ fn print_digest(d: &Digest) {
         println!("signal: {sig}");
     }
     println!("captured: {}", d.captured);
+    // Print this before the notes below: it reframes the exit code/signal, which
+    // otherwise read as codex dying on its own when in fact we killed it.
+    if let Some(ref why) = d.terminated_by_review {
+        println!("terminated by review: {why}");
+    }
     if d.recovered_from_transcript {
         println!("recovered: final answer restored from transcript (stream/-o truncated)");
     } else if !d.captured {
         // No -o and nothing to recover: no final answer was produced. Note that
         // task_complete is NOT a success signal - it fires on aborted turns too
         // (task_complete.last_agent_message=null), so the exit status sets tone.
-        if d.exit_code != Some(0) || d.signal.is_some() {
+        // A kill by us is excluded: "died" would be a lie about our own doing.
+        if d.terminated_by_review.is_some() {
+            println!(
+                "note: review terminated the run; the text below is whatever codex \
+                 had produced by then"
+            );
+        } else if d.exit_code != Some(0) || d.signal.is_some() {
             println!(
                 "note: run died without a final answer; the text below is the last \
                  interim note, not a conclusion"

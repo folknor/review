@@ -3,12 +3,14 @@ mod cli;
 mod config;
 mod config_write;
 mod incident;
+mod inflight;
 mod input;
 mod lock;
 mod prompt;
 mod provider;
 mod sessions;
 mod transcript;
+mod watchdog;
 
 use anyhow::{Result, bail};
 use clap::Parser;
@@ -108,6 +110,14 @@ async fn main() -> Result<()> {
     // waited, not just what the providers spent.
     let started = std::time::Instant::now();
     let cli = Cli::parse();
+
+    // Forward SIGINT/SIGTERM to any running codex process groups before exiting.
+    // codex runs in its own process group (so we can kill it and its children as
+    // a unit), which means it no longer receives a terminal Ctrl-C implicitly -
+    // without this, killing `review` would leave codex running detached.
+    // Installed once, process-wide, and before any provider can be spawned; see
+    // `provider::install_signal_supervisor` for why it cannot be per-run.
+    provider::install_signal_supervisor();
 
     if matches!(cli.command, Some(cli::Command::Init)) {
         return config::init();
@@ -561,10 +571,23 @@ async fn run_session_resume(
         eprintln!("note: no sidecar record for this session (age unknown)");
     }
 
-    // Global lock: serialize against other `review` invocations.
-    let lock_path = std::env::temp_dir().join("review.lock");
-    let lock_file = lock::open_lock_file(&lock_path)?;
-    lock::acquire_blocking(&lock_file)?;
+    // Global lock: serialize the *launch* against other `review` invocations,
+    // matching what the fan-out path does (it releases the lock once its
+    // staggered launches have fired, not when the runs finish).
+    //
+    // It is deliberately NOT held across the run. The lock exists to space out
+    // provider launches, and a resume launches exactly one thing, so there is
+    // nothing left to serialize once it is running. Holding it for the turn's
+    // duration meant a single wedged resume froze all `review` traffic on the
+    // host indefinitely - every later invocation sat printing "Waiting for
+    // another review to finish..." behind a process that would never return.
+    // A hung run should cost you that run, not the tool.
+    {
+        let lock_path = std::env::temp_dir().join("review.lock");
+        let lock_file = lock::open_lock_file(&lock_path)?;
+        lock::acquire_blocking(&lock_file)?;
+        drop(lock_file);
+    }
 
     let result = provider::invoke(
         provider_name,
@@ -579,8 +602,6 @@ async fn run_session_resume(
         false,
     )
     .await;
-
-    drop(lock_file);
 
     // Resolve audit_id/private for the logs. Load config opportunistically (and
     // persist a generated id when a config exists), but fall back so logging
@@ -844,16 +865,45 @@ fn run_sessions(all: bool, limit: usize) -> Result<()> {
         Some(root.to_string_lossy().into_owned())
     };
 
+    // Runs that are happening *right now*. The sidecar is only written when a
+    // run returns, so without this a session with a turn in flight is
+    // indistinguishable from an idle one - it shows its previous response and a
+    // touch count that has not moved. During the codex hang that motivated the
+    // watchdog, that ambiguity is what made a wedged 10-hour run look like
+    // nothing was happening at all.
+    let mut live = inflight::read_live();
+    if let Some(ref proj) = project_filter {
+        live.retain(|m| &m.project == proj);
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if !live.is_empty() {
+        live.sort_by_key(|m| m.started_epoch);
+        for m in &live {
+            let since = sessions::format_age(now.saturating_sub(m.started_epoch));
+            println!("[in flight] {} / turn in flight since {since}", m.provider);
+            println!("       session: {}", m.session_id);
+            if all {
+                println!("       project: {}", m.project);
+            }
+            println!();
+        }
+    }
+
     let mut records = sessions::read_all();
     if let Some(ref proj) = project_filter {
         records.retain(|r| &r.project == proj);
     }
 
     if records.is_empty() {
-        if project_filter.is_some() {
-            eprintln!("no sessions recorded for this project (try --all)");
-        } else {
-            eprintln!("no sessions recorded");
+        if live.is_empty() {
+            if project_filter.is_some() {
+                eprintln!("no sessions recorded for this project (try --all)");
+            } else {
+                eprintln!("no sessions recorded");
+            }
         }
         return Ok(());
     }
@@ -893,11 +943,6 @@ fn run_sessions(all: bool, limit: usize) -> Result<()> {
 
     rows.sort_by_key(|r| std::cmp::Reverse(r.latest_secs));
     rows.truncate(limit);
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
 
     for row in &rows {
         let age = if row.latest_secs == 0 {

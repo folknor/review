@@ -47,7 +47,7 @@ fn codex_home(override_home: Option<&str>) -> PathBuf {
 /// Locate the transcript file for a session id by matching the `-<id>.jsonl`
 /// filename suffix (the id is a UUID, so this is unambiguous). Bounded
 /// recursive walk of the date-nested `sessions/` tree.
-fn find_transcript(session_id: &str, override_home: Option<&str>) -> Option<PathBuf> {
+pub fn find_transcript_path(session_id: &str, override_home: Option<&str>) -> Option<PathBuf> {
     let sessions = codex_home(override_home).join("sessions");
     let needle = format!("-{session_id}.jsonl");
     let mut stack = vec![(sessions, 0u32)];
@@ -93,12 +93,25 @@ fn ts_before(event_ts: &str, since: &str) -> bool {
 /// turn, never a prior completed turn's `final_answer` left in the same rollout
 /// file by a resume that died before emitting `task_started`.
 fn parse(content: &str, since: Option<&str>) -> TranscriptSummary {
-    let mut task_complete = false;
-    let mut stream_error = false;
+    // Per-turn state. A resumed session appends to the same rollout, so this is
+    // snapshotted and reset at each turn boundary (see the `task_started` arm).
+    #[derive(Default, Clone)]
+    struct TurnState {
+        task_complete: bool,
+        stream_error: bool,
+        final_answer: Option<String>,
+        /// call_id -> (name, arguments), preserving insertion order via a Vec.
+        in_flight: Vec<(String, (String, String))>,
+    }
+
+    let mut cur = TurnState::default();
     let mut last_event: Option<String> = None;
-    let mut final_answer: Option<String> = None;
-    // call_id -> (name, arguments), preserving insertion order via a Vec.
-    let mut in_flight: Vec<(String, (String, String))> = Vec::new();
+    // The turn we were in before the most recent `task_started`. Kept so an
+    // empty turn that immediately aborts can be rolled back (see below).
+    let mut prev: Option<TurnState> = None;
+    // Did the current turn emit anything at all? Distinguishes a real turn from
+    // codex's shutdown-time phantom turn.
+    let mut turn_produced_content = false;
 
     for line in content.lines() {
         if line.trim().is_empty() {
@@ -125,30 +138,54 @@ fn parse(content: &str, since: Option<&str>) -> TranscriptSummary {
         match ptype {
             // A resumed session appends new turns to the same rollout file. Reset
             // per-turn state on each turn boundary so the summary reflects the
-            // current (last) turn, not a completed earlier one.
+            // current (last) turn, not a completed earlier one. The outgoing turn
+            // is stashed in `prev` in case this new turn turns out to be a
+            // phantom (see the `turn_aborted` arm).
             Some("task_started") => {
-                task_complete = false;
-                stream_error = false;
-                final_answer = None;
-                in_flight.clear();
+                prev = Some(std::mem::take(&mut cur));
+                turn_produced_content = false;
             }
-            Some("task_complete") => task_complete = true,
-            Some("stream_error") => stream_error = true,
+            // A turn that ends without ever emitting content is codex's
+            // shutdown-time phantom, not a real turn: as of codex-cli 0.147.0,
+            // `codex exec` opens a turn during teardown and aborts it within
+            // milliseconds (`task_started` immediately followed by
+            // `turn_aborted` with `reason: "interrupted"` and zero items
+            // between them). Attributing it as the session's final state made
+            // clean, fully-completed sessions report `task_complete=false` -
+            // which is how the "resume never completes" investigation was sent
+            // chasing a non-existent truncated-turn condition. Roll back to the
+            // real turn instead. A turn that *did* produce content and then
+            // aborted is a genuine interruption and is kept as-is.
+            Some("turn_aborted") if !turn_produced_content => {
+                if let Some(p) = prev.take() {
+                    cur = p;
+                }
+            }
+            Some("task_complete") => {
+                turn_produced_content = true;
+                cur.task_complete = true;
+            }
+            Some("stream_error") => {
+                turn_produced_content = true;
+                cur.stream_error = true;
+            }
             // codex phase-tags agent messages: interim notes are "commentary",
             // the real report is "final_answer". Keep only the latter.
             Some("agent_message") => {
+                turn_produced_content = true;
                 let is_final = payload
                     .and_then(|p| p.get("phase"))
                     .and_then(|p| p.as_str())
                     == Some("final_answer");
                 if is_final {
-                    final_answer = payload
+                    cur.final_answer = payload
                         .and_then(|p| p.get("message"))
                         .and_then(|m| m.as_str())
                         .map(str::to_string);
                 }
             }
             Some(pt) if pt.ends_with("_call") => {
+                turn_produced_content = true;
                 if let Some(p) = payload {
                     let call_id = p
                         .get("call_id")
@@ -165,30 +202,31 @@ fn parse(content: &str, since: Option<&str>) -> TranscriptSummary {
                         .or_else(|| p.get("input"))
                         .map(ToString::to_string)
                         .unwrap_or_default();
-                    in_flight.push((call_id, (name, args)));
+                    cur.in_flight.push((call_id, (name, args)));
                 }
             }
             Some(pt) if pt.ends_with("_call_output") => {
+                turn_produced_content = true;
                 if let Some(call_id) = payload
                     .and_then(|p| p.get("call_id"))
                     .and_then(|c| c.as_str())
                 {
-                    in_flight.retain(|(id, _)| id != call_id);
+                    cur.in_flight.retain(|(id, _)| id != call_id);
                 }
             }
             _ => {}
         }
     }
 
-    let last_in_flight_tool = in_flight.pop().map(|(_, nt)| nt);
+    let last_in_flight_tool = cur.in_flight.pop().map(|(_, nt)| nt);
 
     TranscriptSummary {
         path: String::new(),
-        task_complete,
-        stream_error,
+        task_complete: cur.task_complete,
+        stream_error: cur.stream_error,
         last_event,
         last_in_flight_tool,
-        final_answer,
+        final_answer: cur.final_answer,
     }
 }
 
@@ -203,7 +241,7 @@ pub fn summarize_session(
     override_home: Option<&str>,
     since: Option<&str>,
 ) -> Option<TranscriptSummary> {
-    let path = find_transcript(session_id, override_home)?;
+    let path = find_transcript_path(session_id, override_home)?;
     summarize(&path, since)
 }
 
@@ -314,6 +352,53 @@ mod tests {
         let s = parse(resumed, None);
         assert!(!s.task_complete, "second turn must not report complete");
         assert!(s.stream_error);
+        let (name, _) = s.last_in_flight_tool.expect("in-flight tool from turn 2");
+        assert_eq!(name, "exec_command");
+    }
+
+    // codex-cli 0.147.0 opens a zero-content turn at `codex exec` teardown and
+    // aborts it milliseconds later. Observed verbatim in the field:
+    //   07:23:23.220  task_started  turn_id 67a4fabf-...
+    //   07:23:23.266  turn_aborted  reason: "interrupted"
+    // The summary must still describe the real (completed) turn underneath.
+    #[test]
+    fn phantom_shutdown_turn_does_not_mask_real_completion() {
+        let rollout = concat!(
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"The real report.","phase":"final_answer"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#,
+        );
+        let s = parse(rollout, None);
+        assert!(s.task_complete, "phantom turn must not clear task_complete");
+        assert_eq!(s.final_answer.as_deref(), Some("The real report."));
+    }
+
+    // The rollback must not swallow a *genuine* interruption: a turn that ran
+    // tools and was then aborted really did fail, and must report as such.
+    #[test]
+    fn aborted_turn_with_content_is_not_rolled_back() {
+        let rollout = concat!(
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{}","call_id":"c1"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#,
+        );
+        let s = parse(rollout, None);
+        assert!(
+            !s.task_complete,
+            "a real aborted turn must not inherit the prior turn's completion"
+        );
         let (name, _) = s.last_in_flight_tool.expect("in-flight tool from turn 2");
         assert_eq!(name, "exec_command");
     }
