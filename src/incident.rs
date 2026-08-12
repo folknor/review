@@ -53,6 +53,11 @@ pub struct Incident<'a> {
     /// healthy run diagnosable after the fact.
     pub quiet_secs: Option<u64>,
     pub last_rollout_event: Option<&'a str>,
+    /// Codex's own stated reason for the turn ending (stream `error` /
+    /// `turn.failed`) - typically an upstream refusal. Recorded so a bundle that
+    /// has an explanation says so on its face, rather than being filed alongside
+    /// the genuinely unexplained deaths this directory exists for.
+    pub turn_error: Option<&'a str>,
 }
 
 /// Keep the last MiB of the raw NDJSON stream - the death is at the end, and a
@@ -88,6 +93,8 @@ struct Meta {
     terminated_by_review: Option<String>,
     quiet_secs: Option<u64>,
     last_rollout_event: Option<String>,
+    /// Codex's stated reason for the turn ending, when it gave one.
+    turn_error: Option<String>,
     stdout_bytes: usize,
     stderr_bytes: usize,
     stdout_truncated: bool,
@@ -218,6 +225,7 @@ pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
         terminated_by_review: inc.terminated_by_review.map(str::to_string),
         quiet_secs: inc.quiet_secs,
         last_rollout_event: inc.last_rollout_event.map(str::to_string),
+        turn_error: inc.turn_error.map(str::to_string),
         stdout_bytes: inc.stdout.len(),
         stderr_bytes: inc.stderr.len(),
         stdout_truncated,
@@ -369,6 +377,10 @@ pub struct IncidentSummary {
     pub final_answer_present: Option<bool>,
     #[serde(default)]
     pub codex_version: Option<String>,
+    /// Codex's stated reason for the turn ending. When present it *is* the
+    /// verdict - the bundle is explained, not a mystery death.
+    #[serde(default)]
+    pub turn_error: Option<String>,
 }
 
 pub struct ListedIncident {

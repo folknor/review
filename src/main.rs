@@ -48,6 +48,19 @@ fn died_without_answer(r: &provider::ProviderResult) -> bool {
     }
 }
 
+/// Codex's own stated reason for the turn ending (a stream `error`/`turn.failed`
+/// event) - an upstream refusal, a rate limit, an auth failure.
+///
+/// This is the one death class auto-resume must *not* touch. Auto-resume exists
+/// for the mid-turn wedge, where the work was real and interrupted, so replaying
+/// it can finish the job. A stated failure is a verdict on the request itself:
+/// resending it produces the identical failure, at full cost, and files a second
+/// incident bundle that looks like a second death. Every observed refusal in this
+/// workspace has shown up as exactly that - a pair of bundles seconds apart.
+fn stated_failure(r: &provider::ProviderResult) -> Option<&str> {
+    r.digest.as_ref()?.turn_error.as_deref()
+}
+
 /// A run that produced a real final answer (captured from `-o` or recovered from
 /// the rollout). Used to decide whether an auto-resume actually helped.
 fn got_final_answer(r: &provider::ProviderResult) -> bool {
@@ -366,7 +379,17 @@ async fn main() -> Result<()> {
                     // ended with no real final answer gets one immediate resume
                     // (cache still warm) with a nudge, reusing the same profile.
                     // A manual resume is what rescued the original Death 2.
-                    if prov == "codex"
+                    // Only a run that produced nothing is a resume candidate at
+                    // all; of those, one with a stated reason is skipped, because
+                    // resending it just buys the same refusal twice (see
+                    // `stated_failure`).
+                    if let Some(why) = stated_failure(&first).filter(|_| died_without_answer(&first))
+                    {
+                        eprintln!("codex ended the turn without a final answer: {why}");
+                        eprintln!(
+                            "not auto-resuming - codex stated a reason, so a retry would hit it again"
+                        );
+                    } else if prov == "codex"
                         && died_without_answer(&first)
                         && let Some(sid) = first.session_id.clone()
                     {
@@ -799,14 +822,19 @@ fn run_incidents(limit: usize) -> Result<()> {
             Some(c) => c.to_string(),
             None => "-".to_string(),
         };
-        let verdict = if m.recovered_from_transcript {
-            "recovered from transcript"
-        } else if m.final_answer_present == Some(false) {
-            "no final answer (died)"
-        } else if m.final_answer_present == Some(true) {
-            "completed (stream/-o truncated)"
-        } else {
-            "suspicious"
+        // A stated reason wins over every inferred verdict: these bundles are
+        // explained, and listing them as "died" sends the reader hunting for a
+        // cause codex already gave. Truncated so one refusal can't wrap the line.
+        let stated = m
+            .turn_error
+            .as_deref()
+            .map(|e| format!("turn failed: {}", first_line_truncated(e, 90)));
+        let verdict = match &stated {
+            Some(s) => s.as_str(),
+            None if m.recovered_from_transcript => "recovered from transcript",
+            None if m.final_answer_present == Some(false) => "no final answer (died)",
+            None if m.final_answer_present == Some(true) => "completed (stream/-o truncated)",
+            None => "suspicious",
         };
         let sig = m
             .signal
@@ -940,8 +968,14 @@ fn print_digest_summary(d: &provider::DigestSummary) {
         println!("signal: {sig}");
     }
     println!("captured: {}", d.captured);
+    if let Some(ref msg) = d.turn_error {
+        println!("turn failed: {msg}");
+    }
     if d.recovered_from_transcript {
         println!("recovered: final answer restored from transcript");
+    } else if d.turn_error.is_some() {
+        // Explained above - don't also guess "died mid-turn" at it.
+        println!("note: no conclusion was produced");
     } else if !d.captured && (d.exit_code != Some(0) || d.signal.is_some()) {
         // No real final answer obtained and the process failed: a mid-turn
         // death. task_complete alone doesn't refute this - it fires on aborts.

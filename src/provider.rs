@@ -365,6 +365,12 @@ pub struct Digest {
     /// `type/payload.type` of the last rollout event - what codex was doing when
     /// it went silent.
     pub last_rollout_event: Option<String>,
+    /// Message from a stream `error` / `turn.failed` event: codex itself
+    /// explaining why the turn ended, most commonly an upstream refusal (content
+    /// flagged, rate limit, auth). Distinct from every other failure mode here in
+    /// that the cause is *known and stated*, so it must not be reported as a
+    /// mystery death or retried - see `print_digest` and the auto-resume gate.
+    pub turn_error: Option<String>,
 }
 
 /// Flat, serializable projection of a `Digest` for the sidecar and audit logs.
@@ -404,6 +410,11 @@ pub struct DigestSummary {
     pub quiet_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_rollout_event: Option<String>,
+    /// Codex's own stated reason for the turn ending (stream `error` /
+    /// `turn.failed`). Persisted so refusals are greppable and never confused
+    /// with the hang class: `jq 'select(.digest.turn_error != null)'`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_error: Option<String>,
 }
 
 impl Digest {
@@ -424,6 +435,7 @@ impl Digest {
             terminated_by_review: self.terminated_by_review.clone(),
             quiet_secs: self.quiet_secs,
             last_rollout_event: self.last_rollout_event.clone(),
+            turn_error: self.turn_error.clone(),
         }
     }
 }
@@ -1049,6 +1061,7 @@ async fn run_codex_json(
     let mut turns: u32 = 0;
     let mut usage = Usage::default();
     let mut log_lines: Vec<String> = Vec::new();
+    let mut turn_error: Option<String> = None;
     for line in stdout.lines() {
         if line.trim().is_empty() {
             continue;
@@ -1080,6 +1093,29 @@ async fn run_codex_json(
                         .and_then(|i| i.get("text"))
                         .and_then(|t| t.as_str())
                         .map(String::from);
+                }
+            }
+            // Codex stating why the turn ended: an upstream refusal (content
+            // flagged, rate limit, auth) or a harness error. Dropping these was
+            // what made a policy refusal - fully explained, at the end of the
+            // stream - surface as an unexplained death with a bare interim note,
+            // then get pointlessly auto-resumed into the identical refusal.
+            // `turn.failed` nests the message; the bare `error` event carries it
+            // at the top level. They arrive as a pair saying the same thing, so
+            // last-writer-wins is fine; a genuine second failure is more
+            // informative than the first anyway.
+            Some("error") => {
+                if let Some(m) = val.get("message").and_then(|m| m.as_str()) {
+                    turn_error = Some(m.to_string());
+                }
+            }
+            Some("turn.failed") => {
+                if let Some(m) = val
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                {
+                    turn_error = Some(m.to_string());
                 }
             }
             Some("turn.completed") => {
@@ -1187,6 +1223,7 @@ async fn run_codex_json(
             terminated_by_review: terminated_by_review.as_deref(),
             quiet_secs,
             last_rollout_event: last_rollout_event.as_deref(),
+            turn_error: turn_error.as_deref(),
         })
         .map(|p| p.to_string_lossy().into_owned())
     } else {
@@ -1206,6 +1243,7 @@ async fn run_codex_json(
         terminated_by_review,
         quiet_secs,
         last_rollout_event,
+        turn_error,
     };
 
     // Even when no message came back (a hard freeze before any agent_message,
@@ -1215,15 +1253,23 @@ async fn run_codex_json(
         // No final answer at all - not even an interim message. task_complete
         // is not a success signal (it fires on aborted turns with a null final
         // answer), so a non-zero exit/signal here means the run died mid-turn.
-        let base = if digest.exit_code == Some(0) && digest.signal.is_none() {
-            "(codex produced no final message)"
-        } else {
-            "(codex died without a final answer)"
-        };
+        // A stated reason outranks our inference: when codex told us why the turn
+        // ended, say that instead of guessing from the exit status.
+        let stated = digest
+            .turn_error
+            .as_ref()
+            .map(|m| format!("(codex ended the turn: {m})"));
+        let base = stated.unwrap_or_else(|| {
+            if digest.exit_code == Some(0) && digest.signal.is_none() {
+                "(codex produced no final message)".to_string()
+            } else {
+                "(codex died without a final answer)".to_string()
+            }
+        });
         let stderr = String::from_utf8_lossy(&stderr_buf);
         let detail = stderr.trim();
         if detail.is_empty() {
-            base.to_string()
+            base
         } else {
             format!("{base}\n{detail}")
         }
@@ -1274,6 +1320,13 @@ fn print_digest(d: &Digest) {
         println!("signal: {sig}");
     }
     println!("captured: {}", d.captured);
+    // Ahead of everything else: codex stated why the turn ended, which reframes
+    // the exit code and makes the notes below unnecessary. Most often an upstream
+    // refusal, and the operator's next move (rephrase, get authorised, wait out a
+    // limit) follows from the message, not from the exit status.
+    if let Some(ref msg) = d.turn_error {
+        println!("turn failed: {msg}");
+    }
     // Print this before the notes below: it reframes the exit code/signal, which
     // otherwise read as codex dying on its own when in fact we killed it.
     if let Some(ref why) = d.terminated_by_review {
@@ -1292,7 +1345,12 @@ fn print_digest(d: &Digest) {
         // task_complete is NOT a success signal - it fires on aborted turns too
         // (task_complete.last_agent_message=null), so the exit status sets tone.
         // A kill by us is excluded: "died" would be a lie about our own doing.
-        if d.terminated_by_review.is_some() {
+        if d.turn_error.is_some() {
+            // Already explained by `turn failed:` above. Saying "died without a
+            // final answer" underneath a stated cause is the bug this branch
+            // exists to avoid: it reframes an answered question as a mystery.
+            println!("note: no conclusion was produced; the text below is interim");
+        } else if d.terminated_by_review.is_some() {
             println!(
                 "note: review terminated the run; the text below is whatever codex \
                  had produced by then"

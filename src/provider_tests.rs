@@ -688,3 +688,74 @@ sleep 300
         "a watchdog kill must write exactly one incident bundle"
     );
 }
+
+/// 5. A refused turn: codex states why it stopped and exits non-zero, having
+///    produced only interim commentary. The real shape, from a run whose
+///    recursion-depth hardening tripped the upstream cybersecurity classifier -
+///    two `agent_message`s of working commentary, then `error` + `turn.failed`
+///    carrying the same message, then exit 1 with no `final_answer` on disk.
+///
+///    Before `turn_error`, both events were dropped on the floor: the run was
+///    reported as "died without a final answer", filed as a mystery death, and
+///    auto-resumed straight into the identical refusal - which is why every
+///    occurrence in the field left *two* incident bundles seconds apart.
+#[tokio::test]
+async fn a_stated_turn_failure_is_surfaced_not_reported_as_a_mystery_death() {
+    let scratch = Scratch::new();
+    const REFUSAL: &str = "This content was flagged for possible cybersecurity risk. \
+If this seems wrong, try rephrasing your request.";
+    let stub = scratch.write_stub(&format!(
+        r#"{preamble}
+# Interim commentary only - no final_answer is ever written to the rollout,
+# which is what makes this indistinguishable from a mid-turn death without the
+# error events.
+printf '%s\n' '{{"type":"item.completed","item":{{"type":"agent_message","text":"I am now mapping the parser tests."}}}}'
+printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"I am now mapping the parser tests.","phase":"commentary"}}}}' >> "$ROLL"
+# Codex says why it is stopping, as a pair of events carrying the same message.
+printf '%s\n' '{{"type":"error","message":"{refusal}"}}'
+printf '%s\n' '{{"type":"turn.failed","error":{{"message":"{refusal}"}}}}'
+exit 1
+"#,
+        preamble = stub_preamble(),
+        refusal = REFUSAL
+    ));
+
+    let run = run_stub(&scratch, stub).await.expect("run completes");
+    let digest = run.digest.expect("digest");
+
+    // The point of the fix: codex's stated reason is carried, not discarded.
+    assert_eq!(
+        digest.turn_error.as_deref(),
+        Some(REFUSAL),
+        "the turn.failed / error message must be captured"
+    );
+    // The surrounding failure signature is unchanged - this still *is* a run
+    // that produced no answer, and must keep reporting as one.
+    assert_eq!(digest.exit_code, Some(1));
+    assert!(!digest.captured, "no -o file was written");
+    assert!(
+        !digest.recovered_from_transcript,
+        "there is no final_answer to recover - a refusal is not a truncation"
+    );
+    // It is persisted, so refusals stay greppable in the sidecar and audit logs.
+    assert_eq!(digest.summary().turn_error.as_deref(), Some(REFUSAL));
+
+    // The interim note is still returned (it is all there is), but the reported
+    // text must not be the bare "died without a final answer" fabrication.
+    assert!(
+        run.text.contains("mapping the parser tests"),
+        "the interim commentary is still surfaced, got {:?}",
+        run.text
+    );
+
+    // A refusal is still suspicious enough to bundle - the evidence is worth
+    // keeping - but the bundle now carries the reason on its face, so
+    // `review incidents` can say what happened instead of guessing "died".
+    let dirs = scratch.incident_dirs();
+    assert_eq!(dirs.len(), 1, "a refused run still writes one bundle");
+    let meta = std::fs::read_to_string(dirs[0].join("meta.json")).expect("meta.json");
+    assert!(
+        meta.contains("This content was flagged"),
+        "meta.json must record the stated reason, got {meta}"
+    );
+}
