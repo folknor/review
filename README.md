@@ -106,7 +106,17 @@ echo "audit the auth flow" | review security --profile opus
 
 `--profile opus` resolves `[<host>.<provider>.opus]` for each launched provider and applies its overrides. If any launched provider lacks that profile table, the run errors naming the missing `[host.provider.profile]`.
 
-`sandbox` maps to codex's and grok's `--sandbox` (for codex: `read-only`, `workspace-write`, `danger-full-access`); it defaults to `read-only` when unset, so a bare `review` run can never modify files. **Claude ignores it** -- claude's `--permission-mode` is a tool-approval policy on a different axis with no honest mapping.
+`sandbox` takes one of `review`'s three levels -- `read-only`, `workspace-write`, `danger-full-access` -- and defaults to `read-only` when unset, so a bare `review` run can never modify files. **Claude ignores it** -- claude's `--permission-mode` is a tool-approval policy on a different axis with no honest mapping.
+
+The levels are `review`'s own vocabulary, translated per provider at launch, because the providers do not agree on the names and grok *refuses to start* on one it cannot resolve:
+
+| `review` level | codex `--sandbox` | grok `--sandbox` |
+|---|---|---|
+| `read-only` | `read-only` | `read-only` |
+| `workspace-write` | `workspace-write` | `workspace` |
+| `danger-full-access` | `danger-full-access` | `none` |
+
+A value `review` does not recognise is passed through to the provider verbatim, so a custom grok profile defined in `~/.grok/sandbox.toml` still works; the provider validates its own vocabulary and fails before running a turn if the name is wrong.
 
 ### Follow-up via `--session`
 

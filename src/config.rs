@@ -5,6 +5,41 @@ use std::collections::BTreeMap;
 const CONFIG_FILENAME: &str = ".review.toml";
 pub const KNOWN_PROVIDERS: &[&str] = &["claude", "codex", "grok"];
 
+/// Translate `review`'s sandbox vocabulary into a provider's own.
+///
+/// `review`'s levels, in increasing order of access, are `read-only`,
+/// `workspace-write` and `danger-full-access`. The names are codex's, because
+/// they were `review`'s documented config surface before any translation
+/// existed - adopting a fresh set would have silently changed the meaning of
+/// every profile already written.
+///
+/// The problem this solves is that the names are not interchangeable: codex's
+/// writable profile is `workspace-write`, grok's is `workspace`, and grok
+/// *hard-errors* on a name it cannot resolve rather than falling back. So a
+/// profile written for one provider broke the moment it was pointed at the
+/// other, at launch time, for a reason that reads as a missing config file.
+///
+/// An unrecognised value is passed through verbatim rather than rejected. Grok
+/// resolves sandbox names against user-defined profiles in `~/.grok/sandbox.toml`
+/// (and codex has its own config surface), so a name `review` does not know may
+/// still be one the operator legitimately defined. Rejecting it here would make
+/// `review` the reason a valid provider config could not be used; passing it on
+/// leaves the provider to validate its own vocabulary, which it does with a
+/// better error than we could write. The cost is that a typo reaches the
+/// provider - acceptable, because it fails before any turn runs and quotes the
+/// offending name.
+pub fn sandbox_for(provider: &str, sandbox: &str) -> String {
+    match (provider, sandbox) {
+        // Grok's built-ins are `read-only`, `workspace` and `none`.
+        ("grok", "workspace-write") => "workspace".to_string(),
+        ("grok", "danger-full-access") => "none".to_string(),
+        // `read-only` happens to be spelled the same everywhere, which is why
+        // the default path was portable across providers by luck rather than
+        // design.
+        _ => sandbox.to_string(),
+    }
+}
+
 /// Names that can't be archetypes or groups because the CLI routes them
 /// elsewhere: `all` (fan-out keyword) and the clap subcommands (`init`,
 /// `sessions`, plus the auto-generated `help`). Without this guard such a
@@ -361,6 +396,66 @@ pub fn init() -> Result<()> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_levels_translate_per_provider() {
+        // The default has to stay portable: it is what every bare run gets, on
+        // every provider, and it is the invariant that a run cannot write.
+        for provider in KNOWN_PROVIDERS {
+            assert_eq!(
+                sandbox_for(provider, "read-only"),
+                "read-only",
+                "{provider} must understand the default level"
+            );
+        }
+
+        // The levels that actually differ. Passing codex's spelling to grok is
+        // not a soft failure - grok cannot resolve the profile and refuses to
+        // start - so this mapping is what makes one profile vocabulary usable
+        // across providers.
+        assert_eq!(sandbox_for("codex", "workspace-write"), "workspace-write");
+        assert_eq!(sandbox_for("grok", "workspace-write"), "workspace");
+        assert_eq!(
+            sandbox_for("codex", "danger-full-access"),
+            "danger-full-access"
+        );
+        assert_eq!(sandbox_for("grok", "danger-full-access"), "none");
+    }
+
+    #[test]
+    fn unknown_sandbox_names_reach_the_provider_unchanged() {
+        // Grok resolves names against user-defined profiles in
+        // `~/.grok/sandbox.toml`, so a name `review` does not recognise may be
+        // perfectly valid. Rewriting or rejecting it would make `review` the
+        // reason a working provider config could not be used.
+        assert_eq!(
+            sandbox_for("grok", "my-custom-profile"),
+            "my-custom-profile"
+        );
+        assert_eq!(
+            sandbox_for("codex", "my-custom-profile"),
+            "my-custom-profile"
+        );
+    }
+
+    /// `review`'s documented sandbox vocabulary. Kept here rather than in the
+    /// module so it cannot drift into looking like a runtime allowlist - the
+    /// translation deliberately passes unknown names through.
+    const SANDBOX_LEVELS: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
+
+    #[test]
+    fn every_documented_level_maps_somewhere() {
+        // Guards the pairing between the documented vocabulary and the match
+        // arms: adding a level here without teaching grok about it would
+        // otherwise pass it through verbatim and fail at launch.
+        for level in SANDBOX_LEVELS {
+            let mapped = sandbox_for("grok", level);
+            assert!(
+                ["read-only", "workspace", "none"].contains(&mapped.as_str()),
+                "{level} maps to {mapped}, which is not one of grok's built-in profiles"
+            );
+        }
+    }
 
     #[test]
     fn parses_archetypes() {

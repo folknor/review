@@ -549,6 +549,13 @@ pub async fn invoke(
     launched: Option<LaunchSignal>,
     runtime: &CodexRuntime,
 ) -> ProviderResult {
+    // Profiles carry `review`'s own sandbox vocabulary; each provider spells the
+    // levels differently and grok hard-errors on a name it cannot resolve, so
+    // the translation happens once, here, and the runners below only ever see
+    // their own native value.
+    let sandbox = sandbox.map(|s| crate::config::sandbox_for(provider, s));
+    let sandbox = sandbox.as_deref();
+
     let result = match provider {
         // `sandbox` is an OS filesystem sandbox, which codex and grok both have
         // and claude does not: claude's `--permission-mode` is a tool-approval
