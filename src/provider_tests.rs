@@ -834,8 +834,12 @@ fn grok_cancelled_turn_is_not_an_answer() {
 
     // It must still read as a failure everywhere that matters: exit code,
     // greppable digest, and no auto-resume (a stated reason is not a wedge).
-    let digest = super::grok_no_answer_digest(reason);
-    assert_eq!(digest.exit_code, Some(1), "a run with no answer exits 1");
+    let digest = super::grok_no_answer_digest(reason, &exited(1));
+    assert_eq!(
+        digest.exit_code,
+        Some(1),
+        "the digest reports the status we observed"
+    );
     assert!(!digest.captured, "nothing was captured");
     assert!(
         !digest.recovered_from_transcript,
@@ -847,12 +851,24 @@ fn grok_cancelled_turn_is_not_an_answer() {
     );
 }
 
+/// An exit status with the given code, for digests that must report what was
+/// observed rather than what was assumed.
+fn exited(code: i32) -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(code << 8)
+}
+
 #[test]
 fn grok_missing_stop_reason_is_not_an_answer() {
     // A future grok that drops or renames the field must not be read as
     // success: the whole gate rests on that field being present and known.
-    let outcome = super::interpret_grok_output(r#"{"text": "half a thought"}"#, "")
-        .expect("an unlabelled turn still ran");
+    // This object still identifies itself as a result (it carries a session
+    // id), so the turn demonstrably ran - it just did not say how it ended.
+    let outcome = super::interpret_grok_output(
+        r#"{"text": "half a thought", "sessionId": "019ffbc5-2b48-7611-a7f2-48db1fa2b0ed"}"#,
+        "",
+    )
+    .expect("an unlabelled turn still ran");
     let super::GrokOutcome::NoAnswer { reason, .. } = outcome else {
         panic!("an unlabelled turn is not a proven answer");
     };
@@ -860,6 +876,24 @@ fn grok_missing_stop_reason_is_not_an_answer() {
         reason.contains("missing"),
         "says the reason was absent: {reason}"
     );
+}
+
+#[test]
+fn json_that_is_not_a_result_object_is_a_launch_failure() {
+    // Every field of a result object is optional, so *any* JSON object
+    // deserializes into an all-default `GrokResult`. Reading that as "a turn
+    // ran but did not answer" would infer the fact from successful parsing
+    // rather than from evidence - and `NoAnswer` returns `Ok`, which tells
+    // `--session` the prompt cache was warmed. An unrecognised pre-turn failure
+    // would then mark a cold session warm and get the *next* resume refused.
+    let err = super::interpret_grok_output(r#"{"unexpected": "shape"}"#, "Error: something else")
+        .expect_err("nothing here says a turn ran");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no recognisable result"),
+        "distinct from a labelled non-answer: {msg}"
+    );
+    assert!(msg.contains("something else"), "quotes the reason: {msg}");
 }
 
 #[test]

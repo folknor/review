@@ -28,6 +28,15 @@ pub const KNOWN_PROVIDERS: &[&str] = &["claude", "codex", "grok"];
 /// better error than we could write. The cost is that a typo reaches the
 /// provider - acceptable, because it fails before any turn runs and quotes the
 /// offending name.
+///
+/// The three level names are consequently **reserved**: they always mean
+/// `review`'s level, so a custom grok profile named `workspace-write` or
+/// `danger-full-access` cannot be selected through a `.review.toml` profile.
+/// That is the deliberate trade - the whole point is that these three names mean
+/// the same thing whichever provider a profile is pointed at, which fails the
+/// moment one provider can reinterpret them. Custom profiles have the entire
+/// rest of the namespace, and `read-only` is unaffected either way because every
+/// provider already spells it that way.
 pub fn sandbox_for(provider: &str, sandbox: &str) -> String {
     match (provider, sandbox) {
         // Grok's built-ins are `read-only`, `workspace` and `none`.
@@ -399,9 +408,13 @@ mod tests {
 
     #[test]
     fn sandbox_levels_translate_per_provider() {
-        // The default has to stay portable: it is what every bare run gets, on
-        // every provider, and it is the invariant that a run cannot write.
-        for provider in KNOWN_PROVIDERS {
+        // The default has to stay portable: it is what every bare run gets and
+        // it is the invariant that a run cannot write. Claude is deliberately
+        // not in this list - it has no filesystem sandbox to translate to, and
+        // `invoke` drops the value rather than mapping it, so asserting a level
+        // survives translation for claude would imply an enforcement claude does
+        // not make.
+        for provider in ["codex", "grok"] {
             assert_eq!(
                 sandbox_for(provider, "read-only"),
                 "read-only",

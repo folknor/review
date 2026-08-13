@@ -766,6 +766,26 @@ struct GrokResult {
     kind: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    /// Not read for its value - only as evidence that grok got as far as
+    /// running a turn. See `ran_a_turn`.
+    #[serde(rename = "numTurns", alias = "num_turns", default)]
+    num_turns: Option<u32>,
+}
+
+impl GrokResult {
+    /// Whether this object is evidence that a turn actually ran.
+    ///
+    /// Every field is optional, so *any* JSON object deserializes into an
+    /// all-default `GrokResult`. Treating that as "a turn ran but did not
+    /// answer" infers the fact from successful parsing rather than from
+    /// evidence, and the inference is load-bearing: `NoAnswer` returns `Ok`,
+    /// which tells `--session` the prompt cache was warmed and refreshes the
+    /// staleness clock. An unrecognised pre-turn failure would therefore mark a
+    /// cold session warm. Requiring one of grok's own result fields keeps that
+    /// claim tied to something grok actually said.
+    fn ran_a_turn(&self) -> bool {
+        self.stop_reason.is_some() || self.session_id.is_some() || self.num_turns.is_some()
+    }
 }
 
 /// The one `stopReason` that means `text` is an answer. Anything else
@@ -845,17 +865,30 @@ async fn run_grok(
         .context("failed to wait for grok")?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    // Grok echoes the session id it actually used - on a fresh run that is the
-    // UUID we passed, but reading it back means a future grok that reassigns it
-    // cannot silently orphan the session. Either way the id survives a turn that
-    // produced no answer, so that turn can still be resumed.
-    let keep_id = |echoed: Option<String>| oneshot.then_some(echoed).flatten().or(oneshot_id);
+    // Only a *fresh* run reports a session id: it is new information, and it
+    // must survive a turn that produced no answer so that turn can still be
+    // resumed. A resume reports `None` because the caller passed the id in and
+    // already records it (`main` logs the `--session` argument, not this field);
+    // claude does the same. Preferring grok's echoed id over the UUID we
+    // generated means a future grok that reassigns it cannot orphan the session.
+    let keep_id = |echoed: Option<String>| if oneshot { echoed.or(oneshot_id) } else { None };
 
     match interpret_grok_output(&stdout, &stderr)? {
         GrokOutcome::Answered(answer) => Ok(RunOutput {
             text: answer.text,
             session_id: keep_id(answer.session_id),
-            digest: None,
+            // A real answer from a process that nonetheless exited non-zero is
+            // still a real answer, but the status is worth surfacing rather
+            // than discarding - it is the only sign that something went wrong
+            // after the turn finished. `captured: true` keeps it out of
+            // `died_without_answer`, so the run does not fail on it.
+            digest: (!output.status.success()).then(|| Digest {
+                captured: true,
+                ..grok_no_answer_digest(
+                    "grok exited non-zero after producing an answer".to_string(),
+                    &output.status,
+                )
+            }),
         }),
         GrokOutcome::NoAnswer {
             reason,
@@ -864,7 +897,7 @@ async fn run_grok(
         } => Ok(RunOutput {
             text,
             session_id: keep_id(session_id),
-            digest: Some(grok_no_answer_digest(reason)),
+            digest: Some(grok_no_answer_digest(reason, &output.status)),
         }),
     }
 }
@@ -896,10 +929,14 @@ struct GrokAnswer {
 /// first, persists flat, and never invites a retry. The remaining fields
 /// describe a run with no captured answer, which is what happened; the
 /// codex-specific forensics stay `None` because grok has no rollout.
-fn grok_no_answer_digest(reason: String) -> Digest {
+fn grok_no_answer_digest(reason: String, status: &std::process::ExitStatus) -> Digest {
     Digest {
-        exit_code: Some(1),
-        signal: None,
+        // The *observed* status, not an assumed one. Hardcoding `1` here made
+        // the digest assert something it had never looked at - and the exit
+        // code is the field an operator reads to tell "grok declined" from
+        // "grok was killed".
+        exit_code: status.code(),
+        signal: signal_name(status),
         captured: false,
         recovered_from_transcript: false,
         turns: 0,
@@ -944,6 +981,17 @@ fn interpret_grok_output(stdout: &str, stderr: &str) -> Result<GrokOutcome> {
     if result.kind.as_deref() == Some("error") {
         let detail = result.message.as_deref().unwrap_or(stdout.trim());
         anyhow::bail!("grok reported an error: {detail}");
+    }
+
+    // Nothing here identifies this as a result object, so it is not evidence a
+    // turn ran - treat it like any other pre-turn failure.
+    if !result.ran_a_turn() {
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        anyhow::bail!("grok produced no recognisable result: {detail}");
     }
 
     let stop = result.stop_reason.as_deref().unwrap_or("missing");

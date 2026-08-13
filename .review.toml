@@ -7,16 +7,16 @@ providers = ["codex"]
 
 [dm6.codex.bugs]
 model = "gpt-5.6-sol"
-effort = "xhigh"
+effort = "low"
 
 [dm6.codex.implement]
-model = "gpt-5.6-terra"
-effort = "medium"
+model = "gpt-5.6-sol"
+effort = "low"
 sandbox = "workspace-write"
 
 [plantasjen.codex.bugs]
 model = "gpt-5.6-sol"
-effort = "xhigh"
+effort = "low"
 sandbox = "read-only"
 # NB: forcing HTTP transport here (a custom openai-http provider via `config`)
 # was tried and reverted - on this account the HTTP path 403s on /v1/models
