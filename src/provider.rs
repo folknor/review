@@ -19,10 +19,17 @@ pub fn is_available(provider: &str) -> bool {
 /// defeats symlink pre-planting on what used to be a predictable pid+archetype
 /// path. The file is created empty; codex overwrites it with the final message.
 fn new_output_file() -> Result<String> {
+    new_temp_file("codex")
+}
+
+/// The same exclusive-creation dance for any provider temp file. `tag` only
+/// distinguishes the files to a human reading the temp dir; the UUID is what
+/// makes the name unique and unguessable.
+fn new_temp_file(tag: &str) -> Result<String> {
     let dir = std::env::temp_dir();
     for _ in 0..8 {
         let path = dir.join(format!(
-            "review-codex-{}.txt",
+            "review-{tag}-{}.txt",
             crate::config::generate_uuid()
         ));
         match std::fs::OpenOptions::new()
@@ -33,13 +40,11 @@ fn new_output_file() -> Result<String> {
             Ok(_) => return Ok(path.to_string_lossy().into_owned()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "failed to create codex output temp file: {e}"
-                ));
+                return Err(anyhow::anyhow!("failed to create {tag} temp file: {e}"));
             }
         }
     }
-    anyhow::bail!("could not create a unique codex output temp file after 8 tries")
+    anyhow::bail!("could not create a unique {tag} temp file after 8 tries")
 }
 
 /// Caps on how much provider output we buffer in memory. Generous - real reviews
@@ -545,15 +550,29 @@ pub async fn invoke(
     runtime: &CodexRuntime,
 ) -> ProviderResult {
     let result = match provider {
-        // `sandbox` is a codex-only concept (an OS filesystem sandbox). Claude's
-        // `--permission-mode` is a tool-approval policy on a different axis with
-        // no honest mapping, so claude ignores it. `config` (codex `-c`) is
-        // likewise codex-only.
+        // `sandbox` is an OS filesystem sandbox, which codex and grok both have
+        // and claude does not: claude's `--permission-mode` is a tool-approval
+        // policy on a different axis with no honest mapping, so claude ignores
+        // it. `config` (codex `-c`) stays codex-only.
         "claude" => {
             run_claude(
                 session_id,
                 model,
                 effort,
+                env,
+                prompt,
+                project_root,
+                oneshot,
+                launched,
+            )
+            .await
+        }
+        "grok" => {
+            run_grok(
+                session_id,
+                model,
+                effort,
+                sandbox,
                 env,
                 prompt,
                 project_root,
@@ -719,6 +738,237 @@ async fn run_claude(
         session_id: oneshot_id,
         digest: None,
     })
+}
+
+/// Grok's headless result object (`--output-format json`). One JSON object on
+/// stdout per run, whatever the outcome; the fields we don't use (usage, cost,
+/// requestId, thought) are ignored rather than modelled.
+#[derive(serde::Deserialize)]
+struct GrokResult {
+    #[serde(default)]
+    text: String,
+    #[serde(rename = "stopReason", default)]
+    stop_reason: Option<String>,
+    #[serde(rename = "sessionId", default)]
+    session_id: Option<String>,
+    /// Grok also prints failures that happen *before* a turn as a typed line on
+    /// stdout (`{"type":"error","message":...}`). Every field above is optional,
+    /// so such a line parses cleanly as an all-default result - these two carry
+    /// the reason that would otherwise be silently discarded.
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// The one `stopReason` that means `text` is an answer. Anything else
+/// (`cancelled`, `max_tokens`, ...) means `text` is whatever the model happened
+/// to have said when it was cut off - interim commentary, not a result.
+const GROK_OK_STOP: &str = "end_turn";
+
+#[allow(clippy::too_many_arguments)]
+async fn run_grok(
+    session_id: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    sandbox: Option<&str>,
+    env: Option<&std::collections::BTreeMap<String, String>>,
+    prompt: &str,
+    project_root: &Path,
+    oneshot: bool,
+    launched: Option<LaunchSignal>,
+) -> Result<RunOutput> {
+    // Grok takes no prompt on stdin - `-p` requires a value and `-p -` is read
+    // literally as a one-character prompt. `--prompt-file` is the equivalent
+    // escape from shell argument length limits, so the prompt goes via a temp
+    // file instead of a pipe.
+    let prompt_path = new_temp_file("grok-prompt")?;
+    std::fs::write(&prompt_path, prompt)
+        .with_context(|| format!("failed to write grok prompt file {prompt_path}"))?;
+    let _prompt_file = RemoveOnDrop(prompt_path.clone());
+
+    let oneshot_id = if oneshot {
+        Some(crate::config::generate_uuid())
+    } else {
+        None
+    };
+
+    let mut args: Vec<String> = if let Some(ref id) = oneshot_id {
+        vec!["--session-id".to_string(), id.clone()]
+    } else {
+        vec!["--resume".to_string(), session_id.to_string()]
+    };
+    args.push("--prompt-file".to_string());
+    args.push(prompt_path.clone());
+    args.push("--output-format".to_string());
+    args.push("json".to_string());
+    args.push("--permission-mode".to_string());
+    args.push("dontAsk".to_string());
+    // Unlike claude, grok has a real filesystem sandbox on the same axis as
+    // codex's, so the profile field maps honestly and the default still holds:
+    // a bare run cannot modify files.
+    args.push("--sandbox".to_string());
+    args.push(sandbox.unwrap_or("read-only").to_string());
+    if let Some(m) = model {
+        args.push("-m".to_string());
+        args.push(m.to_string());
+    }
+    if let Some(e) = effort {
+        args.push("--reasoning-effort".to_string());
+        args.push(e.to_string());
+    }
+
+    let mut cmd = Command::new("grok");
+    cmd.args(&args)
+        .current_dir(project_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(vars) = env {
+        cmd.envs(vars);
+    }
+    let child = cmd.spawn().context("failed to spawn grok")?;
+    if let Some(signal) = launched {
+        let _ = signal.send(());
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .context("failed to wait for grok")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    // Grok echoes the session id it actually used - on a fresh run that is the
+    // UUID we passed, but reading it back means a future grok that reassigns it
+    // cannot silently orphan the session. Either way the id survives a turn that
+    // produced no answer, so that turn can still be resumed.
+    let keep_id = |echoed: Option<String>| oneshot.then_some(echoed).flatten().or(oneshot_id);
+
+    match interpret_grok_output(&stdout, &stderr)? {
+        GrokOutcome::Answered(answer) => Ok(RunOutput {
+            text: answer.text,
+            session_id: keep_id(answer.session_id),
+            digest: None,
+        }),
+        GrokOutcome::NoAnswer {
+            reason,
+            text,
+            session_id,
+        } => Ok(RunOutput {
+            text,
+            session_id: keep_id(session_id),
+            digest: Some(grok_no_answer_digest(reason)),
+        }),
+    }
+}
+
+/// A grok run that produced a real answer.
+#[derive(Debug)]
+struct GrokAnswer {
+    text: String,
+    session_id: Option<String>,
+}
+
+/// A grok turn that ran but produced no answer, expressed the same way codex's
+/// deaths are: `Ok` carrying a digest, never `Err`.
+///
+/// The distinction that matters is between *never reaching the provider* (a
+/// spawn failure, an unknown model, a session that does not exist - nothing ran,
+/// no session exists to resume, no prompt cache was warmed) and *running a turn
+/// that produced no answer*. Only the first is an `Err`. Collapsing the second
+/// into `Err` too costs two things that are invisible until you need them:
+/// `invoke` forces `session_id: None` on the error path, so the id grok already
+/// minted is dropped and the cut-off turn cannot be resumed - exactly the turn
+/// most worth resuming; and `--session` refreshes its cold-cache clock on
+/// `output.is_ok()`, so a resume that ran and warmed the cache would leave the
+/// clock stale and get the *next* resume refused. Codex avoids both by returning
+/// `Ok` with a death digest, and grok has no reason to differ.
+///
+/// `turn_error` is the honest field for it: grok stated why the turn ended, so
+/// this is a stated failure in exactly the sense codex means, and it prints
+/// first, persists flat, and never invites a retry. The remaining fields
+/// describe a run with no captured answer, which is what happened; the
+/// codex-specific forensics stay `None` because grok has no rollout.
+fn grok_no_answer_digest(reason: String) -> Digest {
+    Digest {
+        exit_code: Some(1),
+        signal: None,
+        captured: false,
+        recovered_from_transcript: false,
+        turns: 0,
+        usage: Usage::default(),
+        log_lines: Vec::new(),
+        transcript: None,
+        incident_path: None,
+        terminated_by_review: None,
+        quiet_secs: None,
+        last_rollout_event: None,
+        turn_error: Some(reason),
+    }
+}
+
+/// Decide whether a finished grok run produced an answer, from its streams
+/// alone.
+///
+/// Two distinct failures have to stay distinguishable, because the operator's
+/// next move differs. A run that never reached a turn at all (unknown model,
+/// missing session, auth failure) prints a bare message and no result object -
+/// nothing ran, so nothing was spent. A run that reached a turn and was cut off
+/// emits a full result object whose `text` is whatever the model had said at
+/// that moment: interim commentary, not a result. That second shape is exactly
+/// the one that cost so much effort on codex, where it is indistinguishable
+/// from a real answer without going to the rollout; grok labels it itself via
+/// `stopReason`, so this takes it at face value rather than re-deriving it. The
+/// commentary is carried in the error text - it is often the only clue about
+/// what the run was doing - but it never becomes the response.
+fn interpret_grok_output(stdout: &str, stderr: &str) -> Result<GrokOutcome> {
+    let Ok(result) = serde_json::from_str::<GrokResult>(stdout.trim()) else {
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        anyhow::bail!("grok produced no result object: {detail}");
+    };
+
+    // A typed error line is well-formed JSON, so it survives the parse above as
+    // an empty result. Check it before `stopReason`, or the reason grok gave is
+    // replaced by the generic "no stop reason" complaint.
+    if result.kind.as_deref() == Some("error") {
+        let detail = result.message.as_deref().unwrap_or(stdout.trim());
+        anyhow::bail!("grok reported an error: {detail}");
+    }
+
+    let stop = result.stop_reason.as_deref().unwrap_or("missing");
+    if stop != GROK_OK_STOP {
+        return Ok(GrokOutcome::NoAnswer {
+            reason: format!("grok ended the turn without an answer (stopReason: {stop})"),
+            // Whatever the model had said when it was cut off. Kept because it
+            // is all there is and often the only clue about what the run was
+            // doing - the digest, not this text, is what says it is not an
+            // answer.
+            text: result.text,
+            session_id: result.session_id,
+        });
+    }
+
+    Ok(GrokOutcome::Answered(GrokAnswer {
+        text: result.text,
+        session_id: result.session_id,
+    }))
+}
+
+/// What a finished grok run amounts to. An `Err` alongside these two means the
+/// run never got as far as a turn at all.
+#[derive(Debug)]
+enum GrokOutcome {
+    Answered(GrokAnswer),
+    /// A turn ran and grok said why it produced nothing.
+    NoAnswer {
+        reason: String,
+        text: String,
+        session_id: Option<String>,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]

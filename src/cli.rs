@@ -5,11 +5,11 @@ Archetypes are named reviewer personas defined under [archetypes] in
 .review.toml (name = priming prompt). Groups fan out to multiple archetypes
 (defined under [_groups]). Use \"all\" to fan out to every configured archetype.
 
-Providers: claude, codex. Providers come from --provider, or
+Providers: claude, codex, grok. Providers come from --provider, or
 [_defaults].providers when --provider is omitted.
 
 Each run starts a fresh session, prepends the archetype's priming prompt, and
-lets the agent fetch code itself. For claude and codex the new session ID is
+lets the agent fetch code itself. For all three providers the new session ID is
 printed above the response so you can follow up while the cache is warm via
 --session.
 

@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 const CONFIG_FILENAME: &str = ".review.toml";
-pub const KNOWN_PROVIDERS: &[&str] = &["claude", "codex"];
+pub const KNOWN_PROVIDERS: &[&str] = &["claude", "codex", "grok"];
 
 /// Names that can't be archetypes or groups because the CLI routes them
 /// elsewhere: `all` (fan-out keyword) and the clap subcommands (`init`,
@@ -66,8 +66,10 @@ pub struct ProviderProfiles {
 pub struct Profile {
     pub model: Option<String>,
     pub effort: Option<String>,
-    /// Sandbox / write-access level. Codex: passed as `--sandbox` (e.g.
-    /// `read-only`, `workspace-write`). Defaults to `read-only` when unset.
+    /// Sandbox / write-access level, passed as `--sandbox` by both codex (e.g.
+    /// `read-only`, `workspace-write`) and grok (which resolves the name against
+    /// its own built-in and `sandbox.toml` profiles). Defaults to `read-only`
+    /// when unset. Ignored by claude, which has no sandbox on this axis.
     pub sandbox: Option<String>,
     pub env: Option<BTreeMap<String, String>>,
     /// Extra codex `-c key=value` overrides, each passed verbatim as its own

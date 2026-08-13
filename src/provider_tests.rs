@@ -759,3 +759,130 @@ exit 1
         "meta.json must record the stated reason, got {meta}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// grok output classification
+//
+// These need no child process: grok reports the outcome of a turn in its own
+// result object, so the whole decision is a pure function of the two streams.
+// That is the substantive difference from codex, where the equivalent question
+// ("is this text an answer?") can only be settled by reading the rollout, and
+// where the tests consequently have to drive a real process.
+// ---------------------------------------------------------------------------
+
+/// The shape of a healthy run, trimmed to the fields we read.
+const GROK_OK: &str = r#"{
+  "text": "OK",
+  "stopReason": "end_turn",
+  "sessionId": "3f1c9a2e-7b40-4d51-9c68-2a5e10d3b7f4",
+  "usage": { "total_tokens": 22628 },
+  "num_turns": 1
+}"#;
+
+#[test]
+fn grok_end_turn_is_an_answer() {
+    let super::GrokOutcome::Answered(answer) =
+        super::interpret_grok_output(GROK_OK, "").expect("end_turn is an answer")
+    else {
+        panic!("end_turn must classify as an answer");
+    };
+    assert_eq!(answer.text, "OK");
+    assert_eq!(
+        answer.session_id.as_deref(),
+        Some("3f1c9a2e-7b40-4d51-9c68-2a5e10d3b7f4"),
+        "the echoed session id is what we record, not the one we asked for"
+    );
+}
+
+#[test]
+fn grok_cancelled_turn_is_not_an_answer() {
+    // Observed by running a tool-using prompt under `--max-turns 1`: a full
+    // result object, exit 1, and `text` holding the model's opening remark.
+    // Persisting that as the response is the exact failure this gate prevents.
+    let cut_off = r#"{
+      "text": "I'll list everything in `src/` first, then read each file.",
+      "stopReason": "cancelled",
+      "sessionId": "019ffbc5-2b48-7611-a7f2-48db1fa2b0ed",
+      "num_turns": 1
+    }"#;
+    let outcome = super::interpret_grok_output(cut_off, "Error: max turns reached")
+        .expect("a cancelled turn still ran - it is not a launch failure");
+    let super::GrokOutcome::NoAnswer {
+        reason,
+        text,
+        session_id,
+    } = outcome
+    else {
+        panic!("a cancelled turn is not an answer");
+    };
+    assert!(
+        reason.contains("cancelled"),
+        "names the stop reason: {reason}"
+    );
+    assert!(
+        text.contains("list everything"),
+        "the interim commentary is kept as a clue: {text}"
+    );
+    // The session id is the point of returning this rather than an error: the
+    // turn that was cut off is the one most worth resuming, and `invoke` drops
+    // the id on every error path.
+    assert_eq!(
+        session_id.as_deref(),
+        Some("019ffbc5-2b48-7611-a7f2-48db1fa2b0ed"),
+        "a cut-off turn keeps its session id"
+    );
+
+    // It must still read as a failure everywhere that matters: exit code,
+    // greppable digest, and no auto-resume (a stated reason is not a wedge).
+    let digest = super::grok_no_answer_digest(reason);
+    assert_eq!(digest.exit_code, Some(1), "a run with no answer exits 1");
+    assert!(!digest.captured, "nothing was captured");
+    assert!(
+        !digest.recovered_from_transcript,
+        "grok has no rollout to recover from"
+    );
+    assert!(
+        digest.summary().turn_error.is_some(),
+        "the reason persists flat, so these stay greppable"
+    );
+}
+
+#[test]
+fn grok_missing_stop_reason_is_not_an_answer() {
+    // A future grok that drops or renames the field must not be read as
+    // success: the whole gate rests on that field being present and known.
+    let outcome = super::interpret_grok_output(r#"{"text": "half a thought"}"#, "")
+        .expect("an unlabelled turn still ran");
+    let super::GrokOutcome::NoAnswer { reason, .. } = outcome else {
+        panic!("an unlabelled turn is not a proven answer");
+    };
+    assert!(
+        reason.contains("missing"),
+        "says the reason was absent: {reason}"
+    );
+}
+
+#[test]
+fn grok_without_a_result_object_reports_the_failure() {
+    // Unknown model / unknown session / auth failure: grok never reaches a
+    // turn, so there is no object to parse and the message is all we have.
+    let err = super::interpret_grok_output("", "Error: Couldn't set model 'nope-9000'")
+        .expect_err("no result object is a failure");
+    let msg = err.to_string();
+    assert!(msg.contains("no result object"), "distinct class: {msg}");
+    assert!(msg.contains("nope-9000"), "quotes grok's reason: {msg}");
+}
+
+#[test]
+fn grok_typed_error_line_keeps_its_message() {
+    // Every field of a result object is optional, so this line parses as a
+    // perfectly valid empty result. Read as one it reports only "no stop
+    // reason" and throws away the sentence that says what went wrong - which is
+    // the whole content of a pre-turn failure.
+    let err = super::interpret_grok_output(r#"{"type":"error","message":"boom"}"#, "")
+        .expect_err("a typed error line is not an answer");
+    assert!(
+        err.to_string().contains("boom"),
+        "an error printed only on stdout keeps its message: {err}"
+    );
+}

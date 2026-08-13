@@ -1,6 +1,6 @@
 # review
 
-A Rust CLI that fans out code reviews to fresh AI sessions across multiple providers (Claude Code, Codex), each primed with a specific reviewer perspective.
+A Rust CLI that fans out code reviews to fresh AI sessions across multiple providers (Claude Code, Codex, Grok), each primed with a specific reviewer perspective.
 
 Built with LLMs. See [LLM.md](LLM.md).
 
@@ -8,7 +8,7 @@ Built with LLMs. See [LLM.md](LLM.md).
 
 You define **archetypes** -- reviewer perspectives like `security`, `bugs`, `perf`, or any custom name -- as a name mapped to a priming prompt. When you run a review, you pipe your instructions via stdin. The tool starts a **fresh session** on each provider, prepends the archetype's priming prompt, and lets the agent fetch code itself. The archetype prompt carries its own grounding (role, whether it may modify files, "inspect current state") -- the tool bakes in nothing.
 
-Every run is a clean session by design. Reviving a long-lived session on a cold prompt cache means reprocessing its entire accumulated history - which only grows - whereas a fresh session costs roughly one review's worth of tokens each time. For claude and codex the new session ID is printed above the response, so you can follow up while the cache is still warm via `--session`.
+Every run is a clean session by design. Reviving a long-lived session on a cold prompt cache means reprocessing its entire accumulated history - which only grows - whereas a fresh session costs roughly one review's worth of tokens each time. All three providers print the new session ID above the response, so you can follow up while the cache is still warm via `--session`.
 
 ## Quick start
 
@@ -80,6 +80,9 @@ Per-provider launch behavior:
 |----------|------|----------------------|
 | claude | `--session-id <generated> --print --permission-mode dontAsk` | yes (UUID generated up front) |
 | codex | `exec --sandbox read-only --json` | yes (parsed from `thread.started`) |
+| grok | `--session-id <generated> --prompt-file <tmp> --output-format json --permission-mode dontAsk --sandbox read-only` | yes (echoed in the result object) |
+
+Grok is the one provider that takes no prompt on stdin: `-p` requires a value and `-p -` is read as a one-character prompt, so `review` writes the assembled prompt to a temp file and passes `--prompt-file`. That escapes shell argument length limits the same way the stdin pipe does for the other two.
 
 ### Profiles
 
@@ -103,7 +106,7 @@ echo "audit the auth flow" | review security --profile opus
 
 `--profile opus` resolves `[<host>.<provider>.opus]` for each launched provider and applies its overrides. If any launched provider lacks that profile table, the run errors naming the missing `[host.provider.profile]`.
 
-`sandbox` maps to codex's `--sandbox` (`read-only`, `workspace-write`, `danger-full-access`); it defaults to `read-only` when unset, so a bare `review` run can never modify files. It is **codex-only** -- claude's `--permission-mode` is a tool-approval policy on a different axis with no honest mapping, so claude ignores `sandbox`.
+`sandbox` maps to codex's and grok's `--sandbox` (for codex: `read-only`, `workspace-write`, `danger-full-access`); it defaults to `read-only` when unset, so a bare `review` run can never modify files. **Claude ignores it** -- claude's `--permission-mode` is a tool-approval policy on a different axis with no honest mapping.
 
 ### Follow-up via `--session`
 
@@ -369,6 +372,7 @@ An archetype is just a name mapped to a priming prompt - no session, no host bin
 |----------|--------|----------------|--------|------------|
 | claude | `claude` | `--print` | `--resume <id>` | `--model <name>` |
 | codex | `codex` | `exec` | `exec resume <id>` | `-m <model>` |
+| grok | `grok` | `--prompt-file` | `--resume <id>` | `-m <model>` |
 
 Use `--provider` to limit which providers run:
 
