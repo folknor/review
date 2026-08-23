@@ -1047,6 +1047,13 @@ async fn run_codex(
         "exec".to_string(),
         "--sandbox".to_string(),
         sandbox.unwrap_or("read-only").to_string(),
+        // `review` is routinely launched from a directory that is not itself a
+        // git repo (an umbrella dir whose repos live in subdirectories). Codex
+        // refuses to start there - "Not inside a trusted directory and
+        // --skip-git-repo-check was not specified" - so pass it always. The
+        // filesystem guarantee we rely on is `--sandbox`, which is unaffected:
+        // this flag only waives codex's own "am I in a repo?" precondition.
+        "--skip-git-repo-check".to_string(),
     ];
     if let Some(m) = model {
         args.push("-m".to_string());
