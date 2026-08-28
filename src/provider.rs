@@ -1054,6 +1054,23 @@ async fn run_codex(
         // filesystem guarantee we rely on is `--sandbox`, which is unaffected:
         // this flag only waives codex's own "am I in a repo?" precondition.
         "--skip-git-repo-check".to_string(),
+        // `--sandbox` alone stopped being a filesystem guarantee in codex
+        // 0.150.x. `codex exec` sets `approval_policy = "never"` for headless
+        // runs, which is what made a read-only sandbox absolute: the model's
+        // `request_permissions` escalation is auto-denied under `never`. But
+        // `build_exec_config` now *drops* that headless default whenever the
+        // resolved `approvals_reviewer` is `auto_review` (settable globally in
+        // `~/.codex/config.toml`), falling back to `on-request`. Escalations
+        // then go to codex's own auto-approving guardian, which grants them,
+        // and additional write permissions are layered onto the read-only
+        // profile for the turn. Verified on 0.150.1: a bare
+        // `codex exec --sandbox read-only` wrote a file; with this override the
+        // same prompt is rejected ("writing is blocked by read-only sandbox").
+        // Pinning the policy here restores the invariant regardless of the
+        // operator's global codex config. Passed before profile `config`
+        // overrides so a profile can still opt back in deliberately.
+        "-c".to_string(),
+        "approval_policy=\"never\"".to_string(),
     ];
     if let Some(m) = model {
         args.push("-m".to_string());
