@@ -122,6 +122,18 @@ pub struct Profile {
     /// path (`model_provider` + `model_providers.<name>`).
     #[serde(default)]
     pub config: Vec<String>,
+    /// Extra writable roots for a `workspace-write` run, **added to** the ones
+    /// derived from the host (`src/writable_roots.rs`) rather than replacing
+    /// them: the derived set covers what any build needs on this machine, and
+    /// this covers what a particular project needs beyond that - a data
+    /// directory, a sibling checkout, a generated-asset cache.
+    ///
+    /// Per-profile, which is already per-host, so a path that exists on one
+    /// machine cannot leak into a run on another. Ignored unless the profile's
+    /// `sandbox` is `workspace-write`, because widening a `read-only` profile
+    /// would contradict the only thing that profile promises.
+    #[serde(default)]
+    pub writable_roots: Vec<String>,
 }
 
 impl ReviewConfig {

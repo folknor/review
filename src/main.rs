@@ -337,6 +337,9 @@ async fn main() -> Result<()> {
             let sandbox = profile.and_then(|p| p.sandbox.clone());
             let env = profile.and_then(|p| p.env.clone());
             let config = profile.map(|p| p.config.clone()).unwrap_or_default();
+            let profile_roots = profile
+                .map(|p| p.writable_roots.clone())
+                .unwrap_or_default();
             let env_keys: Vec<String> = env
                 .as_ref()
                 .map(|m| m.keys().cloned().collect())
@@ -367,6 +370,7 @@ async fn main() -> Result<()> {
                         model.as_deref(),
                         effort.as_deref(),
                         sandbox.as_deref(),
+                        &profile_roots,
                         env.as_ref(),
                         &config,
                         &prompt,
@@ -405,6 +409,10 @@ async fn main() -> Result<()> {
                             model.as_deref(),
                             effort.as_deref(),
                             sandbox.as_deref(),
+                            // An auto-resume reuses the dead run's profile, so
+                            // it must reuse its roots too or the retry launches
+                            // narrower than the run it is replacing.
+                            &profile_roots,
                             env.as_ref(),
                             &config,
                             RESUME_NUDGE,
@@ -716,6 +724,10 @@ async fn run_session_resume(
         None,
         None,
         None,
+        // `--session` bypasses `.review.toml` entirely - no profile, so no
+        // sandbox and no roots of our own; the resumed session keeps whatever
+        // the run that created it was launched with.
+        &[],
         None,
         &[],
         &stdin_instructions,

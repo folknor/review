@@ -49,6 +49,13 @@ fn new_temp_file(tag: &str) -> Result<String> {
 
 /// Caps on how much provider output we buffer in memory. Generous - real reviews
 /// are far under these; the cap only stops a runaway stream from OOMing review.
+/// Guards the one-time announcement of derived writable roots. A fan-out runs
+/// the same profile in the same directory against several archetypes, so every
+/// invocation derives an identical set; announcing per invocation would stack
+/// duplicate blocks above the results rather than telling the operator anything
+/// new.
+static ROOTS_ANNOUNCED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
 const STDOUT_CAPTURE_CAP: usize = 64 << 20; // 64 MiB
 const STDERR_CAPTURE_CAP: usize = 8 << 20; // 8 MiB
 
@@ -551,6 +558,7 @@ pub async fn invoke(
     model: Option<&str>,
     effort: Option<&str>,
     sandbox: Option<&str>,
+    profile_roots: &[String],
     env: Option<&std::collections::BTreeMap<String, String>>,
     config: &[String],
     prompt: &str,
@@ -572,13 +580,24 @@ pub async fn invoke(
     let granted_roots: Vec<crate::writable_roots::GrantedRoot> =
         if provider == "codex" && sandbox == Some("workspace-write") {
             std::env::current_dir()
-                .map(|cwd| crate::writable_roots::derive(&cwd, &crate::writable_roots::RealHost))
+                .map(|cwd| {
+                    crate::writable_roots::derive_with(
+                        &cwd,
+                        &crate::writable_roots::RealHost,
+                        profile_roots,
+                    )
+                })
                 .unwrap_or_default()
         } else {
             Vec::new()
         };
-    for grant in &granted_roots {
-        eprintln!("codex: writable root {} ({})", grant.path, grant.why);
+    // Printed once per process, not once per invocation: a fan-out launches the
+    // same profile against several archetypes and would otherwise repeat an
+    // identical block per run, at the top, before any result it belongs to.
+    if !granted_roots.is_empty() && ROOTS_ANNOUNCED.set(()).is_ok() {
+        for grant in &granted_roots {
+            eprintln!("codex: writable root {} ({})", grant.path, grant.why);
+        }
     }
     let root_paths: Vec<String> = granted_roots.iter().map(|g| g.path.clone()).collect();
 

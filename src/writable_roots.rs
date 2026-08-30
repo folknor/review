@@ -69,6 +69,30 @@ impl Host for RealHost {
     }
 }
 
+/// Paths outside `cwd` that a build needs write access to, plus any a profile
+/// asked for.
+///
+/// Profile roots are **added to** the derived ones, not a replacement: the
+/// derivation covers what any build on this machine needs, while a profile
+/// covers what one project needs beyond that. They go through the same filters,
+/// so a profile cannot grant `/`, cannot grant a relative path, and gains
+/// nothing by naming a path already inside the workspace.
+///
+/// Returns an empty vec when nothing is needed - a workspace whose build stays
+/// entirely inside itself derives no grants and is left with codex's defaults.
+pub fn derive_with(cwd: &Path, host: &impl Host, profile_roots: &[String]) -> Vec<GrantedRoot> {
+    let mut out = derive(cwd, host);
+    for root in profile_roots {
+        let path = PathBuf::from(root);
+        if !path.is_absolute() {
+            eprintln!("warning: ignoring relative writable_roots entry: {root}");
+            continue;
+        }
+        push_root(&mut out, cwd, &path, "profile writable_roots");
+    }
+    out
+}
+
 /// Paths outside `cwd` that a build needs write access to.
 ///
 /// Returns an empty vec when nothing is needed - a workspace whose build stays
@@ -76,39 +100,11 @@ impl Host for RealHost {
 pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
     let mut out: Vec<GrantedRoot> = Vec::new();
 
-    let mut push = |path: PathBuf, why: &'static str| {
-        // Only paths outside the workspace are worth granting: cwd is already
-        // writable, so granting a subpath of it would be noise that reads like
-        // a widening.
-        if path.starts_with(cwd) {
-            return;
-        }
-        let Some(text) = path.to_str() else {
-            return;
-        };
-        // A symlink target routinely carries a trailing slash while the env var
-        // naming the same directory does not, so compare and emit the
-        // normalised form or the two arrive as separate grants - which is
-        // harmless to codex but reads as two widenings where there is one.
-        let text = text.trim_end_matches('/');
-        if text.is_empty() {
-            // `/` is not a target dir; it is the whole filesystem.
-            return;
-        }
-        if out.iter().any(|g| g.path == text) {
-            return;
-        }
-        out.push(GrantedRoot {
-            path: text.to_string(),
-            why,
-        });
-    };
-
     // The build lock. Fatal when missing, and never inside the workspace.
     if let Some(dir) = host.var("XDG_RUNTIME_DIR") {
         let path = PathBuf::from(dir);
         if path.is_absolute() {
-            push(path, "build lock ($XDG_RUNTIME_DIR)");
+            push_root(&mut out, cwd, &path, "build lock ($XDG_RUNTIME_DIR)");
         }
     }
 
@@ -116,7 +112,7 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
     if let Some(dir) = host.var("CARGO_TARGET_DIR") {
         let path = PathBuf::from(dir);
         if path.is_absolute() {
-            push(path, "cargo target ($CARGO_TARGET_DIR)");
+            push_root(&mut out, cwd, &path, "cargo target ($CARGO_TARGET_DIR)");
         }
     }
 
@@ -124,10 +120,39 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
     // `CARGO_TARGET_DIR` is set, because the two can disagree and the symlink
     // is what an unset-env build would use.
     if let Some(target) = host.read_link(&cwd.join("target")) {
-        push(target, "cargo target (./target symlink)");
+        push_root(&mut out, cwd, &target, "cargo target (./target symlink)");
     }
 
     out
+}
+
+/// Add one candidate root, applying every filter a grant must pass.
+fn push_root(out: &mut Vec<GrantedRoot>, cwd: &Path, path: &Path, why: &'static str) {
+    // Only paths outside the workspace are worth granting: cwd is already
+    // writable, so granting a subpath of it would be noise that reads like a
+    // widening.
+    if path.starts_with(cwd) {
+        return;
+    }
+    let Some(text) = path.to_str() else {
+        return;
+    };
+    // A symlink target routinely carries a trailing slash while the env var
+    // naming the same directory does not, so compare and emit the normalised
+    // form or the two arrive as separate grants - which is harmless to codex but
+    // reads as two widenings where there is one.
+    let text = text.trim_end_matches('/');
+    if text.is_empty() {
+        // `/` is not a target dir; it is the whole filesystem.
+        return;
+    }
+    if out.iter().any(|g| g.path == text) {
+        return;
+    }
+    out.push(GrantedRoot {
+        path: text.to_string(),
+        why,
+    });
 }
 
 /// The codex `-c` override expressing a set of grants, or `None` when empty.
@@ -251,6 +276,53 @@ mod tests {
         let grants = derive(&cwd(), &host);
         assert_eq!(grants.len(), 1, "{grants:?}");
         assert_eq!(grants[0].path, "/media/disk/cargo");
+    }
+
+    #[test]
+    fn a_profile_root_is_added_to_the_derived_ones() {
+        let host = FakeHost::new().var("XDG_RUNTIME_DIR", "/run/user/1000");
+        let grants = derive_with(&cwd(), &host, &["/srv/fixtures".to_string()]);
+        assert_eq!(grants.len(), 2);
+        assert_eq!(grants[1].path, "/srv/fixtures");
+        assert_eq!(grants[1].why, "profile writable_roots");
+    }
+
+    /// A profile must not be able to undo the derivation - the derived roots are
+    /// what makes a build run at all, so replacing rather than extending would
+    /// let a profile that names one extra path break the build it was widening.
+    #[test]
+    fn a_profile_root_does_not_replace_the_derived_ones() {
+        let host = FakeHost::new()
+            .var("XDG_RUNTIME_DIR", "/run/user/1000")
+            .var("CARGO_TARGET_DIR", "/media/disk/cargo");
+        let grants = derive_with(&cwd(), &host, &["/srv/fixtures".to_string()]);
+        let paths: Vec<&str> = grants.iter().map(|g| g.path.as_str()).collect();
+        assert!(paths.contains(&"/run/user/1000"), "{paths:?}");
+        assert!(paths.contains(&"/media/disk/cargo"), "{paths:?}");
+    }
+
+    /// Profile entries go through the same filters as derived ones, so a
+    /// `.review.toml` cannot hand a run the whole filesystem, and a relative
+    /// path (which codex would reject as a config error at launch) is dropped
+    /// with a warning rather than emitted.
+    #[test]
+    fn a_profile_cannot_grant_the_filesystem_root_or_a_relative_path() {
+        let host = FakeHost::new();
+        let grants = derive_with(
+            &cwd(),
+            &host,
+            &["/".to_string(), "../elsewhere".to_string()],
+        );
+        assert!(grants.is_empty(), "{grants:?}");
+    }
+
+    /// A profile naming a path the host already derived should not double it.
+    #[test]
+    fn a_profile_root_matching_a_derived_one_is_not_repeated() {
+        let host = FakeHost::new().var("CARGO_TARGET_DIR", "/media/disk/cargo");
+        let grants = derive_with(&cwd(), &host, &["/media/disk/cargo".to_string()]);
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].why, "cargo target ($CARGO_TARGET_DIR)");
     }
 
     /// Granting `/` would hand the run the entire filesystem, which is the one
