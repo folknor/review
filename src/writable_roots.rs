@@ -83,7 +83,11 @@ impl Host for RealHost {
 pub fn derive_with(cwd: &Path, host: &impl Host, profile_roots: &[String]) -> Vec<GrantedRoot> {
     let mut out = derive(cwd, host);
     for root in profile_roots {
-        let path = PathBuf::from(root);
+        let Some(expanded) = expand(root, host) else {
+            // `expand` has already explained which variable was unset.
+            continue;
+        };
+        let path = PathBuf::from(&expanded);
         if !path.is_absolute() {
             eprintln!("warning: ignoring relative writable_roots entry: {root}");
             continue;
@@ -91,6 +95,66 @@ pub fn derive_with(cwd: &Path, host: &impl Host, profile_roots: &[String]) -> Ve
         push_root(&mut out, cwd, &path, "profile writable_roots");
     }
     out
+}
+
+/// Expand `~`, `$VAR` and `${VAR}` in a configured root.
+///
+/// One `.review.toml` is read on five machines whose layouts differ, so a
+/// literal path is often unwritable somewhere. Expansion is the deliberate,
+/// visible-in-config kind of environment use - unlike the derivation above, the
+/// operator wrote the variable name down.
+///
+/// An **unset** variable returns `None` rather than expanding to nothing:
+/// `$UNSET/data` would otherwise collapse to `/data`, granting a path nobody
+/// named, and `$UNSET` alone would collapse to `/` - the one grant this module
+/// must never make.
+fn expand(raw: &str, host: &impl Host) -> Option<String> {
+    let raw = match raw.strip_prefix("~/") {
+        Some(rest) => {
+            let home = host.var("HOME").or_else(|| {
+                eprintln!("warning: ignoring writable_roots entry {raw}: HOME is not set");
+                None
+            })?;
+            format!("{}/{rest}", home.trim_end_matches('/'))
+        }
+        None if raw == "~" => host.var("HOME")?,
+        None => raw.to_string(),
+    };
+
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw.as_str();
+    while let Some(idx) = rest.find('$') {
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx + 1..];
+        let (name, tail) = if let Some(braced) = after.strip_prefix('{') {
+            match braced.find('}') {
+                Some(end) => (&braced[..end], &braced[end + 1..]),
+                None => {
+                    eprintln!("warning: ignoring writable_roots entry {raw}: unclosed '${{'");
+                    return None;
+                }
+            }
+        } else {
+            let end = after
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(after.len());
+            (&after[..end], &after[end..])
+        };
+        if name.is_empty() {
+            eprintln!("warning: ignoring writable_roots entry {raw}: empty variable name");
+            return None;
+        }
+        match host.var(name) {
+            Some(value) => out.push_str(&value),
+            None => {
+                eprintln!("warning: ignoring writable_roots entry {raw}: ${name} is not set");
+                return None;
+            }
+        }
+        rest = tail;
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 /// Paths outside `cwd` that a build needs write access to.
@@ -323,6 +387,72 @@ mod tests {
         let grants = derive_with(&cwd(), &host, &["/media/disk/cargo".to_string()]);
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].why, "cargo target ($CARGO_TARGET_DIR)");
+    }
+
+    #[test]
+    fn a_profile_root_expands_a_bare_variable() {
+        let host = FakeHost::new().var("DATA", "/srv/data");
+        let grants = derive_with(&cwd(), &host, &["$DATA/fixtures".to_string()]);
+        assert_eq!(grants[0].path, "/srv/data/fixtures");
+    }
+
+    #[test]
+    fn a_profile_root_expands_a_braced_variable() {
+        let host = FakeHost::new().var("DATA", "/srv/data");
+        let grants = derive_with(&cwd(), &host, &["${DATA}x/fixtures".to_string()]);
+        assert_eq!(grants[0].path, "/srv/datax/fixtures");
+    }
+
+    #[test]
+    fn a_profile_root_expands_tilde() {
+        let host = FakeHost::new().var("HOME", "/home/dev");
+        let grants = derive_with(&cwd(), &host, &["~/data".to_string()]);
+        assert_eq!(grants[0].path, "/home/dev/data");
+    }
+
+    /// The dangerous case. Expanding an unset variable to nothing would turn
+    /// `$UNSET/data` into `/data` - a real path nobody named - and `$UNSET`
+    /// alone into `/`, handing the run the whole filesystem.
+    #[test]
+    fn an_unset_variable_drops_the_entry_rather_than_expanding_to_nothing() {
+        let host = FakeHost::new();
+        let grants = derive_with(
+            &cwd(),
+            &host,
+            &["$NOPE/data".to_string(), "$NOPE".to_string()],
+        );
+        assert!(grants.is_empty(), "{grants:?}");
+    }
+
+    #[test]
+    fn several_variables_in_one_entry_all_expand() {
+        let host = FakeHost::new().var("A", "/srv").var("B", "cache");
+        let grants = derive_with(&cwd(), &host, &["$A/shared/$B".to_string()]);
+        assert_eq!(grants[0].path, "/srv/shared/cache");
+    }
+
+    #[test]
+    fn an_unclosed_brace_drops_the_entry() {
+        let host = FakeHost::new().var("DATA", "/srv/data");
+        let grants = derive_with(&cwd(), &host, &["${DATA/fixtures".to_string()]);
+        assert!(grants.is_empty(), "{grants:?}");
+    }
+
+    /// Expansion must not create a path that skips the filters: a variable
+    /// holding `/` still has to be refused.
+    #[test]
+    fn expansion_cannot_smuggle_the_filesystem_root_past_the_filters() {
+        let host = FakeHost::new().var("ROOT", "/");
+        let grants = derive_with(&cwd(), &host, &["$ROOT".to_string()]);
+        assert!(grants.is_empty(), "{grants:?}");
+    }
+
+    /// Likewise for the inside-the-workspace filter.
+    #[test]
+    fn expansion_into_the_workspace_is_still_dropped() {
+        let host = FakeHost::new().var("W", "/home/dev/project");
+        let grants = derive_with(&cwd(), &host, &["$W/sub".to_string()]);
+        assert!(grants.is_empty(), "{grants:?}");
     }
 
     /// Granting `/` would hand the run the entire filesystem, which is the one

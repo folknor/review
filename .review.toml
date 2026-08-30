@@ -21,7 +21,9 @@ sandbox = "workspace-write"
 # `writable_roots = [...]` adds to the roots derived from the host (build lock,
 # cargo target), never replaces them. Per-profile, which is already per-host, so
 # a path that only exists on this machine cannot follow the repo to another.
-# This project needs nothing beyond the derived set, so it sets none.
+# Entries may use `~`, `$VAR` and `${VAR}`, which is what makes one file work
+# across hosts with different layouts. This project needs nothing beyond the
+# derived set, so it sets none.
 
 [plantasjen.codex.bugs]
 model = "gpt-5.6-sol"
