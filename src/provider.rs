@@ -1095,6 +1095,22 @@ async fn run_codex(
         // flag fails loudly on an unknown argument rather than silently running
         // unsandboxed, which is the right way round.
         "--ignore-rules".to_string(),
+        // And the general form of the same lesson: a `review` run must be a
+        // function of `.review.toml` plus argv, never of a file the operator
+        // edited for unrelated reasons. Twice now the guarantee a profile
+        // advertised was silently voided by ambient global codex config - once
+        // by `approvals_reviewer = "auto_review"` rewriting the approval
+        // policy, once by the execpolicy rules above. Pinning each hole as it
+        // is found leaves the next one live, so drop `$CODEX_HOME/config.toml`
+        // wholesale. Auth is unaffected: it resolves from `CODEX_HOME`
+        // independently of this flag (verified - a run with it authenticates
+        // and completes normally). Two consequences, both deliberate: a run
+        // whose profile sets no `model` now takes codex's built-in default
+        // rather than the operator's configured one (identical on this host
+        // today, but no longer a silent coupling), and a profile whose `config`
+        // overrides name a custom `model_provider` defined in the operator's
+        // config.toml must now define it in the profile too.
+        "--ignore-user-config".to_string(),
         // Rollout reasoning items carry `encrypted_content` - sealed server-side
         // and undecryptable here - and on the default `auto` summary setting
         // their `summary` arrays come back empty, so a rollout records *what* a
