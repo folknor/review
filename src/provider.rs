@@ -1071,6 +1071,42 @@ async fn run_codex(
         // overrides so a profile can still opt back in deliberately.
         "-c".to_string(),
         "approval_policy=\"never\"".to_string(),
+        // The second, independent hole in the same guarantee - and the one that
+        // actually fires in the field. Codex's execpolicy `.rules` files are not
+        // only an approval allowlist: a `prefix_rule(..., decision="allow")`
+        // whose pattern matches *every* parsed segment of a command makes
+        // `exec_policy.rs` return `Skip { bypass_sandbox: true }`, which the
+        // orchestrator resolves to `SandboxType::None`. On Linux the sandbox is
+        // purely an argv wrapper, so that is not a weakened sandbox - it is no
+        // sandbox at all. `approval_policy="never"` does not gate this branch,
+        // and `read-only` is exposed exactly as much as `workspace-write`
+        // (`unsandboxed_execution_allowed` only tests for deny-*read* entries,
+        // which neither level has). Verified on 0.151.0 against an operator
+        // `~/.codex/rules/default.rules` carrying `["brokkr","status"]` and
+        // `["ln","-s"]`: under `--sandbox read-only`, `ln -s /etc/hostname x`
+        // created the link, and `brokkr status` wrote a row into
+        // `~/.local/share/brokkr/history.db` - both outside every writable root.
+        // Prefixing one non-allowlisted segment (`echo probe; ...`) made the
+        // identical command sandboxed, which is why this looked like flaky,
+        // per-run behaviour for months: enforcement tracked the shape of the
+        // command the model happened to type. `--ignore-rules` drops the user
+        // and project rule layers for this invocation only, leaving the
+        // operator's interactive codex untouched. An older codex without the
+        // flag fails loudly on an unknown argument rather than silently running
+        // unsandboxed, which is the right way round.
+        "--ignore-rules".to_string(),
+        // Rollout reasoning items carry `encrypted_content` - sealed server-side
+        // and undecryptable here - and on the default `auto` summary setting
+        // their `summary` arrays come back empty, so a rollout records *what* a
+        // run did and never *why*. That cost real time: reconstructing why an
+        // agent relocated a build meant inferring intent from the command
+        // sequence alone, because the transcript held no prose at any point.
+        // `detailed` fills the summaries, which `src/transcript.rs` forensics
+        // and `review sessions <id>` can then surface. Passed before profile
+        // `config` overrides, so a profile can still set `none` where the
+        // summaries are not worth their tokens.
+        "-c".to_string(),
+        "model_reasoning_summary=\"detailed\"".to_string(),
     ];
     if let Some(m) = model {
         args.push("-m".to_string());
