@@ -1278,6 +1278,38 @@ async fn run_codex(
         args.push("-c".to_string());
         args.push(override_arg);
     }
+    // A `workspace-write` run gets network access, because without it codex
+    // cannot use **unix domain sockets** - which has nothing to do with the
+    // network and everything to do with how the filter is written.
+    //
+    // The seccomp filter codex installs when network access is off
+    // (`linux-sandbox/src/landlock.rs`) unconditionally denies `bind`,
+    // `connect`, `listen` and `accept`, returning `EPERM`. It carves out
+    // AF_UNIX for `socket()` and `socketpair()` only, so an AF_UNIX socket can
+    // be created and then used for nothing that needs a pathname. A daemon /
+    // worker test suite that binds a socket under its own target directory
+    // fails with `Operation not permitted` on a path that is demonstrably
+    // writable - verified by binding in the *cwd*, which codex grants
+    // unconditionally, and getting the same errno. So no `writable_roots`
+    // entry can fix it; there is no path for which it works.
+    //
+    // Enabling network access is a blunt instrument - the filter is
+    // all-or-nothing, so this restores AF_INET egress too, and codex offers no
+    // AF_UNIX-only knob. It is nevertheless not a widening of what these runs
+    // have actually had: until `--ignore-rules` landed in a commit earlier that
+    // day, an operator execpolicy allowlist made build commands bypass the
+    // sandbox wrapper entirely, so no seccomp filter was installed and every
+    // `workspace-write` run in this tool's history ran with full network
+    // access. This makes that explicit and, unlike the bypass, it applies to
+    // every command rather than the ones whose argv happened to match a rule.
+    //
+    // Scoped to `workspace-write`: `read-only` is the reviewer profile, which
+    // has no build to run and so no socket to bind. Passed before profile
+    // `config`, so a profile can restate the key and win.
+    if sandbox == Some("workspace-write") {
+        args.push("-c".to_string());
+        args.push("sandbox_workspace_write.network_access=true".to_string());
+    }
 
     // Profile `config` overrides, each a verbatim `-c key=value`. Placed after
     // effort so a profile could even override reasoning effort if it wanted.
