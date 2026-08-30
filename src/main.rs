@@ -110,6 +110,8 @@ fn record_run(
             result.completed_epoch,
             model,
             env_keys.to_vec(),
+            result.sandbox.as_deref(),
+            result.writable_roots.clone(),
             operator_prompt,
             prompt,
             &result.output,
@@ -472,6 +474,11 @@ async fn main() -> Result<()> {
                     session_id: None,
                     digest: None,
                     completed_epoch: provider::now_epoch_secs(),
+                    // A panicked task never reached a provider, so it launched
+                    // with nothing; recording a sandbox here would attribute
+                    // permissions to a run that never happened.
+                    sandbox: None,
+                    writable_roots: Vec::new(),
                 },
                 also: None,
             },
@@ -789,6 +796,11 @@ async fn run_session_resume(
             result.completed_epoch,
             None,
             Vec::new(),
+            // A `--session` resume bypasses `.review.toml` entirely and inherits
+            // whatever the original run was launched with, so `review` has no
+            // sandbox of its own to report here.
+            result.sandbox.as_deref(),
+            result.writable_roots.clone(),
             &stdin_instructions,
             &stdin_instructions,
             &result.output,

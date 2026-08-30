@@ -457,6 +457,16 @@ pub struct ProviderResult {
     /// sidecar-record time so the cold-cache clock reflects completion, not the
     /// (possibly much later) moment results are collected in launch order.
     pub completed_epoch: u64,
+    /// The filesystem permissions this run actually launched with, in the
+    /// provider's own vocabulary. Recorded because the guarantee a profile
+    /// advertises is worth nothing if the permissions a run *received* are only
+    /// visible in the launching terminal: `jq 'select(.sandbox=="read-only")'`
+    /// has to be able to answer "which runs could not write?" after the fact.
+    pub sandbox: Option<String>,
+    /// Writable roots derived for this run beyond the provider's defaults
+    /// (`src/writable_roots.rs`). Empty for every run that widened nothing,
+    /// which is every read-only run.
+    pub writable_roots: Vec<String>,
 }
 
 pub fn now_epoch_secs() -> u64 {
@@ -556,6 +566,22 @@ pub async fn invoke(
     let sandbox = sandbox.map(|s| crate::config::sandbox_for(provider, s));
     let sandbox = sandbox.as_deref();
 
+    // Derived here rather than inside the codex runner so the same values that
+    // widen the run are the ones recorded on the result: a grant that is applied
+    // but not logged is exactly the invisible permission this is meant to avoid.
+    let granted_roots: Vec<crate::writable_roots::GrantedRoot> =
+        if provider == "codex" && sandbox == Some("workspace-write") {
+            std::env::current_dir()
+                .map(|cwd| crate::writable_roots::derive(&cwd, &crate::writable_roots::RealHost))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+    for grant in &granted_roots {
+        eprintln!("codex: writable root {} ({})", grant.path, grant.why);
+    }
+    let root_paths: Vec<String> = granted_roots.iter().map(|g| g.path.clone()).collect();
+
     let result = match provider {
         // `sandbox` is an OS filesystem sandbox, which codex and grok both have
         // and claude does not: claude's `--permission-mode` is a tool-approval
@@ -594,6 +620,7 @@ pub async fn invoke(
                 model,
                 effort,
                 sandbox,
+                &granted_roots,
                 env,
                 config,
                 prompt,
@@ -614,6 +641,8 @@ pub async fn invoke(
             session_id: run.session_id,
             digest: run.digest,
             completed_epoch,
+            sandbox: sandbox.map(ToString::to_string),
+            writable_roots: root_paths,
         },
         Err(e) => ProviderResult {
             provider: provider.to_string(),
@@ -621,6 +650,11 @@ pub async fn invoke(
             session_id: None,
             digest: None,
             completed_epoch,
+            // A launch that failed still launched with these permissions
+            // requested, and a row that omitted them would read as a run with
+            // none.
+            sandbox: sandbox.map(ToString::to_string),
+            writable_roots: root_paths,
         },
     }
 }
@@ -1032,6 +1066,7 @@ async fn run_codex(
     model: Option<&str>,
     effort: Option<&str>,
     sandbox: Option<&str>,
+    granted_roots: &[crate::writable_roots::GrantedRoot],
     env: Option<&std::collections::BTreeMap<String, String>>,
     config: &[String],
     prompt: &str,
@@ -1132,31 +1167,13 @@ async fn run_codex(
         args.push("-c".to_string());
         args.push(format!("model_reasoning_effort=\"{e}\""));
     }
-    // A `workspace-write` sandbox grants only cwd and /tmp, which is not enough
-    // to run a build on any of the hosts this is used from: the build wrapper
-    // locks under `$XDG_RUNTIME_DIR` (fatal when denied - the run dies before
-    // compiling anything), and several hosts export a global `CARGO_TARGET_DIR`
-    // or carry a `target` symlink onto a shared drive. Those are properties of
-    // the machine, not of the project, so deriving them beats restating them in
-    // every `.review.toml` and getting them wrong on the hosts that were not in
-    // front of whoever edited it. Scoped to `workspace-write` only: a
-    // `read-only` profile derives nothing, because nothing being writable is
-    // the entire point of it. Placed before profile `config` so a profile can
-    // restate `sandbox_workspace_write.writable_roots` and win.
-    if sandbox == Some("workspace-write")
-        && let Ok(cwd) = std::env::current_dir()
-    {
-        let grants = crate::writable_roots::derive(&cwd, &crate::writable_roots::RealHost);
-        if let Some(override_arg) = crate::writable_roots::config_override(&grants) {
-            // Printed, not silent: this is the one place ambient environment is
-            // allowed to widen a run, so the effective permissions have to be
-            // visible rather than inferred from the machine's config.
-            for grant in &grants {
-                eprintln!("codex: writable root {} ({})", grant.path, grant.why);
-            }
-            args.push("-c".to_string());
-            args.push(override_arg);
-        }
+    // Writable roots the host needs for a build, derived by the caller (see
+    // `invoke`, and `src/writable_roots.rs` for why they are derived at all).
+    // Placed before profile `config` so a profile can restate
+    // `sandbox_workspace_write.writable_roots` and win.
+    if let Some(override_arg) = crate::writable_roots::config_override(granted_roots) {
+        args.push("-c".to_string());
+        args.push(override_arg);
     }
 
     // Profile `config` overrides, each a verbatim `-c key=value`. Placed after

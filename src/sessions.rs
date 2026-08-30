@@ -20,6 +20,16 @@ struct SessionEntry<'a> {
     /// Environment variable *names* configured for this provider entry; values
     /// are deliberately not recorded to avoid leaking secrets in the sidecar.
     env_keys: Vec<String>,
+    /// The sandbox level the run launched with, in the provider's own
+    /// vocabulary (`None` for claude, which has no filesystem sandbox). Makes
+    /// "which runs could write?" a `jq` query rather than an inference from the
+    /// profile name, which is only a claim about what was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sandbox: Option<&'a str>,
+    /// Writable roots granted beyond the provider's defaults. Empty for every
+    /// run that widened nothing, which is every read-only run.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    writable_roots: Vec<String>,
     operator_prompt: &'a str,
     assembled_prompt: &'a str,
     response: Option<String>,
@@ -57,6 +67,15 @@ pub struct SessionRecord {
     #[allow(dead_code)]
     #[serde(default)]
     pub env_keys: Vec<String>,
+    /// Sandbox level the run launched with; absent on rows written before this
+    /// was recorded, and on providers without a filesystem sandbox.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub sandbox: Option<String>,
+    /// Writable roots granted beyond the provider's defaults.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub writable_roots: Vec<String>,
     pub operator_prompt: String,
     #[allow(dead_code)]
     pub assembled_prompt: String,
@@ -175,6 +194,11 @@ pub fn record(
     epoch_secs: u64,
     model: Option<&str>,
     env_keys: Vec<String>,
+    // The filesystem permissions the run launched with. Recorded because a
+    // profile's advertised guarantee is worth nothing if what a run actually
+    // received is only visible in the terminal that launched it.
+    sandbox: Option<&str>,
+    writable_roots: Vec<String>,
     operator_prompt: &str,
     assembled_prompt: &str,
     result: &Result<String>,
@@ -207,6 +231,8 @@ pub fn record(
         kind,
         model,
         env_keys,
+        sandbox,
+        writable_roots,
         operator_prompt,
         assembled_prompt,
         response: result.as_ref().ok().cloned(),
