@@ -12,6 +12,7 @@ mod sessions;
 mod timings;
 mod transcript;
 mod watchdog;
+mod writable_roots;
 
 use anyhow::{Result, bail};
 use clap::Parser;

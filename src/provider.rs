@@ -1132,6 +1132,33 @@ async fn run_codex(
         args.push("-c".to_string());
         args.push(format!("model_reasoning_effort=\"{e}\""));
     }
+    // A `workspace-write` sandbox grants only cwd and /tmp, which is not enough
+    // to run a build on any of the hosts this is used from: the build wrapper
+    // locks under `$XDG_RUNTIME_DIR` (fatal when denied - the run dies before
+    // compiling anything), and several hosts export a global `CARGO_TARGET_DIR`
+    // or carry a `target` symlink onto a shared drive. Those are properties of
+    // the machine, not of the project, so deriving them beats restating them in
+    // every `.review.toml` and getting them wrong on the hosts that were not in
+    // front of whoever edited it. Scoped to `workspace-write` only: a
+    // `read-only` profile derives nothing, because nothing being writable is
+    // the entire point of it. Placed before profile `config` so a profile can
+    // restate `sandbox_workspace_write.writable_roots` and win.
+    if sandbox == Some("workspace-write")
+        && let Ok(cwd) = std::env::current_dir()
+    {
+        let grants = crate::writable_roots::derive(&cwd, &crate::writable_roots::RealHost);
+        if let Some(override_arg) = crate::writable_roots::config_override(&grants) {
+            // Printed, not silent: this is the one place ambient environment is
+            // allowed to widen a run, so the effective permissions have to be
+            // visible rather than inferred from the machine's config.
+            for grant in &grants {
+                eprintln!("codex: writable root {} ({})", grant.path, grant.why);
+            }
+            args.push("-c".to_string());
+            args.push(override_arg);
+        }
+    }
+
     // Profile `config` overrides, each a verbatim `-c key=value`. Placed after
     // effort so a profile could even override reasoning effort if it wanted.
     for c in config {
