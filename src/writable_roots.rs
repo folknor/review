@@ -50,6 +50,9 @@ pub trait Host {
     fn var(&self, key: &str) -> Option<String>;
     /// The target of `path` if it is a symlink, resolved to an absolute path.
     fn read_link(&self, path: &Path) -> Option<PathBuf>;
+    /// `path` with every symlink component resolved, or `None` if it does not
+    /// exist. Used to check what a grant *reaches*, not merely what it spells.
+    fn canonicalize(&self, path: &Path) -> Option<PathBuf>;
 }
 
 /// The real host.
@@ -70,6 +73,10 @@ impl Host for RealHost {
             // A relative link resolves against the link's own directory.
             Some(path.parent()?.join(target))
         }
+    }
+
+    fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
+        std::fs::canonicalize(path).ok()
     }
 }
 
@@ -97,7 +104,7 @@ pub fn derive_with(cwd: &Path, host: &impl Host, profile_roots: &[String]) -> Ve
             eprintln!("warning: ignoring relative writable_roots entry: {root}");
             continue;
         }
-        push_root(&mut out, cwd, &path, "profile writable_roots");
+        push_root(&mut out, cwd, host, &path, "profile writable_roots");
     }
     out
 }
@@ -176,7 +183,7 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
     if let Some(dir) = host.var("XDG_RUNTIME_DIR") {
         let path = PathBuf::from(dir);
         if path.is_absolute() {
-            push_root(&mut out, cwd, &path, "build lock ($XDG_RUNTIME_DIR)");
+            push_root(&mut out, cwd, host, &path, "build lock ($XDG_RUNTIME_DIR)");
         }
     }
 
@@ -184,7 +191,13 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
     if let Some(dir) = host.var("CARGO_TARGET_DIR") {
         let path = PathBuf::from(dir);
         if path.is_absolute() {
-            push_root(&mut out, cwd, &path, "cargo target ($CARGO_TARGET_DIR)");
+            push_root(
+                &mut out,
+                cwd,
+                host,
+                &path,
+                "cargo target ($CARGO_TARGET_DIR)",
+            );
         }
     }
 
@@ -192,14 +205,37 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
     // `CARGO_TARGET_DIR` is set, because the two can disagree and the symlink
     // is what an unset-env build would use.
     if let Some(target) = host.read_link(&cwd.join("target")) {
-        push_root(&mut out, cwd, &target, "cargo target (./target symlink)");
+        push_root(
+            &mut out,
+            cwd,
+            host,
+            &target,
+            "cargo target (./target symlink)",
+        );
     }
 
     out
 }
 
 /// Add one candidate root, applying every filter a grant must pass.
-fn push_root(out: &mut Vec<GrantedRoot>, cwd: &Path, path: &Path, why: &'static str) {
+///
+/// Filters run against the **resolved** path as well as the spelled one. A
+/// lexical check answers "what does this say", and the sandbox binds "what does
+/// this reach": `/srv/cache` may be a symlink to `/`, in which case granting it
+/// grants the filesystem while passing every string test. The resolved form is
+/// what gets emitted, so the log names the directory that actually becomes
+/// writable. A path that does not exist yet cannot be resolved and is taken at
+/// its word - codex will fail on it if it is wrong, and refusing it outright
+/// would break granting a cache directory the build itself creates.
+fn push_root(
+    out: &mut Vec<GrantedRoot>,
+    cwd: &Path,
+    host: &impl Host,
+    path: &Path,
+    why: &'static str,
+) {
+    let resolved = host.canonicalize(path);
+    let path: &Path = resolved.as_deref().unwrap_or(path);
     // `..` defeats every lexical check below - `/..` is absolute, is not a
     // prefix of cwd and is not empty, so it would sail through and codex would
     // resolve it to `/`. Refuse rather than normalise: `/a/../b` and `/b` are
@@ -290,6 +326,7 @@ mod tests {
     struct FakeHost {
         vars: HashMap<String, String>,
         links: HashMap<PathBuf, PathBuf>,
+        canon: HashMap<PathBuf, PathBuf>,
     }
 
     impl FakeHost {
@@ -297,6 +334,7 @@ mod tests {
             Self {
                 vars: HashMap::new(),
                 links: HashMap::new(),
+                canon: HashMap::new(),
             }
         }
         fn var(mut self, key: &str, value: &str) -> Self {
@@ -307,6 +345,12 @@ mod tests {
             self.links.insert(PathBuf::from(at), PathBuf::from(to));
             self
         }
+        /// Model a path that *resolves* somewhere other than it is spelled -
+        /// the case a purely lexical filter cannot see.
+        fn resolves(mut self, path: &str, to: &str) -> Self {
+            self.canon.insert(PathBuf::from(path), PathBuf::from(to));
+            self
+        }
     }
 
     impl Host for FakeHost {
@@ -315,6 +359,11 @@ mod tests {
         }
         fn read_link(&self, path: &Path) -> Option<PathBuf> {
             self.links.get(path).cloned()
+        }
+        /// Unmapped paths resolve to themselves, matching the common case of a
+        /// directory with no symlink components.
+        fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
+            Some(self.canon.get(path).cloned().unwrap_or(path.to_path_buf()))
         }
     }
 
@@ -512,6 +561,44 @@ mod tests {
         let host = FakeHost::new().var("W", "/home/dev/project");
         let grants = derive_with(&cwd(), &host, &["$W/sub".to_string()]);
         assert!(grants.is_empty(), "{grants:?}");
+    }
+
+    /// The filters are lexical, but the sandbox binds what a path *reaches*.
+    /// `/srv/build-cache` spelled innocently but symlinked to `/` passes every
+    /// string test and grants the filesystem.
+    #[test]
+    fn a_root_that_resolves_to_the_filesystem_root_is_refused() {
+        let host = FakeHost::new().resolves("/srv/build-cache", "/");
+        let grants = derive_with(&cwd(), &host, &["/srv/build-cache".to_string()]);
+        assert!(grants.is_empty(), "{grants:?}");
+    }
+
+    #[test]
+    fn a_root_that_resolves_to_an_ancestor_of_the_workspace_is_refused() {
+        let host = FakeHost::new().resolves("/srv/cache", "/home/dev");
+        let grants = derive_with(&cwd(), &host, &["/srv/cache".to_string()]);
+        assert!(grants.is_empty(), "{grants:?}");
+    }
+
+    /// The resolved form is what gets granted, so the announcement and the
+    /// sidecar name the directory that actually becomes writable rather than
+    /// the alias the operator happened to type.
+    #[test]
+    fn a_resolved_root_is_recorded_by_its_real_path() {
+        let host = FakeHost::new().resolves("/srv/alias", "/media/disk/cargo");
+        let grants = derive_with(&cwd(), &host, &["/srv/alias".to_string()]);
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].path, "/media/disk/cargo");
+    }
+
+    /// A derived root is symlink-checked too, not just profile entries: an
+    /// operator's `./target` link or `CARGO_TARGET_DIR` can point anywhere.
+    #[test]
+    fn a_derived_root_that_resolves_wide_is_refused() {
+        let host = FakeHost::new()
+            .var("CARGO_TARGET_DIR", "/srv/cargo")
+            .resolves("/srv/cargo", "/");
+        assert!(derive(&cwd(), &host).is_empty());
     }
 
     /// `..` defeats every lexical filter: `/..` is absolute, is not a prefix of

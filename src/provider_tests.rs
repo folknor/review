@@ -920,3 +920,46 @@ fn grok_typed_error_line_keeps_its_message() {
         "an error printed only on stdout keeps its message: {err}"
     );
 }
+
+/// A profile `config` entry restating the writable-roots key wins over the
+/// derived one, because codex takes the last `-c`. The sidecar has to follow
+/// the run rather than the derivation, or it makes a confident false claim
+/// about what a run could write.
+#[test]
+fn a_profile_config_override_of_writable_roots_is_what_gets_recorded() {
+    let config = vec![r#"sandbox_workspace_write.writable_roots=["/secret"]"#.to_string()];
+    assert_eq!(
+        super::config_writable_roots_override(&config),
+        Some(vec!["/secret".to_string()])
+    );
+}
+
+/// An explicit empty override is a real state - the profile narrowed the run
+/// back to codex's defaults - and must not read as "no override".
+#[test]
+fn an_empty_writable_roots_override_is_recorded_as_empty_not_absent() {
+    let config = vec!["sandbox_workspace_write.writable_roots=[]".to_string()];
+    assert_eq!(super::config_writable_roots_override(&config), Some(vec![]));
+}
+
+#[test]
+fn unrelated_profile_config_entries_leave_the_derived_roots_recorded() {
+    let config = vec![
+        r#"model_provider="openai-http""#.to_string(),
+        r#"sandbox_workspace_write.network_access=true"#.to_string(),
+    ];
+    assert_eq!(super::config_writable_roots_override(&config), None);
+}
+
+/// Codex takes the last `-c` for a repeated key, so the record must too.
+#[test]
+fn the_last_writable_roots_override_wins() {
+    let config = vec![
+        r#"sandbox_workspace_write.writable_roots=["/first"]"#.to_string(),
+        r#"sandbox_workspace_write.writable_roots=["/second"]"#.to_string(),
+    ];
+    assert_eq!(
+        super::config_writable_roots_override(&config),
+        Some(vec!["/second".to_string()])
+    );
+}

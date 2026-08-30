@@ -597,15 +597,17 @@ pub async fn invoke(
     // but not logged is exactly the invisible permission this is meant to avoid.
     let granted_roots: Vec<crate::writable_roots::GrantedRoot> =
         if provider == "codex" && sandbox == Some("workspace-write") {
-            std::env::current_dir()
-                .map(|cwd| {
-                    crate::writable_roots::derive_with(
-                        &cwd,
-                        &crate::writable_roots::RealHost,
-                        profile_roots,
-                    )
-                })
-                .unwrap_or_default()
+            // Against `project_root`, not the process cwd: every runner spawns
+            // the provider with `.current_dir(project_root)`, and `.review.toml`
+            // discovery deliberately allows launching from a descendant of it.
+            // Deriving from the process cwd inspected `<subdir>/target` instead
+            // of the workspace's, so a run started one directory down silently
+            // failed to grant the root its build needed.
+            crate::writable_roots::derive_with(
+                project_root,
+                &crate::writable_roots::RealHost,
+                profile_roots,
+            )
         } else {
             // Silence here would be indistinguishable from the paths having been
             // granted: an operator who put `writable_roots` on the wrong profile
@@ -620,7 +622,15 @@ pub async fn invoke(
             }
             Vec::new()
         };
-    let root_paths: Vec<String> = granted_roots.iter().map(|g| g.path.clone()).collect();
+    let mut root_paths: Vec<String> = granted_roots.iter().map(|g| g.path.clone()).collect();
+    // A profile `config` entry restating the key wins, deliberately - but the
+    // record must follow the run, not the derivation, or the sidecar makes a
+    // confident false claim: a profile overriding to `["/secret"]` would be
+    // logged with the derived roots, and one overriding to `[]` would be logged
+    // as widened when it was not.
+    if let Some(overridden) = config_writable_roots_override(config) {
+        root_paths = overridden;
+    }
     // Announced once per distinct root set, not once per invocation: a fan-out
     // launches the same profile against several archetypes and would otherwise
     // repeat an identical block per run.
@@ -705,6 +715,34 @@ pub async fn invoke(
             writable_roots: root_paths,
         },
     }
+}
+
+/// The writable roots a profile `config` entry sets, when one does.
+///
+/// Profile overrides are passed after the derived `-c`, so codex takes the last
+/// one and a profile restating this key replaces the derivation entirely. The
+/// last entry wins here for the same reason. Returns `None` when no entry
+/// touches the key, and `Some(vec![])` for an explicit empty override - which is
+/// a real, recordable state, not the absence of one.
+fn config_writable_roots_override(config: &[String]) -> Option<Vec<String>> {
+    const KEY: &str = "sandbox_workspace_write.writable_roots";
+    let entry = config
+        .iter()
+        .rev()
+        .find(|c| c.trim_start().starts_with(KEY))?;
+    // Parse rather than string-scrape: the value is TOML, and a hand-written
+    // profile can spell an array in ways a regex would get wrong.
+    let parsed = entry.parse::<toml::Table>().ok()?;
+    let roots = parsed
+        .get("sandbox_workspace_write")?
+        .get("writable_roots")?
+        .as_array()?;
+    Some(
+        roots
+            .iter()
+            .filter_map(|v| v.as_str().map(ToString::to_string))
+            .collect(),
+    )
 }
 
 /// The sandbox level a run will actually be launched under, as opposed to the
