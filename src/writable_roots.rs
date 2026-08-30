@@ -22,9 +22,13 @@
 //! - it applies **only** to `workspace-write`; a `read-only` profile derives
 //!   nothing, because the whole point of that profile is that nothing is
 //!   writable;
-//! - it grants only paths that a build provably needs and that are **already
-//!   outside** the workspace (a path inside cwd is dropped - it is writable
-//!   anyway, and granting it would widen nothing while implying it did);
+//! - it grants only paths that a build provably needs, and only ones that
+//!   neither sit **inside** the workspace (writable anyway, so granting them
+//!   widens nothing while implying it did) nor **contain** it (`~` and a
+//!   `$HOME` that lost its subdirectory both resolve to the home directory,
+//!   which is never the narrow grant this promises), and never one carrying
+//!   `..`, which would defeat both checks lexically and let codex resolve `/..`
+//!   to `/`;
 //! - every grant carries a reason and is printed at launch, so the effective
 //!   permissions of a run are visible rather than inferred;
 //! - it is passed *before* profile `config` overrides, so a profile can still
@@ -75,8 +79,9 @@ impl Host for RealHost {
 /// Profile roots are **added to** the derived ones, not a replacement: the
 /// derivation covers what any build on this machine needs, while a profile
 /// covers what one project needs beyond that. They go through the same filters,
-/// so a profile cannot grant `/`, cannot grant a relative path, and gains
-/// nothing by naming a path already inside the workspace.
+/// so a profile cannot grant `/`, an ancestor of the workspace, a path
+/// containing `..`, or a relative path, and gains nothing by naming a path
+/// already inside the workspace.
 ///
 /// Returns an empty vec when nothing is needed - a workspace whose build stays
 /// entirely inside itself derives no grants and is left with codex's defaults.
@@ -117,7 +122,10 @@ fn expand(raw: &str, host: &impl Host) -> Option<String> {
             })?;
             format!("{}/{rest}", home.trim_end_matches('/'))
         }
-        None if raw == "~" => host.var("HOME")?,
+        None if raw == "~" => host.var("HOME").or_else(|| {
+            eprintln!("warning: ignoring writable_roots entry ~: HOME is not set");
+            None
+        })?,
         None => raw.to_string(),
     };
 
@@ -192,6 +200,33 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
 
 /// Add one candidate root, applying every filter a grant must pass.
 fn push_root(out: &mut Vec<GrantedRoot>, cwd: &Path, path: &Path, why: &'static str) {
+    // `..` defeats every lexical check below - `/..` is absolute, is not a
+    // prefix of cwd and is not empty, so it would sail through and codex would
+    // resolve it to `/`. Refuse rather than normalise: `/a/../b` and `/b` are
+    // the same path only when `/a` is not a symlink, and this module does not
+    // get to assume that.
+    if path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        eprintln!(
+            "warning: ignoring writable root containing '..': {}",
+            path.display()
+        );
+        return;
+    }
+    // An *ancestor* of the workspace is the mirror image of the check below and
+    // just as wrong: `~` or a `$HOME` whose intended subdirectory was dropped
+    // resolves to the home directory, and granting it hands over every repo,
+    // `~/.ssh`, and `review`'s own logs. A grant that contains the workspace is
+    // never the narrow thing this module promises.
+    if cwd.starts_with(path) {
+        eprintln!(
+            "warning: ignoring writable root that contains the workspace: {}",
+            path.display()
+        );
+        return;
+    }
     // Only paths outside the workspace are worth granting: cwd is already
     // writable, so granting a subpath of it would be noise that reads like a
     // widening.
@@ -201,6 +236,14 @@ fn push_root(out: &mut Vec<GrantedRoot>, cwd: &Path, path: &Path, why: &'static 
     let Some(text) = path.to_str() else {
         return;
     };
+    // A control character cannot be carried by a TOML basic string, so such a
+    // path would render a `-c` value codex refuses to parse - an opaque launch
+    // failure. A path really containing a newline is far more likely a mangled
+    // environment variable than a directory anyone meant to grant.
+    if text.contains(|c: char| c.is_control()) {
+        eprintln!("warning: ignoring writable root containing a control character");
+        return;
+    }
     // A symlink target routinely carries a trailing slash while the env var
     // naming the same directory does not, so compare and emit the normalised
     // form or the two arrive as separate grants - which is harmless to codex but
@@ -298,6 +341,7 @@ mod tests {
     fn a_global_cargo_target_dir_is_granted() {
         let host = FakeHost::new().var("CARGO_TARGET_DIR", "/media/disk/cargo");
         let grants = derive(&cwd(), &host);
+        assert_eq!(grants.len(), 1, "{grants:?}");
         assert_eq!(grants[0].path, "/media/disk/cargo");
     }
 
@@ -305,7 +349,22 @@ mod tests {
     fn a_target_symlink_pointing_outside_is_granted() {
         let host = FakeHost::new().link("/home/dev/project/target", "/media/disk/cargo");
         let grants = derive(&cwd(), &host);
+        assert_eq!(grants.len(), 1, "{grants:?}");
         assert_eq!(grants[0].path, "/media/disk/cargo");
+    }
+
+    /// `RealHost` is the one implementation with logic of its own, and
+    /// `FakeHost` cannot exercise it: an empty environment variable must read as
+    /// unset, or an exported-but-blank `CARGO_TARGET_DIR` would reach the
+    /// absolute-path guard as `""`.
+    #[test]
+    fn the_real_host_treats_an_empty_variable_as_unset() {
+        // SAFETY: single-threaded test, and the variable is removed after.
+        unsafe { std::env::set_var("REVIEW_EMPTY_PROBE", "") };
+        assert_eq!(RealHost.var("REVIEW_EMPTY_PROBE"), None);
+        unsafe { std::env::set_var("REVIEW_EMPTY_PROBE", "x") };
+        assert_eq!(RealHost.var("REVIEW_EMPTY_PROBE").as_deref(), Some("x"));
+        unsafe { std::env::remove_var("REVIEW_EMPTY_PROBE") };
     }
 
     /// A path inside the workspace is writable already. Granting it would widen
@@ -452,6 +511,58 @@ mod tests {
     fn expansion_into_the_workspace_is_still_dropped() {
         let host = FakeHost::new().var("W", "/home/dev/project");
         let grants = derive_with(&cwd(), &host, &["$W/sub".to_string()]);
+        assert!(grants.is_empty(), "{grants:?}");
+    }
+
+    /// `..` defeats every lexical filter: `/..` is absolute, is not a prefix of
+    /// cwd and is not empty, so before this was refused it was emitted verbatim
+    /// and codex resolved it to `/`.
+    #[test]
+    fn a_parent_dir_component_cannot_smuggle_a_wider_grant() {
+        let host = FakeHost::new();
+        for entry in ["/..", "/srv/..", "/srv/../../etc", "/home/dev/project/.."] {
+            let grants = derive_with(&cwd(), &host, &[entry.to_string()]);
+            assert!(grants.is_empty(), "{entry} produced {grants:?}");
+        }
+    }
+
+    #[test]
+    fn a_parent_dir_from_an_expanded_variable_is_also_refused() {
+        let host = FakeHost::new().var("BASE", "/srv/data");
+        let grants = derive_with(&cwd(), &host, &["$BASE/../..".to_string()]);
+        assert!(grants.is_empty(), "{grants:?}");
+    }
+
+    /// The mirror of the inside-the-workspace filter, and the likelier operator
+    /// mistake: `~` (or a `$HOME` whose intended subdirectory was dropped)
+    /// resolves to the home directory, which *contains* the workspace. Granting
+    /// it hands over every repo, `~/.ssh`, and review's own logs.
+    #[test]
+    fn a_root_containing_the_workspace_is_refused() {
+        let host = FakeHost::new().var("HOME", "/home/dev");
+        for entry in ["~", "$HOME", "/home/dev", "/home", "/"] {
+            let grants = derive_with(&cwd(), &host, &[entry.to_string()]);
+            assert!(grants.is_empty(), "{entry} produced {grants:?}");
+        }
+    }
+
+    /// A sibling of the workspace under the same parent is a legitimate grant -
+    /// the ancestor check must not be a string prefix test.
+    #[test]
+    fn a_sibling_of_the_workspace_is_still_granted() {
+        let host = FakeHost::new();
+        let grants = derive_with(&cwd(), &host, &["/home/dev/project-other".to_string()]);
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].path, "/home/dev/project-other");
+    }
+
+    /// A control character cannot live in a TOML basic string, so emitting one
+    /// would render a `-c` value codex refuses to parse - an opaque launch
+    /// failure rather than a grant.
+    #[test]
+    fn a_control_character_in_a_path_is_refused() {
+        let host = FakeHost::new().var("XDG_RUNTIME_DIR", "/run/user/1000\nx");
+        let grants = derive(&cwd(), &host);
         assert!(grants.is_empty(), "{grants:?}");
     }
 

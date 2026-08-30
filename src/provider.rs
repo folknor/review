@@ -49,15 +49,33 @@ fn new_temp_file(tag: &str) -> Result<String> {
 
 /// Caps on how much provider output we buffer in memory. Generous - real reviews
 /// are far under these; the cap only stops a runaway stream from OOMing review.
-/// Guards the one-time announcement of derived writable roots. A fan-out runs
-/// the same profile in the same directory against several archetypes, so every
-/// invocation derives an identical set; announcing per invocation would stack
-/// duplicate blocks above the results rather than telling the operator anything
-/// new.
-static ROOTS_ANNOUNCED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-
 const STDOUT_CAPTURE_CAP: usize = 64 << 20; // 64 MiB
 const STDERR_CAPTURE_CAP: usize = 8 << 20; // 8 MiB
+
+/// Root sets already announced this process, so an identical set is printed once
+/// while a *different* one always prints.
+///
+/// A fan-out today runs one profile in one directory, so every invocation
+/// derives the same set and a plain "have we announced?" flag would do. Keying
+/// on the set instead costs nothing and removes the trap: the moment roots can
+/// differ between invocations - per-archetype profiles being the obvious next
+/// config change - a flag would leave the *wider* run unannounced while the
+/// operator had seen only the narrower block, which is precisely the invisible
+/// permission this announcement exists to prevent.
+static ROOTS_ANNOUNCED: std::sync::Mutex<Option<std::collections::HashSet<Vec<String>>>> =
+    std::sync::Mutex::new(None);
+
+/// Whether this exact root set still needs announcing.
+fn claim_roots_announcement(paths: &[String]) -> bool {
+    match ROOTS_ANNOUNCED.lock() {
+        Ok(mut guard) => guard
+            .get_or_insert_with(Default::default)
+            .insert(paths.to_vec()),
+        // A poisoned lock means another thread panicked mid-announcement.
+        // Announcing twice is noise; staying silent about a widening is not.
+        Err(_) => true,
+    }
+}
 
 /// Buffer shared between a reader task and the runner.
 ///
@@ -589,17 +607,28 @@ pub async fn invoke(
                 })
                 .unwrap_or_default()
         } else {
+            // Silence here would be indistinguishable from the paths having been
+            // granted: an operator who put `writable_roots` on the wrong profile
+            // gets a build that fails for reasons the config appears to rule out.
+            if !profile_roots.is_empty() {
+                eprintln!(
+                    "warning: profile writable_roots ignored - they apply only to \
+                     a codex workspace-write profile (this run: {} {})",
+                    provider,
+                    sandbox.unwrap_or("read-only")
+                );
+            }
             Vec::new()
         };
-    // Printed once per process, not once per invocation: a fan-out launches the
-    // same profile against several archetypes and would otherwise repeat an
-    // identical block per run, at the top, before any result it belongs to.
-    if !granted_roots.is_empty() && ROOTS_ANNOUNCED.set(()).is_ok() {
+    let root_paths: Vec<String> = granted_roots.iter().map(|g| g.path.clone()).collect();
+    // Announced once per distinct root set, not once per invocation: a fan-out
+    // launches the same profile against several archetypes and would otherwise
+    // repeat an identical block per run.
+    if !granted_roots.is_empty() && claim_roots_announcement(&root_paths) {
         for grant in &granted_roots {
             eprintln!("codex: writable root {} ({})", grant.path, grant.why);
         }
     }
-    let root_paths: Vec<String> = granted_roots.iter().map(|g| g.path.clone()).collect();
 
     let result = match provider {
         // `sandbox` is an OS filesystem sandbox, which codex and grok both have
@@ -660,7 +689,7 @@ pub async fn invoke(
             session_id: run.session_id,
             digest: run.digest,
             completed_epoch,
-            sandbox: sandbox.map(ToString::to_string),
+            sandbox: effective_sandbox(provider, sandbox),
             writable_roots: root_paths,
         },
         Err(e) => ProviderResult {
@@ -672,9 +701,26 @@ pub async fn invoke(
             // A launch that failed still launched with these permissions
             // requested, and a row that omitted them would read as a run with
             // none.
-            sandbox: sandbox.map(ToString::to_string),
+            sandbox: effective_sandbox(provider, sandbox),
             writable_roots: root_paths,
         },
+    }
+}
+
+/// The sandbox level a run will actually be launched under, as opposed to the
+/// one the caller asked for.
+///
+/// The two differ on the `--session` path, which carries no profile and so no
+/// sandbox: the runners still pass `--sandbox read-only` by default, so a resume
+/// genuinely runs read-only rather than inheriting the level of the session it
+/// resumes. Recording the caller's `None` there left every resume row invisible
+/// to `jq 'select(.sandbox=="read-only")'` - the exact query the sidecar fields
+/// exist to answer. Claude has no filesystem sandbox on this axis, so it records
+/// none.
+fn effective_sandbox(provider: &str, sandbox: Option<&str>) -> Option<String> {
+    match provider {
+        "codex" | "grok" => Some(sandbox.unwrap_or("read-only").to_string()),
+        _ => None,
     }
 }
 

@@ -808,9 +808,11 @@ async fn run_session_resume(
             result.completed_epoch,
             None,
             Vec::new(),
-            // A `--session` resume bypasses `.review.toml` entirely and inherits
-            // whatever the original run was launched with, so `review` has no
-            // sandbox of its own to report here.
+            // A `--session` resume carries no profile, so the runner falls back
+            // to `read-only` - it does *not* inherit the level of the session it
+            // resumes. `result.sandbox` therefore reports `read-only`, which is
+            // what actually ran, and keeps resume rows visible to a query over
+            // the sandbox level.
             result.sandbox.as_deref(),
             result.writable_roots.clone(),
             &stdin_instructions,
