@@ -1163,6 +1163,97 @@ enum GrokOutcome {
     },
 }
 
+/// Name of the codex permissions profile `review` synthesises for `read-only`.
+///
+/// Never read from the operator's config - `--ignore-user-config` drops that
+/// file, and the profile is defined entirely by the `-c` overrides below - so
+/// the name only has to avoid colliding with a built-in (those all start `:`).
+const CODEX_READ_ONLY_PROFILE: &str = "review-read-only";
+
+/// The codex arguments that select a sandbox level.
+///
+/// Every level but `read-only` is `--sandbox <level>`. `read-only` is not,
+/// and the reason is worth the paragraph.
+///
+/// A `read-only` run needs sockets for the same reason a `workspace-write` one
+/// does: the seccomp filter codex installs when network access is off denies
+/// `bind`, `connect`, `listen`, `accept`, `getsockname`, `getsockopt`,
+/// `setsockopt` and `sendto` outright, and permits `socket()` only for
+/// AF_UNIX - so a unix socket can be created and then used for nothing. That
+/// filter is not scoped to a sandbox level; it is installed whenever the
+/// network policy is `Restricted`, which `read-only` always was.
+///
+/// There is no `sandbox_read_only.network_access` to turn it off.
+/// `SandboxPolicy::ReadOnly` does carry a `network_access` field, but nothing
+/// in the legacy `sandbox_mode` pipeline ever sets it: `derive_permission_
+/// profile` maps `SandboxMode::ReadOnly` to `PermissionProfile::read_only()`,
+/// whose network policy is hardcoded `Restricted`. Only the workspace-write
+/// arm consults config, which is why the sibling override below exists and has
+/// no read-only counterpart.
+///
+/// The one surface that *can* express "read-only filesystem, network enabled"
+/// is codex's named-permissions pipeline - a `[permissions.<id>]` profile
+/// extending the built-in `:read-only` with `network.enabled = true`. The
+/// catch is that `resolve_permission_config_syntax` returns `Legacy` the
+/// instant a `sandbox_mode` override is present, and `Legacy` makes
+/// `[permissions]` profiles inert. So selecting the profile means **not**
+/// passing `--sandbox` at all; the two mechanisms cannot be combined.
+///
+/// Giving up `--sandbox` on the path that matters most deserved evidence
+/// rather than a reading of the source, so `scripts/readonly_network_check.py`
+/// measures three configurations against one witness program. Verified on
+/// codex-cli 0.151.0:
+///
+/// ```text
+///                      --sandbox read-only   profile, restricted   profile, enabled
+///   write_cwd          EROFS                 EROFS                 EROFS
+///   read_etc_hostname  ok                    ok                    ok
+///   unix_connect       EPERM                 EPERM                 ok
+///   unix_sockopt       EPERM                 EPERM                 ok
+///   inet_socket_create EPERM                 EPERM                 ok
+///   inet_bind_listen   EPERM                 EPERM                 ok
+///   tcp_connect        EPERM                 EPERM                 ok
+/// ```
+///
+/// The middle column is the load-bearing one. It is the same profile with
+/// network left restricted, and it reproduces `--sandbox read-only` exactly -
+/// which is what establishes that dropping the flag does not widen the
+/// filesystem, separately from the network change. `write_cwd` stays `EROFS`
+/// in all three: the guarantee `.review.toml` advertises for `read-only` is
+/// intact, and only the socket lines move.
+///
+/// Note the witnesses are `connect()` and socket options, not `bind()` on a
+/// unix path. Under `read-only` nothing is writable, so binding an AF_UNIX
+/// socket cannot succeed on filesystem grounds however the filter is set; what
+/// a read-only run gains is the ability to *reach* something already
+/// listening, plus AF_INET egress.
+///
+/// Enabling network is as blunt here as it is for `workspace-write` - the
+/// filter is all-or-nothing and codex exposes no AF_UNIX-only knob on Linux
+/// (`NetworkToml` has `unix_sockets` and `allow_local_binding`, but only
+/// `seatbelt.rs` reads them; the Linux path is `landlock.rs`, where network
+/// `Enabled` with no proxy means no filter is installed at all). Deliberately
+/// *not* configuring a proxy also keeps us out of `NetworkSeccompMode::
+/// ProxyRouted`, which would be worse than the status quo: it denies AF_UNIX
+/// `socket()` entirely.
+///
+/// An older codex without the permissions pipeline fails soft rather than
+/// silently wide: it ignores `default_permissions` and falls through to
+/// `SandboxMode::default()`, which is `ReadOnly`.
+fn codex_sandbox_args(level: &str) -> Vec<String> {
+    if level != "read-only" {
+        return vec!["--sandbox".to_string(), level.to_string()];
+    }
+    vec![
+        "-c".to_string(),
+        format!(r#"permissions.{CODEX_READ_ONLY_PROFILE}.extends=":read-only""#),
+        "-c".to_string(),
+        format!("permissions.{CODEX_READ_ONLY_PROFILE}.network.enabled=true"),
+        "-c".to_string(),
+        format!(r#"default_permissions="{CODEX_READ_ONLY_PROFILE}""#),
+    ]
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_codex(
     session_id: &str,
@@ -1183,8 +1274,6 @@ async fn run_codex(
     // Exec-level options shared by both paths.
     let mut args: Vec<String> = vec![
         "exec".to_string(),
-        "--sandbox".to_string(),
-        sandbox.unwrap_or("read-only").to_string(),
         // `review` is routinely launched from a directory that is not itself a
         // git repo (an umbrella dir whose repos live in subdirectories). Codex
         // refuses to start there - "Not inside a trusted directory and
@@ -1262,6 +1351,7 @@ async fn run_codex(
         "-c".to_string(),
         "model_reasoning_summary=\"detailed\"".to_string(),
     ];
+    args.extend(codex_sandbox_args(sandbox.unwrap_or("read-only")));
     if let Some(m) = model {
         args.push("-m".to_string());
         args.push(m.to_string());
