@@ -1,6 +1,7 @@
 [archetypes]
 bugs = """You review `review`, a Rust CLI, for bugs. Inspect the current \
 repository state before reporting."""
+bare = ""
 
 [_defaults]
 providers = ["codex"]
@@ -34,6 +35,16 @@ sandbox = "read-only"
 # (missing api.model.read scope), a wall the websocket transport doesn't hit.
 # See TODO.md. Websocket is the working transport; deaths are handled, not
 # prevented, via recover + auto-resume + incident bundles.
+
+[bygg.codex.implement]
+model = "gpt-5.6-sol"
+effort = "low"
+sandbox = "workspace-write"
+
+[bygg.codex.bugs]
+model = "gpt-5.6-sol"
+effort = "low"
+sandbox = "read-only"
 
 [_audit]
 id = "43fd"

@@ -8,7 +8,17 @@
 /// with an empty argument and orphan the operator's real goal a line below.
 /// When the prime is a bare single-line slash command, the stdin is inlined
 /// onto that line (`/goal <stdin>`) so the command receives it as its argument.
+///
+/// Special case: an empty prime (`bare = ""`), whose whole point is that the
+/// operator's prompt is the entire instruction. The separator is dropped rather
+/// than applied to nothing, which would prepend two newlines to a prompt that
+/// advertises itself as carrying no priming. Whitespace-only counts as empty -
+/// a prime of `" "` primes exactly as much as `""` does, and the difference is
+/// invisible in a config file.
 pub fn assemble(prime: &str, stdin_instructions: &str) -> String {
+    if prime.trim().is_empty() {
+        return stdin_instructions.to_string();
+    }
     if is_slash_command(prime) {
         return format!("{} {}", prime.trim_end(), stdin_instructions.trim_start());
     }
@@ -56,6 +66,31 @@ mod tests {
     fn non_slash_prime_keeps_blank_line_separator() {
         let out = assemble("you are a bugs expert", "review it");
         assert_eq!(out, "you are a bugs expert\n\nreview it");
+    }
+
+    #[test]
+    fn empty_prime_sends_stdin_verbatim() {
+        // `bare = ""` must send exactly what the operator typed. The blank-line
+        // separator applied to an empty prime prepends two newlines to every
+        // bare prompt.
+        let out = assemble("", "what is the mechanism here?");
+        assert_eq!(out, "what is the mechanism here?");
+    }
+
+    #[test]
+    fn whitespace_only_prime_is_bare_too() {
+        // Indistinguishable from `""` in a config file, so it must behave the
+        // same rather than emitting the separator plus the stray whitespace.
+        let out = assemble("  \n ", "go");
+        assert_eq!(out, "go");
+    }
+
+    #[test]
+    fn empty_prime_preserves_stdin_leading_whitespace() {
+        // The separator is what gets dropped, not the operator's own text: a
+        // prompt that deliberately opens with an indented block keeps it.
+        let out = assemble("", "  indented first line\nsecond");
+        assert_eq!(out, "  indented first line\nsecond");
     }
 
     #[test]
