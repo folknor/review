@@ -5,9 +5,9 @@
 //! used from, and the shortfall is not the project's to know about - it is a
 //! property of the machine:
 //!
-//! - The build wrapper takes its lock under `$XDG_RUNTIME_DIR`
-//!   (`/run/user/<uid>`). Failing that write is **fatal** - the run dies at
-//!   `lock: failed to open lock file` before a single crate is compiled.
+//! - The build wrapper takes its lock in `$HOME/.brokkr`. Failing that write is
+//!   **fatal** - the run dies at `lock: failed to open lock file` before a
+//!   single crate is compiled.
 //! - Two of the five hosts export a global `CARGO_TARGET_DIR` onto a separate
 //!   drive, and several repos carry a `target` symlink pointing at the same
 //!   shared cache. Cargo cannot write there either.
@@ -22,19 +22,14 @@
 //! - it applies **only** to `workspace-write`; a `read-only` profile derives
 //!   nothing, because the whole point of that profile is that nothing is
 //!   writable;
-//! - it derives only from a **public contract the host has declared**, never
-//!   from a tool's internals. `$CARGO_TARGET_DIR` and the `./target` symlink are
-//!   cargo facts. `$XDG_RUNTIME_DIR` is not a fact about Rust at all - it is
-//!   derived because brokkr locks there - but it is a standardised variable the
-//!   host sets, so granting it is honouring a declaration rather than predicting
-//!   a behaviour. When it is *unset* brokkr falls back to `$HOME/.cache/brokkr`,
-//!   and that is deliberately **not** derived here: it is brokkr's private
-//!   implementation detail, it would make this module predict an optional tool
-//!   `review` neither selects nor invokes, and a brokkr release could silently
-//!   invalidate the grant with nothing here expressing the dependency. A profile
-//!   whose workflow runs brokkr declares it instead, with
-//!   `writable_roots = ["~/.cache/brokkr"]` - the profile author knows whether
-//!   brokkr is involved, and this module cannot;
+//! - it derives only paths that resolve **identically from every login path**.
+//!   `$CARGO_TARGET_DIR` and the `./target` symlink are cargo facts. The build
+//!   lock is not a fact about Rust at all - it is derived because brokkr locks
+//!   there - but `$HOME/.brokkr` is a fixed, documented location, so deriving it
+//!   is reading a stable contract rather than predicting a behaviour. The test
+//!   is determinism, not whether a variable happens to look standard:
+//!   `$XDG_RUNTIME_DIR` looked like the generic choice and was the fragile one,
+//!   because a login that skips pam_systemd never sets it;
 //! - it grants only paths that a build provably needs, and only ones that
 //!   neither sit **inside** the workspace (writable anyway, so granting them
 //!   widens nothing while implying it did) nor **contain** it (`~` and a
@@ -193,10 +188,27 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
     let mut out: Vec<GrantedRoot> = Vec::new();
 
     // The build lock. Fatal when missing, and never inside the workspace.
-    if let Some(dir) = host.var("XDG_RUNTIME_DIR") {
-        let path = PathBuf::from(dir);
+    //
+    // `$HOME/.brokkr`, not `$XDG_RUNTIME_DIR`. The latter looked like a generic
+    // machine fact but never was one - nothing about a Rust build needs it, and
+    // it was derived purely because that is where the build lock used to live.
+    // It failed as a location twice over: it is absent from any login that does
+    // not go through pam_systemd (Tailscale SSH constructs the child environment
+    // itself, so an entire host had it unset while `systemctl --user
+    // show-environment` still reported it), and when absent the lock fell back
+    // under `$HOME` - outside every granted root - so the derivation went silent
+    // in exactly the case the build needed it most. Granting it was also far
+    // wider than the lock warranted: `/run/user/<uid>` holds D-Bus, Wayland,
+    // keyring and agent sockets.
+    //
+    // `$HOME` is set by every login path including the ones that drop
+    // `XDG_RUNTIME_DIR`, so this resolves identically from a terminal, an ssh
+    // session and an agent harness - which is what makes the grant derivable at
+    // all rather than something each project has to declare.
+    if let Some(home) = host.var("HOME") {
+        let path = PathBuf::from(home).join(".brokkr");
         if path.is_absolute() {
-            push_root(&mut out, cwd, host, &path, "build lock ($XDG_RUNTIME_DIR)");
+            push_root(&mut out, cwd, host, &path, "build lock ($HOME/.brokkr)");
         }
     }
 
@@ -393,10 +405,44 @@ mod tests {
 
     #[test]
     fn the_build_lock_directory_is_granted() {
-        let host = FakeHost::new().var("XDG_RUNTIME_DIR", "/run/user/1000");
+        let host = FakeHost::new().var("HOME", "/home/dev");
         let grants = derive(&cwd(), &host);
         assert_eq!(grants.len(), 1);
-        assert_eq!(grants[0].path, "/run/user/1000");
+        assert_eq!(grants[0].path, "/home/dev/.brokkr");
+    }
+
+    /// The lock directory must not depend on `XDG_RUNTIME_DIR`. It was the
+    /// previous location and is absent from any login that skips pam_systemd -
+    /// a whole host had it unset under Tailscale SSH - so a derivation that
+    /// still consulted it would go silent in exactly that case.
+    #[test]
+    fn the_build_lock_ignores_xdg_runtime_dir() {
+        let host = FakeHost::new()
+            .var("HOME", "/home/dev")
+            .var("XDG_RUNTIME_DIR", "/run/user/1000");
+        let grants = derive(&cwd(), &host);
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(grants[0].path, "/home/dev/.brokkr");
+    }
+
+    /// A login with no `HOME` cannot have its lock location derived. Inventing
+    /// one would grant `/.brokkr`, a path nobody named.
+    #[test]
+    fn no_home_derives_no_build_lock() {
+        assert!(derive(&cwd(), &FakeHost::new()).is_empty());
+    }
+
+    /// `$HOME` itself is never the grant - only the dedicated subdirectory. A
+    /// bare lock file at the home root would need the home directory writable,
+    /// handing over every repo, `~/.ssh` and review's own logs.
+    #[test]
+    fn the_build_lock_grant_is_never_the_home_directory() {
+        let host = FakeHost::new().var("HOME", "/home/dev");
+        let grants = derive(&cwd(), &host);
+        assert!(
+            grants.iter().all(|g| g.path != "/home/dev"),
+            "home itself must never be granted: {grants:?}"
+        );
     }
 
     #[test]
@@ -465,7 +511,7 @@ mod tests {
 
     #[test]
     fn a_profile_root_is_added_to_the_derived_ones() {
-        let host = FakeHost::new().var("XDG_RUNTIME_DIR", "/run/user/1000");
+        let host = FakeHost::new().var("HOME", "/home/dev");
         let grants = derive_with(&cwd(), &host, &["/srv/fixtures".to_string()]);
         assert_eq!(grants.len(), 2);
         assert_eq!(grants[1].path, "/srv/fixtures");
@@ -478,11 +524,11 @@ mod tests {
     #[test]
     fn a_profile_root_does_not_replace_the_derived_ones() {
         let host = FakeHost::new()
-            .var("XDG_RUNTIME_DIR", "/run/user/1000")
+            .var("HOME", "/home/dev")
             .var("CARGO_TARGET_DIR", "/media/disk/cargo");
         let grants = derive_with(&cwd(), &host, &["/srv/fixtures".to_string()]);
         let paths: Vec<&str> = grants.iter().map(|g| g.path.as_str()).collect();
-        assert!(paths.contains(&"/run/user/1000"), "{paths:?}");
+        assert!(paths.contains(&"/home/dev/.brokkr"), "{paths:?}");
         assert!(paths.contains(&"/media/disk/cargo"), "{paths:?}");
     }
 
@@ -526,9 +572,17 @@ mod tests {
 
     #[test]
     fn a_profile_root_expands_tilde() {
+        // Selected by reason, not by index: setting `HOME` also derives the
+        // build lock, so position would pin the derivation's shape rather than
+        // the expansion under test.
         let host = FakeHost::new().var("HOME", "/home/dev");
         let grants = derive_with(&cwd(), &host, &["~/data".to_string()]);
-        assert_eq!(grants[0].path, "/home/dev/data");
+        let profile: Vec<&str> = grants
+            .iter()
+            .filter(|g| g.why == "profile writable_roots")
+            .map(|g| g.path.as_str())
+            .collect();
+        assert_eq!(profile, vec!["/home/dev/data"]);
     }
 
     /// The dangerous case. Expanding an unset variable to nothing would turn
@@ -641,7 +695,13 @@ mod tests {
     fn a_root_containing_the_workspace_is_refused() {
         let host = FakeHost::new().var("HOME", "/home/dev");
         for entry in ["~", "$HOME", "/home/dev", "/home", "/"] {
-            let grants = derive_with(&cwd(), &host, &[entry.to_string()]);
+            // Setting `HOME` also derives the build lock, which is a legitimate
+            // grant and not what this test is about - only the profile entry
+            // must be refused.
+            let grants: Vec<_> = derive_with(&cwd(), &host, &[entry.to_string()])
+                .into_iter()
+                .filter(|g| g.why == "profile writable_roots")
+                .collect();
             assert!(grants.is_empty(), "{entry} produced {grants:?}");
         }
     }
@@ -706,13 +766,13 @@ mod tests {
     #[test]
     fn the_override_is_a_toml_array_of_the_granted_paths() {
         let host = FakeHost::new()
-            .var("XDG_RUNTIME_DIR", "/run/user/1000")
+            .var("HOME", "/home/dev")
             .var("CARGO_TARGET_DIR", "/media/disk/cargo");
         let grants = derive(&cwd(), &host);
         assert_eq!(
             config_override(&grants).as_deref(),
             Some(
-                r#"sandbox_workspace_write.writable_roots=["/run/user/1000","/media/disk/cargo"]"#
+                r#"sandbox_workspace_write.writable_roots=["/home/dev/.brokkr","/media/disk/cargo"]"#
             )
         );
     }
@@ -723,7 +783,7 @@ mod tests {
     #[test]
     fn a_quote_in_a_path_cannot_inject_another_config_key() {
         let hostile = "/run/\"],approval_policy=\"on-request";
-        let host = FakeHost::new().var("XDG_RUNTIME_DIR", hostile);
+        let host = FakeHost::new().var("HOME", hostile);
         let grants = derive(&cwd(), &host);
         let Some(rendered) = config_override(&grants) else {
             panic!("a granted root must render an override");
@@ -744,6 +804,12 @@ mod tests {
             .as_array()
             .unwrap_or_else(|| panic!("writable_roots must be an array: {parsed:?}"));
         assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0].as_str(), Some(hostile));
+        // The whole hostile string survives as one array element, escaped - the
+        // grant is the `.brokkr` subdirectory of it, so the quote never escapes
+        // the TOML string it is quarantined in.
+        assert_eq!(
+            roots[0].as_str(),
+            Some(format!("{hostile}/.brokkr").as_str())
+        );
     }
 }
