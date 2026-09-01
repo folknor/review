@@ -634,10 +634,33 @@ pub async fn invoke(
     // Announced once per distinct root set, not once per invocation: a fan-out
     // launches the same profile against several archetypes and would otherwise
     // repeat an identical block per run.
-    if !granted_roots.is_empty() && claim_roots_announcement(&root_paths) {
-        for grant in &granted_roots {
-            eprintln!("codex: writable root {} ({})", grant.path, grant.why);
+    //
+    // What is announced is the *effective* set, not the derived one. Keying
+    // either the guard or the loop on `granted_roots` broke the "every grant is
+    // printed" fence three ways: a profile `config` override that replaced the
+    // roots printed the derived paths instead of the ones the run actually got,
+    // one that *added* roots to an empty derivation printed nothing at all, and
+    // an override to `[]` printed grants the run did not receive. The whole
+    // justification for deriving from ambient environment is that the result is
+    // visible rather than inferred, so the line must follow the run.
+    if !root_paths.is_empty() && claim_roots_announcement(&root_paths) {
+        for line in announcement_lines(&granted_roots, &root_paths) {
+            eprintln!("{line}");
         }
+    }
+    // A workspace-write run that ends up with nothing outside the workspace is
+    // usually a stripped environment rather than a workspace that needs nothing
+    // (see `writable_roots::derive`, which has a legitimate zero case). It is
+    // therefore a policy warning, not a correctness diagnostic - but silence
+    // here is what let 40 consecutive runs record no roots unnoticed while every
+    // build inside them died at a lock outside the sandbox.
+    if provider == "codex" && sandbox == Some("workspace-write") && root_paths.is_empty() {
+        eprintln!(
+            "warning: workspace-write run with no writable roots outside the \
+             workspace - a build needing one (a lock or cache under $HOME or \
+             $XDG_RUNTIME_DIR) will fail read-only. Declare it with \
+             `writable_roots` on this profile if so."
+        );
     }
 
     let result = match provider {
@@ -724,6 +747,32 @@ pub async fn invoke(
 /// last entry wins here for the same reason. Returns `None` when no entry
 /// touches the key, and `Some(vec![])` for an explicit empty override - which is
 /// a real, recordable state, not the absence of one.
+/// The `writable root` lines for a launch: one per **effective** root, carrying
+/// the derivation's reason where the path came from the derivation and saying so
+/// plainly where it did not.
+///
+/// Split out from `invoke` because the defect this replaced was invisible in
+/// review: the announcement read from the derived set while the run used the
+/// effective one, so the two could disagree with nothing failing. A pure
+/// function over both sets is the only shape that can be tested.
+fn announcement_lines(
+    granted_roots: &[crate::writable_roots::GrantedRoot],
+    root_paths: &[String],
+) -> Vec<String> {
+    root_paths
+        .iter()
+        .map(|path| {
+            // A derived root can state why a build needs it; one that arrived
+            // through a `config` override cannot, and must not borrow a reason
+            // from the derivation it replaced.
+            match granted_roots.iter().find(|g| &g.path == path) {
+                Some(grant) => format!("codex: writable root {} ({})", grant.path, grant.why),
+                None => format!("codex: writable root {path} (profile config override)"),
+            }
+        })
+        .collect()
+}
+
 fn config_writable_roots_override(config: &[String]) -> Option<Vec<String>> {
     const KEY: &str = "sandbox_workspace_write.writable_roots";
     let entry = config

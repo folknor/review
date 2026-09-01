@@ -1028,3 +1028,81 @@ fn the_read_only_profile_extends_the_builtin_read_only_filesystem() {
         "expected the built-in read-only parent, got {extends}"
     );
 }
+
+fn grant(path: &str, why: &'static str) -> crate::writable_roots::GrantedRoot {
+    crate::writable_roots::GrantedRoot {
+        path: path.to_string(),
+        why,
+    }
+}
+
+/// The ordinary case: no override, so every effective root is a derived one and
+/// keeps the reason a build needs it.
+#[test]
+fn announcement_reports_derived_roots_with_their_reason() {
+    let granted = vec![grant("/run/user/1000", "build lock ($XDG_RUNTIME_DIR)")];
+    let lines = super::announcement_lines(&granted, &["/run/user/1000".to_string()]);
+    assert_eq!(
+        lines,
+        vec!["codex: writable root /run/user/1000 (build lock ($XDG_RUNTIME_DIR))"]
+    );
+}
+
+/// The defect this function exists to prevent. A profile `config` override
+/// replaces the roots the run launches with, and codex takes the last `-c`, so
+/// announcing the derived set would print paths the run did not receive while
+/// withholding the one it did.
+#[test]
+fn announcement_follows_a_config_override_rather_than_the_derivation() {
+    let granted = vec![grant("/run/user/1000", "build lock ($XDG_RUNTIME_DIR)")];
+    let lines = super::announcement_lines(&granted, &["/secret".to_string()]);
+    assert_eq!(
+        lines,
+        vec!["codex: writable root /secret (profile config override)"]
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("/run/user/1000")),
+        "a replaced derived root must not be announced as granted: {lines:?}"
+    );
+}
+
+/// An override that *adds* to an empty derivation still has to be announced -
+/// the old guard keyed on the derived set being non-empty and printed nothing
+/// here, which is the silent-widening case the fence exists to catch.
+#[test]
+fn announcement_covers_roots_added_to_an_empty_derivation() {
+    let lines = super::announcement_lines(&[], &["/srv/cache".to_string()]);
+    assert_eq!(
+        lines,
+        vec!["codex: writable root /srv/cache (profile config override)"]
+    );
+}
+
+/// A reason belongs to a path, not to a position: an override that keeps one
+/// derived root and adds another must label each correctly rather than pairing
+/// them off in order.
+#[test]
+fn announcement_matches_reasons_by_path_not_by_position() {
+    let granted = vec![
+        grant("/media/disk/cargo", "cargo target ($CARGO_TARGET_DIR)"),
+        grant("/run/user/1000", "build lock ($XDG_RUNTIME_DIR)"),
+    ];
+    let effective = vec!["/run/user/1000".to_string(), "/srv/extra".to_string()];
+    let lines = super::announcement_lines(&granted, &effective);
+    assert_eq!(
+        lines,
+        vec![
+            "codex: writable root /run/user/1000 (build lock ($XDG_RUNTIME_DIR))",
+            "codex: writable root /srv/extra (profile config override)",
+        ]
+    );
+}
+
+/// An explicit `[]` override widens nothing, so there is nothing to announce -
+/// distinct from having derived nothing, which the separate zero-root warning
+/// covers.
+#[test]
+fn announcement_is_empty_when_an_override_grants_nothing() {
+    let granted = vec![grant("/run/user/1000", "build lock ($XDG_RUNTIME_DIR)")];
+    assert!(super::announcement_lines(&granted, &[]).is_empty());
+}

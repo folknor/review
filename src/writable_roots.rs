@@ -22,6 +22,19 @@
 //! - it applies **only** to `workspace-write`; a `read-only` profile derives
 //!   nothing, because the whole point of that profile is that nothing is
 //!   writable;
+//! - it derives only from a **public contract the host has declared**, never
+//!   from a tool's internals. `$CARGO_TARGET_DIR` and the `./target` symlink are
+//!   cargo facts. `$XDG_RUNTIME_DIR` is not a fact about Rust at all - it is
+//!   derived because brokkr locks there - but it is a standardised variable the
+//!   host sets, so granting it is honouring a declaration rather than predicting
+//!   a behaviour. When it is *unset* brokkr falls back to `$HOME/.cache/brokkr`,
+//!   and that is deliberately **not** derived here: it is brokkr's private
+//!   implementation detail, it would make this module predict an optional tool
+//!   `review` neither selects nor invokes, and a brokkr release could silently
+//!   invalidate the grant with nothing here expressing the dependency. A profile
+//!   whose workflow runs brokkr declares it instead, with
+//!   `writable_roots = ["~/.cache/brokkr"]` - the profile author knows whether
+//!   brokkr is involved, and this module cannot;
 //! - it grants only paths that a build provably needs, and only ones that
 //!   neither sit **inside** the workspace (writable anyway, so granting them
 //!   widens nothing while implying it did) nor **contain** it (`~` and a
