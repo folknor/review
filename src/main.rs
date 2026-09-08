@@ -620,6 +620,39 @@ fn resolve_session_provider(requested: &[String], recorded: Option<&str>) -> Res
     Ok(chosen)
 }
 
+/// The sandbox level and writable roots a `--session` resume should launch with,
+/// taken from the session's own last recorded run.
+///
+/// `--session` carries no profile, and the runners default to `read-only`, so a
+/// resume used to silently drop the permissions the session was created with: a
+/// `workspace-write` run that died mid-turn came back as a read-only resume that
+/// could not touch the files it had been editing, and the failure surfaced as
+/// the model reporting a read-only filesystem rather than as anything about
+/// `review`. The permissions are a property of the *session*, not of the
+/// invocation that happens to be driving it.
+///
+/// The sidecar already records both, and records the **effective** values (what
+/// the run received, not what its profile asked for), which is exactly what has
+/// to carry forward - the recurring lesson of the codex sandbox work is that
+/// those two differ. Roots are passed as profile roots rather than as a verbatim
+/// list so they go back through the same filters and are re-derived against
+/// *this* host: a host fact like the build lock belongs to the machine the
+/// resume runs on, not to the one that recorded the row.
+///
+/// Recorded levels are in the provider's own vocabulary, which `sandbox_for`
+/// maps identically for codex and passes through for grok's already-native
+/// names, so a round trip cannot change the level. No record, or a record from
+/// another provider, inherits nothing and leaves the default in place.
+fn inherited_permissions(
+    record: Option<&sessions::SessionRecord>,
+    provider_name: &str,
+) -> (Option<String>, Vec<String>) {
+    let Some(record) = record.filter(|r| r.provider == provider_name) else {
+        return (None, Vec::new());
+    };
+    (record.sandbox.clone(), record.writable_roots.clone())
+}
+
 /// `--session <id>` mode: resume a specific provider session and send raw
 /// stdin. No `.review.toml` lookup, no prime - the session already has its
 /// grounding from the original interaction. Single provider, single archetype
@@ -717,17 +750,21 @@ async fn run_session_resume(
     let lock_file = lock::open_lock_file(&lock_path)?;
     lock::acquire_blocking(&lock_file)?;
 
+    // Permissions are inherited from the session's own last recorded run rather
+    // than defaulted (see `inherited_permissions`).
+    let (inherit_sandbox, inherit_roots) = inherited_permissions(record.as_ref(), provider_name);
+    if let Some(ref level) = inherit_sandbox {
+        eprintln!("sandbox: {level} (inherited from the session record)");
+    }
+
     let (launched_tx, launched_rx) = tokio::sync::oneshot::channel();
     let invoke = provider::invoke(
         provider_name,
         session_id,
         None,
         None,
-        None,
-        // `--session` bypasses `.review.toml` entirely - no profile, so no
-        // sandbox and no roots of our own; the resumed session keeps whatever
-        // the run that created it was launched with.
-        &[],
+        inherit_sandbox.as_deref(),
+        &inherit_roots,
         None,
         &[],
         &stdin_instructions,
@@ -808,11 +845,9 @@ async fn run_session_resume(
             result.completed_epoch,
             None,
             Vec::new(),
-            // A `--session` resume carries no profile, so the runner falls back
-            // to `read-only` - it does *not* inherit the level of the session it
-            // resumes. `result.sandbox` therefore reports `read-only`, which is
-            // what actually ran, and keeps resume rows visible to a query over
-            // the sandbox level.
+            // The permissions this resume actually launched with - inherited
+            // from the session's last recorded run, so the next resume in the
+            // chain inherits from this row in turn.
             result.sandbox.as_deref(),
             result.writable_roots.clone(),
             &stdin_instructions,
@@ -1224,6 +1259,89 @@ mod tests {
         let err = resolve_session_provider(&[], None)
             .expect_err("nothing to infer from and nothing requested");
         assert!(err.to_string().contains("--provider"));
+    }
+
+    /// A sidecar row, built the way one is actually read back - from JSON, so a
+    /// field this test forgets is exercised as a missing field rather than as a
+    /// compile error the struct literal would have caught.
+    fn record(json: serde_json::Value) -> sessions::SessionRecord {
+        serde_json::from_value(json).expect("valid session record")
+    }
+
+    #[test]
+    fn a_resume_inherits_the_permissions_of_the_run_that_created_the_session() {
+        let rec = record(serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "epoch_secs": 1_767_225_600u64,
+            "project": "/w",
+            "hostname": "h",
+            "audit_id": "a",
+            "provider": "codex",
+            "archetype": "implement",
+            "session_id": "s",
+            "kind": "run",
+            "sandbox": "workspace-write",
+            "writable_roots": ["/home/u/.brokkr", "/srv/cache"],
+            "operator_prompt": "p",
+            "assembled_prompt": "p",
+            "review_version": "0.0.0",
+        }));
+        let (sandbox, roots) = inherited_permissions(Some(&rec), "codex");
+        assert_eq!(sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(roots, vec!["/home/u/.brokkr", "/srv/cache"]);
+    }
+
+    #[test]
+    fn a_row_from_before_permissions_were_recorded_inherits_nothing() {
+        // The pre-existing default (read-only, no roots) has to survive an old
+        // row, since the fields are simply absent there.
+        let rec = record(serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "epoch_secs": 1_767_225_600u64,
+            "project": "/w",
+            "hostname": "h",
+            "audit_id": "a",
+            "provider": "codex",
+            "archetype": "implement",
+            "session_id": "s",
+            "operator_prompt": "p",
+            "assembled_prompt": "p",
+            "review_version": "0.0.0",
+        }));
+        let (sandbox, roots) = inherited_permissions(Some(&rec), "codex");
+        assert_eq!(sandbox, None);
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn permissions_are_not_inherited_across_providers() {
+        // `resolve_session_provider` should already have made this impossible,
+        // but a grok level fed to codex (or vice versa) is a widening nobody
+        // asked for, so the guard is here rather than assumed upstream.
+        let rec = record(serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "epoch_secs": 1_767_225_600u64,
+            "project": "/w",
+            "hostname": "h",
+            "audit_id": "a",
+            "provider": "grok",
+            "archetype": "implement",
+            "session_id": "s",
+            "sandbox": "none",
+            "operator_prompt": "p",
+            "assembled_prompt": "p",
+            "review_version": "0.0.0",
+        }));
+        let (sandbox, roots) = inherited_permissions(Some(&rec), "codex");
+        assert_eq!(sandbox, None);
+        assert!(roots.is_empty());
+    }
+
+    #[test]
+    fn no_record_inherits_nothing() {
+        let (sandbox, roots) = inherited_permissions(None, "codex");
+        assert_eq!(sandbox, None);
+        assert!(roots.is_empty());
     }
 
     #[test]

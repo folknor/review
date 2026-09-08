@@ -797,13 +797,13 @@ fn config_writable_roots_override(config: &[String]) -> Option<Vec<String>> {
 /// The sandbox level a run will actually be launched under, as opposed to the
 /// one the caller asked for.
 ///
-/// The two differ on the `--session` path, which carries no profile and so no
-/// sandbox: the runners still pass `--sandbox read-only` by default, so a resume
-/// genuinely runs read-only rather than inheriting the level of the session it
-/// resumes. Recording the caller's `None` there left every resume row invisible
-/// to `jq 'select(.sandbox=="read-only")'` - the exact query the sidecar fields
-/// exist to answer. Claude has no filesystem sandbox on this axis, so it records
-/// none.
+/// The two differ wherever the caller passes no level: the runners still pass
+/// `--sandbox read-only`, so the run genuinely is read-only, and recording the
+/// caller's `None` left such rows invisible to the exact query the sidecar
+/// fields exist to answer, `jq 'select(.sandbox=="read-only")'`. On the `--session` path
+/// the caller is `main::inherited_permissions`, which supplies the level the
+/// session was created with; `None` there means there was no record to inherit
+/// from. Claude has no filesystem sandbox on this axis, so it records none.
 fn effective_sandbox(provider: &str, sandbox: Option<&str>) -> Option<String> {
     match provider {
         "codex" | "grok" => Some(sandbox.unwrap_or("read-only").to_string()),
