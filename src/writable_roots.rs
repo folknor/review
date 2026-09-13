@@ -11,6 +11,12 @@
 //! - Two of the five hosts export a global `CARGO_TARGET_DIR` onto a separate
 //!   drive, and several repos carry a `target` symlink pointing at the same
 //!   shared cache. Cargo cannot write there either.
+//! - Cargo downloads crates into `$CARGO_HOME` (`$HOME/.cargo` by default).
+//!   This one fails *conditionally*, which is why it outlived the other two: a
+//!   workspace whose dependencies are already unpacked builds, lints and tests
+//!   fine without it, because cargo's package-cache lock degrades silently on a
+//!   read-only filesystem. The first build that has to fetch a crate dies
+//!   before compiling, naming the registry cache rather than the sandbox.
 //!
 //! Requiring each `.review.toml` to restate those paths would put a
 //! machine-shaped fact in fifteen project files, and get it wrong on the hosts
@@ -212,6 +218,31 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
         }
     }
 
+    // The cargo home: registry index, downloaded `.crate` archives, git
+    // checkouts, and the package-cache lock.
+    //
+    // This one hid for a long time because it fails *conditionally*. A build
+    // whose dependencies are already unpacked needs nothing here that matters:
+    // cargo's `.package-cache` flock degrades silently on a read-only
+    // filesystem rather than erroring, and the global-cache tracker tolerates
+    // the same. So sandboxed runs compiled, linted and ran full test suites
+    // with no cargo home grant at all, and the gap read as absent. It turns
+    // fatal the moment a crate has to be *fetched* - a new dependency, a bump,
+    // a lockfile the workspace has not populated yet - at which point the run
+    // dies before compilation with `failed to open ... registry/cache/...:
+    // Read-only file system (os error 30)`, an error whose text points at the
+    // cache rather than at the sandbox.
+    //
+    // `$CARGO_HOME`, else `$HOME/.cargo`, which is cargo's own documented
+    // default and therefore as deterministic as the lock directory above.
+    let cargo_home = host
+        .var("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| host.var("HOME").map(|h| PathBuf::from(h).join(".cargo")));
+    if let Some(path) = cargo_home.filter(|p| p.is_absolute()) {
+        push_root(&mut out, cwd, host, &path, "cargo home ($CARGO_HOME)");
+    }
+
     // An explicit shared cargo cache, exported globally on some hosts.
     if let Some(dir) = host.var("CARGO_TARGET_DIR") {
         let path = PathBuf::from(dir);
@@ -407,8 +438,38 @@ mod tests {
     fn the_build_lock_directory_is_granted() {
         let host = FakeHost::new().var("HOME", "/home/dev");
         let grants = derive(&cwd(), &host);
-        assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].path, "/home/dev/.brokkr");
+    }
+
+    /// The conditional failure: a warm cargo home needs no write (the
+    /// package-cache flock degrades silently on a read-only filesystem), so a
+    /// missing grant here passes every build until one has to *fetch* a crate,
+    /// which then dies before compilation.
+    #[test]
+    fn the_cargo_home_is_granted() {
+        let host = FakeHost::new().var("HOME", "/home/dev");
+        let grants = derive(&cwd(), &host);
+        let paths: Vec<&str> = grants.iter().map(|g| g.path.as_str()).collect();
+        assert!(paths.contains(&"/home/dev/.cargo"), "{paths:?}");
+    }
+
+    /// `$CARGO_HOME` wins over the `$HOME/.cargo` default - a host that
+    /// relocates its registry would otherwise be granted a directory cargo
+    /// never touches while the real one stayed read-only.
+    #[test]
+    fn an_explicit_cargo_home_overrides_the_default_location() {
+        let host = FakeHost::new()
+            .var("HOME", "/home/dev")
+            .var("CARGO_HOME", "/media/disk/cargo-home");
+        let paths: Vec<String> = derive(&cwd(), &host).into_iter().map(|g| g.path).collect();
+        assert!(
+            paths.contains(&"/media/disk/cargo-home".to_string()),
+            "{paths:?}"
+        );
+        assert!(
+            !paths.contains(&"/home/dev/.cargo".to_string()),
+            "{paths:?}"
+        );
     }
 
     /// The lock directory must not depend on `XDG_RUNTIME_DIR`. It was the
@@ -420,9 +481,15 @@ mod tests {
         let host = FakeHost::new()
             .var("HOME", "/home/dev")
             .var("XDG_RUNTIME_DIR", "/run/user/1000");
-        let grants = derive(&cwd(), &host);
-        assert_eq!(grants.len(), 1, "{grants:?}");
-        assert_eq!(grants[0].path, "/home/dev/.brokkr");
+        let paths: Vec<String> = derive(&cwd(), &host).into_iter().map(|g| g.path).collect();
+        assert!(
+            paths.contains(&"/home/dev/.brokkr".to_string()),
+            "{paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("/run/user")),
+            "{paths:?}"
+        );
     }
 
     /// A login with no `HOME` cannot have its lock location derived. Inventing
@@ -513,9 +580,15 @@ mod tests {
     fn a_profile_root_is_added_to_the_derived_ones() {
         let host = FakeHost::new().var("HOME", "/home/dev");
         let grants = derive_with(&cwd(), &host, &["/srv/fixtures".to_string()]);
-        assert_eq!(grants.len(), 2);
-        assert_eq!(grants[1].path, "/srv/fixtures");
-        assert_eq!(grants[1].why, "profile writable_roots");
+        let Some(last) = grants.last() else {
+            panic!("a profile root must be granted");
+        };
+        assert_eq!(last.path, "/srv/fixtures");
+        assert_eq!(last.why, "profile writable_roots");
+        assert!(
+            grants.len() > 1,
+            "the derived roots must survive: {grants:?}"
+        );
     }
 
     /// A profile must not be able to undo the derivation - the derived roots are
@@ -721,7 +794,7 @@ mod tests {
     /// failure rather than a grant.
     #[test]
     fn a_control_character_in_a_path_is_refused() {
-        let host = FakeHost::new().var("XDG_RUNTIME_DIR", "/run/user/1000\nx");
+        let host = FakeHost::new().var("CARGO_HOME", "/home/dev/.cargo\nx");
         let grants = derive(&cwd(), &host);
         assert!(grants.is_empty(), "{grants:?}");
     }
@@ -757,7 +830,7 @@ mod tests {
 
     #[test]
     fn an_empty_env_var_is_ignored() {
-        let host = FakeHost::new().var("XDG_RUNTIME_DIR", "");
+        let host = FakeHost::new().var("CARGO_TARGET_DIR", "");
         // The real host filters empties; the fake stores them, so assert the
         // absolute-path guard rejects it too.
         assert!(derive(&cwd(), &host).is_empty());
@@ -772,7 +845,7 @@ mod tests {
         assert_eq!(
             config_override(&grants).as_deref(),
             Some(
-                r#"sandbox_workspace_write.writable_roots=["/home/dev/.brokkr","/media/disk/cargo"]"#
+                r#"sandbox_workspace_write.writable_roots=["/home/dev/.brokkr","/home/dev/.cargo","/media/disk/cargo"]"#
             )
         );
     }
@@ -803,13 +876,18 @@ mod tests {
         let roots = parsed["sandbox_workspace_write"]["writable_roots"]
             .as_array()
             .unwrap_or_else(|| panic!("writable_roots must be an array: {parsed:?}"));
-        assert_eq!(roots.len(), 1);
-        // The whole hostile string survives as one array element, escaped - the
-        // grant is the `.brokkr` subdirectory of it, so the quote never escapes
-        // the TOML string it is quarantined in.
+        // The whole hostile string survives inside each array element, escaped -
+        // the grants are subdirectories of it, so the quote never escapes the
+        // TOML string it is quarantined in.
         assert_eq!(
             roots[0].as_str(),
             Some(format!("{hostile}/.brokkr").as_str())
+        );
+        assert!(
+            roots
+                .iter()
+                .all(|r| r.as_str().is_some_and(|s| s.starts_with(hostile))),
+            "every element must be a subdirectory of the hostile HOME: {roots:?}"
         );
     }
 }

@@ -657,8 +657,8 @@ pub async fn invoke(
     if provider == "codex" && sandbox == Some("workspace-write") && root_paths.is_empty() {
         eprintln!(
             "warning: workspace-write run with no writable roots outside the \
-             workspace - a build needing one (a lock or cache under $HOME or \
-             $XDG_RUNTIME_DIR) will fail read-only. Declare it with \
+             workspace - a build needing one (the build lock, the cargo home, \
+             or a shared target directory) will fail read-only. Declare it with \
              `writable_roots` on this profile if so."
         );
     }
