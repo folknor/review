@@ -79,7 +79,6 @@ fn record_run(
     private: bool,
     audit_id: &str,
     archetype: &str,
-    model: Option<&str>,
     env_keys: &[String],
     operator_prompt: &str,
     prompt: &str,
@@ -108,7 +107,12 @@ fn record_run(
             sid,
             "run",
             result.completed_epoch,
-            model,
+            // From the result, not from the caller's profile: the recorded
+            // model must be the one the run launched with, for the same reason
+            // the sandbox level is - a resume inherits this row, and inheriting
+            // a request rather than an outcome is what this fix is about.
+            result.model.as_deref(),
+            result.effort.as_deref(),
             env_keys.to_vec(),
             result.sandbox.as_deref(),
             result.writable_roots.clone(),
@@ -307,7 +311,6 @@ async fn main() -> Result<()> {
         archetype: String,
         prompt: String,
         operator_prompt: String,
-        model: Option<String>,
         env_keys: Vec<String>,
         handle: tokio::task::JoinHandle<TaskOutcome>,
     }
@@ -352,13 +355,11 @@ async fn main() -> Result<()> {
             let delay = stagger * launch_count;
 
             let prompt_for_audit = prompt.clone();
-            let model_for_pending = model.clone();
             let operator_prompt = stdin_instructions.clone();
             pending.push(PendingResult {
                 archetype: (*arch_name).to_string(),
                 prompt: prompt_for_audit,
                 operator_prompt,
-                model: model_for_pending,
                 env_keys,
                 handle: tokio::spawn(async move {
                     if !delay.is_zero() {
@@ -487,6 +488,8 @@ async fn main() -> Result<()> {
                     // permissions to a run that never happened.
                     sandbox: None,
                     writable_roots: Vec::new(),
+                    model: None,
+                    effort: None,
                 },
                 also: None,
             },
@@ -501,7 +504,6 @@ async fn main() -> Result<()> {
                 cfg.audit.private,
                 &audit_id,
                 &p.archetype,
-                p.model.as_deref(),
                 &p.env_keys,
                 &p.operator_prompt,
                 &p.prompt,
@@ -513,7 +515,6 @@ async fn main() -> Result<()> {
             cfg.audit.private,
             &audit_id,
             &p.archetype,
-            p.model.as_deref(),
             &p.env_keys,
             &p.operator_prompt,
             &p.prompt,
@@ -620,8 +621,8 @@ fn resolve_session_provider(requested: &[String], recorded: Option<&str>) -> Res
     Ok(chosen)
 }
 
-/// The sandbox level and writable roots a `--session` resume should launch with,
-/// taken from the session's own last recorded run.
+/// What a `--session` resume launches with, taken from the session's own last
+/// recorded run: sandbox level, writable roots, model and reasoning effort.
 ///
 /// `--session` carries no profile, and the runners default to `read-only`, so a
 /// resume used to silently drop the permissions the session was created with: a
@@ -643,14 +644,43 @@ fn resolve_session_provider(requested: &[String], recorded: Option<&str>) -> Res
 /// maps identically for codex and passes through for grok's already-native
 /// names, so a round trip cannot change the level. No record, or a record from
 /// another provider, inherits nothing and leaves the default in place.
-fn inherited_permissions(
+///
+/// Model and effort carry forward for the same reason and were originally left
+/// out on the grounds that only `model` was recorded, so a partial restoration
+/// would be less predictable than none. Measurement killed that argument: every
+/// `--session` resume ran on codex's **built-in default model** at its default
+/// effort, not the profile's, and since `--ignore-user-config` that default is
+/// not even the operator's configured one. A session's first turn on
+/// `gpt-5.6-sol`/`low` followed by five resumed turns on a different model is
+/// not a neutral fallback - it silently changes the model mid-session, at a
+/// different price, with nothing in the output saying so. The fix is to record
+/// `effort` too rather than to keep inheriting neither.
+///
+/// Env and profile `config` are still *not* inherited: env values are
+/// deliberately never recorded (they can carry secrets) and `config` is not
+/// recorded at all, so there is nothing to restore from. That is an absence of
+/// data, not a judgement about predictability.
+fn inherited_settings(
     record: Option<&sessions::SessionRecord>,
     provider_name: &str,
-) -> (Option<String>, Vec<String>) {
+) -> InheritedSettings {
     let Some(record) = record.filter(|r| r.provider == provider_name) else {
-        return (None, Vec::new());
+        return InheritedSettings::default();
     };
-    (record.sandbox.clone(), record.writable_roots.clone())
+    InheritedSettings {
+        sandbox: record.sandbox.clone(),
+        writable_roots: record.writable_roots.clone(),
+        model: record.model.clone(),
+        effort: record.effort.clone(),
+    }
+}
+
+#[derive(Default)]
+struct InheritedSettings {
+    sandbox: Option<String>,
+    writable_roots: Vec<String>,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 /// `--session <id>` mode: resume a specific provider session and send raw
@@ -750,21 +780,29 @@ async fn run_session_resume(
     let lock_file = lock::open_lock_file(&lock_path)?;
     lock::acquire_blocking(&lock_file)?;
 
-    // Permissions are inherited from the session's own last recorded run rather
-    // than defaulted (see `inherited_permissions`).
-    let (inherit_sandbox, inherit_roots) = inherited_permissions(record.as_ref(), provider_name);
-    if let Some(ref level) = inherit_sandbox {
+    // Permissions, model and effort are inherited from the session's own last
+    // recorded run rather than defaulted (see `inherited_settings`). Each is
+    // announced, because the failure this replaced was entirely silent: the
+    // resume simply ran on a different model and nothing said so.
+    let inherited = inherited_settings(record.as_ref(), provider_name);
+    if let Some(ref level) = inherited.sandbox {
         eprintln!("sandbox: {level} (inherited from the session record)");
+    }
+    if let Some(ref m) = inherited.model {
+        eprintln!("model: {m} (inherited from the session record)");
+    }
+    if let Some(ref e) = inherited.effort {
+        eprintln!("effort: {e} (inherited from the session record)");
     }
 
     let (launched_tx, launched_rx) = tokio::sync::oneshot::channel();
     let invoke = provider::invoke(
         provider_name,
         session_id,
-        None,
-        None,
-        inherit_sandbox.as_deref(),
-        &inherit_roots,
+        inherited.model.as_deref(),
+        inherited.effort.as_deref(),
+        inherited.sandbox.as_deref(),
+        &inherited.writable_roots,
         None,
         &[],
         &stdin_instructions,
@@ -843,7 +881,13 @@ async fn run_session_resume(
             session_id,
             "session",
             result.completed_epoch,
-            None,
+            // Recorded, not `None`: a resume now launches with an inherited
+            // model and effort, and leaving them out of its own row would break
+            // the chain at the first resume - the next one would find a row
+            // naming neither and fall back to the provider default, which is
+            // the bug this fixes, one link along.
+            result.model.as_deref(),
+            result.effort.as_deref(),
             Vec::new(),
             // The permissions this resume actually launched with - inherited
             // from the session's last recorded run, so the next resume in the
@@ -954,6 +998,9 @@ fn run_session_show(session_id: &str) -> Result<()> {
     println!("project: {}", latest.project);
     if let Some(ref model) = latest.model {
         println!("model: {model}");
+    }
+    if let Some(ref effort) = latest.effort {
+        println!("effort: {effort}");
     }
 
     if let Some(ref d) = latest.digest {
@@ -1282,13 +1329,42 @@ mod tests {
             "kind": "run",
             "sandbox": "workspace-write",
             "writable_roots": ["/home/u/.brokkr", "/srv/cache"],
+            "model": "gpt-5.6-sol",
+            "effort": "low",
             "operator_prompt": "p",
             "assembled_prompt": "p",
             "review_version": "0.0.0",
         }));
-        let (sandbox, roots) = inherited_permissions(Some(&rec), "codex");
-        assert_eq!(sandbox.as_deref(), Some("workspace-write"));
-        assert_eq!(roots, vec!["/home/u/.brokkr", "/srv/cache"]);
+        let got = inherited_settings(Some(&rec), "codex");
+        assert_eq!(got.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(got.writable_roots, vec!["/home/u/.brokkr", "/srv/cache"]);
+        assert_eq!(got.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(got.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn a_row_recording_a_model_but_no_effort_inherits_just_the_model() {
+        // Rows written before `effort` was recorded carry a model and nothing
+        // else. Inheriting the model is still strictly better than falling back
+        // to the provider's default model, so the absent effort must not
+        // suppress it.
+        let rec = record(serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "epoch_secs": 1_767_225_600u64,
+            "project": "/w",
+            "hostname": "h",
+            "audit_id": "a",
+            "provider": "codex",
+            "archetype": "implement",
+            "session_id": "s",
+            "model": "gpt-5.6-sol",
+            "operator_prompt": "p",
+            "assembled_prompt": "p",
+            "review_version": "0.0.0",
+        }));
+        let got = inherited_settings(Some(&rec), "codex");
+        assert_eq!(got.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(got.effort, None);
     }
 
     #[test]
@@ -1308,9 +1384,11 @@ mod tests {
             "assembled_prompt": "p",
             "review_version": "0.0.0",
         }));
-        let (sandbox, roots) = inherited_permissions(Some(&rec), "codex");
-        assert_eq!(sandbox, None);
-        assert!(roots.is_empty());
+        let got = inherited_settings(Some(&rec), "codex");
+        assert_eq!(got.sandbox, None);
+        assert!(got.writable_roots.is_empty());
+        assert_eq!(got.model, None);
+        assert_eq!(got.effort, None);
     }
 
     #[test]
@@ -1328,20 +1406,26 @@ mod tests {
             "archetype": "implement",
             "session_id": "s",
             "sandbox": "none",
+            "model": "grok-4",
             "operator_prompt": "p",
             "assembled_prompt": "p",
             "review_version": "0.0.0",
         }));
-        let (sandbox, roots) = inherited_permissions(Some(&rec), "codex");
-        assert_eq!(sandbox, None);
-        assert!(roots.is_empty());
+        let got = inherited_settings(Some(&rec), "codex");
+        assert_eq!(got.sandbox, None);
+        assert!(got.writable_roots.is_empty());
+        // The model is provider-scoped too: a grok model name handed to codex
+        // is not a fallback, it is an invocation that cannot start.
+        assert_eq!(got.model, None);
     }
 
     #[test]
     fn no_record_inherits_nothing() {
-        let (sandbox, roots) = inherited_permissions(None, "codex");
-        assert_eq!(sandbox, None);
-        assert!(roots.is_empty());
+        let got = inherited_settings(None, "codex");
+        assert_eq!(got.sandbox, None);
+        assert!(got.writable_roots.is_empty());
+        assert_eq!(got.model, None);
+        assert_eq!(got.effort, None);
     }
 
     #[test]

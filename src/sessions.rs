@@ -17,6 +17,12 @@ struct SessionEntry<'a> {
     /// "oneshot" for --oneshot creation events, "session" for --session resumes.
     kind: &'static str,
     model: Option<&'a str>,
+    /// Reasoning effort the run launched with. Recorded alongside `model`
+    /// because a `--session` resume inherits both from this row, and a resume
+    /// that restored the model but not the effort would run the right model at
+    /// the provider's default depth.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<&'a str>,
     /// Environment variable *names* configured for this provider entry; values
     /// are deliberately not recorded to avoid leaking secrets in the sidecar.
     env_keys: Vec<String>,
@@ -62,8 +68,13 @@ pub struct SessionRecord {
     /// field existed (none in practice - included for forward compat).
     #[serde(default)]
     pub kind: String,
-    #[allow(dead_code)]
+    /// Read back by `main::inherited_settings` so a `--session` resume launches
+    /// on the session's own model rather than the provider's default.
     pub model: Option<String>,
+    /// Absent on rows written before this was recorded, and on any run that
+    /// passed no effort at all.
+    #[serde(default)]
+    pub effort: Option<String>,
     #[allow(dead_code)]
     #[serde(default)]
     pub env_keys: Vec<String>,
@@ -193,6 +204,7 @@ pub fn record(
     // so the recorded time reflects completion rather than collection order.
     epoch_secs: u64,
     model: Option<&str>,
+    effort: Option<&str>,
     env_keys: Vec<String>,
     // The filesystem permissions the run launched with. Recorded because a
     // profile's advertised guarantee is worth nothing if what a run actually
@@ -230,6 +242,7 @@ pub fn record(
         session_id,
         kind,
         model,
+        effort,
         env_keys,
         sandbox,
         writable_roots,

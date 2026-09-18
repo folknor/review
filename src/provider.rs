@@ -492,6 +492,19 @@ pub struct ProviderResult {
     /// (`src/writable_roots.rs`). Empty for every run that widened nothing,
     /// which is every read-only run.
     pub writable_roots: Vec<String>,
+    /// The model and reasoning effort this run launched with, recorded for the
+    /// same reason `sandbox` is: they are properties of the *run*, and a
+    /// `--session` resume that cannot see them silently falls back to whatever
+    /// the provider defaults to. `None` means "we passed nothing and the
+    /// provider chose", which since `--ignore-user-config` means codex's
+    /// built-in default rather than the operator's configured one.
+    ///
+    /// A profile `config` entry restating `model` or `model_reasoning_effort`
+    /// is deliberately *not* parsed back out the way `writable_roots` is: which
+    /// of `-m` and `-c model=` codex resolves last is not established here, and
+    /// a confident wrong record is worse than an incomplete one.
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 pub fn now_epoch_secs() -> u64 {
@@ -724,6 +737,8 @@ pub async fn invoke(
             completed_epoch,
             sandbox: effective_sandbox(provider, sandbox),
             writable_roots: root_paths,
+            model: model.map(str::to_string),
+            effort: effort.map(str::to_string),
         },
         Err(e) => ProviderResult {
             provider: provider.to_string(),
@@ -736,6 +751,8 @@ pub async fn invoke(
             // none.
             sandbox: effective_sandbox(provider, sandbox),
             writable_roots: root_paths,
+            model: model.map(str::to_string),
+            effort: effort.map(str::to_string),
         },
     }
 }
