@@ -1220,16 +1220,60 @@ impl GrokResult {
     }
 }
 
-/// How long a grok shell command may hold the foreground, in milliseconds:
-/// grok's own 10-hour background ceiling (`BACKGROUND_MAX_RUNTIME`), so no
-/// command is backgrounded or killed for blocking - see `run_grok`.
-const GROK_FOREGROUND_BLOCK_MS: &str = "36000000";
+/// How long `review` lets a grok shell command run: 20 minutes. Three grok
+/// limits are set from it:
+/// - the auto-background budget (`GROK_FOREGROUND_BLOCK_BUDGET_MS`, default
+///   15s): a command holds the foreground for `min(model's timeout, this)` -
+///   the model's timeout may be up to 10h, since production grok always sends
+///   `max_timeout_secs` = 10h (`tools/config.rs` `PRODUCTION_MAX_TIMEOUT_SECS`),
+///   and is 120s when the model sets none;
+/// - the kill cap for a command that *cannot* be backgrounded
+///   (`GROK_MAX_FOREGROUND_BLOCK_MS`, default 5 minutes) - not the normal path,
+///   set so that path gets the same allowance rather than a shorter one;
+/// - how long headless grok waits for a backgrounded command after the model's
+///   turn ends before killing it (`--background-wait-timeout`, default 600s).
+///
+/// Long enough for a full gate; short enough that a wedged command cannot hold a
+/// run for hours.
+const GROK_COMMAND_WAIT_SECS: u64 = 20 * 60;
 
 /// The one `stopReason` that means `text` is an answer. Anything else
 /// (`cancelled`, `max_tokens`, ...) means `text` is whatever the model happened
 /// to have said when it was cut off - interim commentary, not a result.
 const GROK_OK_STOP: &str = "end_turn";
 
+/// How many times `run_grok` will wake a model for a background result it did
+/// not read. A model that reads the result and finishes needs one; the cap only
+/// stops a model that keeps backgrounding work from looping forever, and
+/// hitting it fails the run rather than passing it off as done.
+const GROK_MAX_WAKES: u32 = 10;
+
+/// Run grok, and keep waking it until it has read every background result.
+///
+/// Headless grok ends when the model ends its turn, even if a command the model
+/// started is still running in the background: it waits for the command to
+/// finish, queues a wake-up message for the model, and exits without running
+/// that turn (`headless.rs` has no wake handling). Whether the model waited for
+/// its own command first is its choice, and a wrong choice is silent - a run
+/// that looks finished, with the build's result never read and no report. So
+/// the guarantee is enforced here instead of hoped for: after every turn,
+/// grok's own update stream is checked for results the model never saw
+/// (`grok_home::unread_background_results`), and if there are any the session
+/// is resumed, same sandbox and model, with a prompt that **contains** them
+/// (`grok_home::wake_prompt`: each command's exit status and output tail, or a
+/// plain "did NOT finish"). Carrying the result rather than pointing at it is
+/// what makes delivery independent of the model: a prompt that only told it to
+/// go and read the output could be ignored, and the next turn boundary would
+/// then look clean. The run returns once a turn ends with nothing unread.
+///
+/// It fails rather than returns clean whenever the results cannot be vouched
+/// for: grok's home or update log cannot be read or parsed (fail closed), or
+/// `GROK_MAX_WAKES` is reached (each wake delivers what it names, so the cap
+/// only stops a model that keeps starting new background work). It does not
+/// wake after a stated failure - grok said why the turn ended, and resending
+/// buys the same answer (`main::stated_failure`); that digest already fails the
+/// run. A wake turn that fails to launch keeps the first turn's output and
+/// session id rather than dropping both.
 #[allow(clippy::too_many_arguments)]
 async fn run_grok(
     session_id: &str,
@@ -1243,6 +1287,174 @@ async fn run_grok(
     oneshot: bool,
     launched: Option<LaunchSignal>,
 ) -> Result<RunOutput> {
+    let (mut first, first_turns, first_usage) = run_grok_turn(
+        session_id,
+        model,
+        effort,
+        sandbox,
+        trust,
+        env,
+        prompt,
+        project_root,
+        oneshot,
+        launched,
+    )
+    .await?;
+    // A fresh run reports its new id (grok's echo, else the one we minted); a
+    // resume was given it. So this is always known.
+    let sid = first
+        .session_id
+        .clone()
+        .unwrap_or_else(|| session_id.to_string());
+    // Fail closed: without grok's home the results cannot be checked, and an
+    // unchecked run must not pass as one whose results were seen.
+    let grok = match crate::grok_home::Grok::resolve(env) {
+        Ok(g) => g,
+        Err(e) => {
+            let reason = format!("could not verify grok's background results: {e:#}");
+            eprintln!("grok: {reason}");
+            first.digest = Some(wake_failure_digest(reason, first.digest.as_ref()));
+            return Ok(first);
+        }
+    };
+    let mut out = first;
+    let mut cost = out.served.cost_usd;
+    let mut turns = first_turns;
+    let mut usage = first_usage;
+    let mut wakes = 0;
+    loop {
+        // Fail closed: a run whose results cannot be checked is not a run
+        // whose results were seen.
+        let pending = match crate::grok_home::session_updates(&grok.home, &sid) {
+            None => Err(format!("no update log for grok session {sid}")),
+            Some(log) => crate::grok_home::unread_background_results(&log),
+        };
+        let pending = match pending {
+            Ok(p) => p,
+            Err(e) => {
+                let reason = format!("could not verify grok's background results: {e}");
+                eprintln!("grok: {reason}");
+                out.digest = Some(wake_failure_digest(reason, out.digest.as_ref()));
+                break;
+            }
+        };
+        if pending.is_empty() {
+            break;
+        }
+        // A stated failure (grok said why the turn ended) is not fixed by
+        // waking: resending buys the same answer. The digest already fails it.
+        if out
+            .digest
+            .as_ref()
+            .is_some_and(|d| d.turn_error.is_some() && !d.captured)
+        {
+            break;
+        }
+        let names: Vec<String> = pending.iter().map(crate::grok_home::Unread::id).collect();
+        if wakes == GROK_MAX_WAKES {
+            let reason = format!(
+                "grok still had unread background results after {GROK_MAX_WAKES} wake-ups: {}",
+                names.join(", ")
+            );
+            eprintln!("grok: {reason} - giving up on session {sid}");
+            out.digest = Some(wake_failure_digest(reason, out.digest.as_ref()));
+            break;
+        }
+        wakes += 1;
+        eprintln!(
+            "grok: session {sid} ended its turn with unread background results ({}) - \
+             resuming it with them (wake {wakes}/{GROK_MAX_WAKES})",
+            names.join(", ")
+        );
+        // Same sandbox (grok refuses a different one on resume) and model; no
+        // `--trust` (granted on the first turn if it was needed); no launch
+        // signal (the lock was released when the first turn spawned).
+        let prompt = crate::grok_home::wake_prompt(&pending);
+        let (next, next_turns, next_usage) = match run_grok_turn(
+            &sid,
+            model,
+            effort,
+            sandbox,
+            false,
+            env,
+            &prompt,
+            project_root,
+            false,
+            None,
+        )
+        .await
+        {
+            Ok(next) => next,
+            Err(e) => {
+                // Keep what the run already has: `invoke` drops the session id
+                // on `Err`, which would cost the sidecar row and any resume.
+                let reason = format!("wake-up turn for session {sid} failed: {e:#}");
+                eprintln!("grok: {reason}");
+                out.digest = Some(wake_failure_digest(reason, out.digest.as_ref()));
+                break;
+            }
+        };
+        cost = match (cost, next.served.cost_usd) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        };
+        turns += next_turns;
+        usage.input_tokens += next_usage.input_tokens;
+        usage.cached_input_tokens += next_usage.cached_input_tokens;
+        usage.output_tokens += next_usage.output_tokens;
+        usage.reasoning_output_tokens += next_usage.reasoning_output_tokens;
+        out = RunOutput {
+            // The wake turn's report is the run's answer; the id stays the
+            // first turn's (a resume does not report one).
+            session_id: out.session_id,
+            ..next
+        };
+    }
+    out.served.cost_usd = cost;
+    // Whatever digest the run ends with describes the whole run, not its last
+    // grok process.
+    if let Some(d) = out.digest.as_mut() {
+        d.turns = turns;
+        d.usage = usage;
+    }
+    if wakes > 0 {
+        out.text = format!(
+            "(grok woken {wakes} time(s) to read background results it had not waited for)\n{}",
+            out.text
+        );
+    }
+    Ok(out)
+}
+
+/// The digest for a grok run the wake loop gave up on: a failure with the
+/// stated reason, keeping the turn and token counts the last turn reported
+/// rather than zeroing them. Exit 1 and no signal are stated outright - the
+/// failure is `review`'s verdict, not an observed process status.
+fn wake_failure_digest(reason: String, last: Option<&Digest>) -> Digest {
+    let (turns, usage) = last.map_or((0, Usage::default()), |d| (d.turns, d.usage.clone()));
+    Digest {
+        exit_code: Some(1),
+        signal: None,
+        turns,
+        usage,
+        ..grok_no_answer_digest(reason, &std::process::ExitStatus::default())
+    }
+}
+
+/// One grok process: a single headless turn.
+#[allow(clippy::too_many_arguments)]
+async fn run_grok_turn(
+    session_id: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    sandbox: Option<&str>,
+    trust: bool,
+    env: Option<&std::collections::BTreeMap<String, String>>,
+    prompt: &str,
+    project_root: &Path,
+    oneshot: bool,
+    launched: Option<LaunchSignal>,
+) -> Result<(RunOutput, u32, Usage)> {
     // Grok takes no prompt on stdin - `-p` requires a value and `-p -` is read
     // literally as a one-character prompt. `--prompt-file` is the equivalent
     // escape from shell argument length limits, so the prompt goes via a temp
@@ -1309,6 +1521,14 @@ async fn run_grok(
         args.push("--reasoning-effort".to_string());
         args.push(e.to_string());
     }
+    // When the model ends its turn with a command still in the background,
+    // headless grok waits for it - by default only 600s, then kills it
+    // (`reap_pending_background_tasks`). Raised to the same wait as a foreground
+    // command, so a build the model walked away from still finishes and leaves
+    // its output for the wake-up turn `run_grok` then gives the model. Hidden
+    // but headless-honoured (`cli.rs` `background_wait_timeout_secs`).
+    args.push("--background-wait-timeout".to_string());
+    args.push(GROK_COMMAND_WAIT_SECS.to_string());
 
     let mut cmd = Command::new("grok");
     cmd.args(&args)
@@ -1329,11 +1549,15 @@ async fn run_grok(
     // raised per run through grok's own env overrides: the auto-background
     // budget (`GROK_FOREGROUND_BLOCK_BUDGET_MS`, terminal.rs) and the
     // non-backgroundable cap (`GROK_MAX_FOREGROUND_BLOCK_MS`, bash/mod.rs), both
-    // to grok's 10h background ceiling. A command then blocks until it exits or
-    // hits the timeout the model asked for (120s when it asks for none). Set
-    // before the profile env so a profile can still restate either.
-    cmd.env("GROK_FOREGROUND_BLOCK_BUDGET_MS", GROK_FOREGROUND_BLOCK_MS)
-        .env("GROK_MAX_FOREGROUND_BLOCK_MS", GROK_FOREGROUND_BLOCK_MS);
+    // to `GROK_COMMAND_WAIT_SECS`. A command then blocks until it exits or hits
+    // the timeout the model asked for (120s when it asks for none). That keeps
+    // most commands in the foreground but cannot guarantee it - the model
+    // chooses the timeout - which is why `run_grok` also wakes the model for any
+    // result it missed. Set before the profile env so a profile can restate
+    // either.
+    let wait_ms = (GROK_COMMAND_WAIT_SECS * 1000).to_string();
+    cmd.env("GROK_FOREGROUND_BLOCK_BUDGET_MS", &wait_ms)
+        .env("GROK_MAX_FOREGROUND_BLOCK_MS", &wait_ms);
     if let Some(vars) = env {
         cmd.envs(vars);
     }
@@ -1383,8 +1607,8 @@ async fn run_grok(
         ..digest
     };
 
-    match interpret_grok_output(&stdout, &stderr)? {
-        GrokOutcome::Answered(answer) => Ok(RunOutput {
+    let run = match interpret_grok_output(&stdout, &stderr)? {
+        GrokOutcome::Answered(answer) => RunOutput {
             text: answer.text,
             session_id: keep_id(answer.session_id),
             served,
@@ -1402,7 +1626,7 @@ async fn run_grok(
                     )
                 })
             }),
-        }),
+        },
         GrokOutcome::NoAnswer {
             reason,
             text,
@@ -1418,14 +1642,17 @@ async fn run_grok(
             });
             let untrusted = grok.as_ref().and_then(|g| g.untrusted_hint(project_root));
             let reason = explain_grok_no_answer(reason, cause.as_deref(), untrusted.as_deref());
-            Ok(RunOutput {
+            RunOutput {
                 text,
                 session_id: keep_id(session_id),
                 digest: Some(with_usage(grok_no_answer_digest(reason, &output.status))),
                 served,
-            })
+            }
         }
-    }
+    };
+    // Turn and token counts go back separately: a clean answer carries no
+    // digest, and `run_grok` needs every turn's counts to describe the run.
+    Ok((run, turns, usage))
 }
 
 /// Extend grok's bare stop reason with what its event log and folder trust
