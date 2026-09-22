@@ -1220,6 +1220,11 @@ impl GrokResult {
     }
 }
 
+/// How long a grok shell command may hold the foreground, in milliseconds:
+/// grok's own 10-hour background ceiling (`BACKGROUND_MAX_RUNTIME`), so no
+/// command is backgrounded or killed for blocking - see `run_grok`.
+const GROK_FOREGROUND_BLOCK_MS: &str = "36000000";
+
 /// The one `stopReason` that means `text` is an answer. Anything else
 /// (`cancelled`, `max_tokens`, ...) means `text` is whatever the model happened
 /// to have said when it was cut off - interim commentary, not a result.
@@ -1311,6 +1316,24 @@ async fn run_grok(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Keep shell commands in the foreground until they finish. Grok moves any
+    // command that blocks longer than 15s to the background, and headless `-p`
+    // then only waits for it to *finish* before exiting - it never gives the
+    // model another turn to read the result (`headless.rs`: exits once
+    // `pending_bg` is empty). So every build over 15s ended a fixer's turn
+    // without a report: the second wave lost two that way, and a live probe
+    // watched `brokkr test` pass 13s after grok had already stopped listening.
+    // The switch itself (`toolset.bash.auto_background_on_timeout`) is
+    // config.toml-only and not on the `GROK_CONFIG` allowlist, and turning it
+    // off would *kill* commands at a 5-minute cap instead, so the budgets are
+    // raised per run through grok's own env overrides: the auto-background
+    // budget (`GROK_FOREGROUND_BLOCK_BUDGET_MS`, terminal.rs) and the
+    // non-backgroundable cap (`GROK_MAX_FOREGROUND_BLOCK_MS`, bash/mod.rs), both
+    // to grok's 10h background ceiling. A command then blocks until it exits or
+    // hits the timeout the model asked for (120s when it asks for none). Set
+    // before the profile env so a profile can still restate either.
+    cmd.env("GROK_FOREGROUND_BLOCK_BUDGET_MS", GROK_FOREGROUND_BLOCK_MS)
+        .env("GROK_MAX_FOREGROUND_BLOCK_MS", GROK_FOREGROUND_BLOCK_MS);
     if let Some(vars) = env {
         cmd.envs(vars);
     }
