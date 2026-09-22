@@ -507,6 +507,12 @@ pub struct ProviderResult {
     pub effort: Option<String>,
     /// What the provider reports actually served the run. Record-only.
     pub served: Served,
+    /// The folder grok was asked to trust permanently (`--trust`) for this run,
+    /// when it had no trust decision yet. Recorded because the grant outlives
+    /// the run and widens every later grok session there (the repo's `.grok`
+    /// MCP/LSP config runs without a prompt) - a change to the operator's
+    /// config that must be findable after the terminal is gone.
+    pub grok_trust: Option<String>,
 }
 
 /// What a provider reports, after the fact, about what served a run - as
@@ -623,46 +629,99 @@ pub async fn invoke(
     // their own native value.
     let sandbox = sandbox.map(|s| crate::config::sandbox_for(provider, s));
     let sandbox = sandbox.as_deref();
+    let grok_write = if provider == "grok" {
+        grok_write_launch(oneshot, sandbox)
+    } else {
+        None
+    };
+    // Roots are *derived* for a codex write run and a fresh grok write run. A
+    // resumed grok session under a `review-ws-*` profile instead takes the roots
+    // recorded with it, verbatim: the profile name is fixed for the session's
+    // life (grok refuses to switch it) and names exactly one root set, so
+    // re-deriving on another host would describe a different profile.
+    let derives = grok_write == Some(GrokWrite::Fresh)
+        || (provider == "codex" && sandbox == Some("workspace-write"));
+    let resumes_profile = matches!(grok_write, Some(GrokWrite::Resume(_)));
 
-    // Derived here rather than inside the codex runner so the same values that
+    // Derived here rather than inside the runners so the same values that
     // widen the run are the ones recorded on the result: a grant that is applied
     // but not logged is exactly the invisible permission this is meant to avoid.
-    let granted_roots: Vec<crate::writable_roots::GrantedRoot> =
-        if provider == "codex" && sandbox == Some("workspace-write") {
-            // Against `project_root`, not the process cwd: every runner spawns
-            // the provider with `.current_dir(project_root)`, and `.review.toml`
-            // discovery deliberately allows launching from a descendant of it.
-            // Deriving from the process cwd inspected `<subdir>/target` instead
-            // of the workspace's, so a run started one directory down silently
-            // failed to grant the root its build needed.
-            crate::writable_roots::derive_with(
-                project_root,
-                &crate::writable_roots::RealHost,
-                profile_roots,
-            )
-        } else {
-            // Silence here would be indistinguishable from the paths having been
-            // granted: an operator who put `writable_roots` on the wrong profile
-            // gets a build that fails for reasons the config appears to rule out.
-            if !profile_roots.is_empty() {
-                eprintln!(
-                    "warning: profile writable_roots ignored - they apply only to \
-                     a codex workspace-write profile (this run: {} {})",
-                    provider,
-                    sandbox.unwrap_or("read-only")
-                );
-            }
-            Vec::new()
-        };
-    let mut root_paths: Vec<String> = granted_roots.iter().map(|g| g.path.clone()).collect();
+    let granted_roots: Vec<crate::writable_roots::GrantedRoot> = if resumes_profile {
+        Vec::new()
+    } else if derives {
+        // Against `project_root`, not the process cwd: every runner spawns
+        // the provider with `.current_dir(project_root)`, and `.review.toml`
+        // discovery deliberately allows launching from a descendant of it.
+        // Deriving from the process cwd inspected `<subdir>/target` instead
+        // of the workspace's, so a run started one directory down silently
+        // failed to grant the root its build needed.
+        crate::writable_roots::derive_with(
+            project_root,
+            &crate::writable_roots::RealHost,
+            profile_roots,
+        )
+    } else {
+        // Silence here would be indistinguishable from the paths having been
+        // granted: an operator who put `writable_roots` on the wrong profile
+        // gets a build that fails for reasons the config appears to rule out.
+        if !profile_roots.is_empty() {
+            eprintln!(
+                "warning: profile writable_roots ignored - they apply only to \
+                     a codex or grok workspace-write profile (this run: {} {})",
+                provider,
+                sandbox.unwrap_or("read-only")
+            );
+        }
+        Vec::new()
+    };
+    let mut root_paths: Vec<String> = if resumes_profile {
+        profile_roots.to_vec()
+    } else {
+        granted_roots.iter().map(|g| g.path.clone()).collect()
+    };
+    // Grok's profile name is a hash of the canonical set, and the recorded
+    // roots must hash back to it on resume - so record them canonically too.
+    if grok_write.is_some() {
+        root_paths = crate::grok_home::canonical_roots(&root_paths);
+    }
     // A profile `config` entry restating the key wins, deliberately - but the
     // record must follow the run, not the derivation, or the sidecar makes a
     // confident false claim: a profile overriding to `["/secret"]` would be
     // logged with the derived roots, and one overriding to `[]` would be logged
     // as widened when it was not.
-    if let Some(overridden) = config_writable_roots_override(config) {
+    // `config` is codex `-c` only; grok never sees it.
+    if provider == "codex"
+        && let Some(overridden) = config_writable_roots_override(config)
+    {
         root_paths = overridden;
     }
+
+    // A grok write run needs grok's own config ready before it launches, or it
+    // fails in ways that cost a whole run to discover: trust (else the first
+    // edit cancels the turn) and its roots profile (else every build dies at
+    // the brokkr lock). A setup failure is a launch failure - running anyway
+    // would reproduce those failures more expensively. Blocking file I/O and a
+    // `flock` another `review` may hold, so off the async runtime.
+    let mut trust_grant: Option<String> = None;
+    let mut grok_profile: Option<String> = None;
+    let setup: Result<()> = match grok_write.clone() {
+        None => Ok(()),
+        Some(kind) => {
+            let root = project_root.to_path_buf();
+            let roots = root_paths.clone();
+            let env = env.cloned();
+            let prepared = tokio::task::spawn_blocking(move || {
+                prepare_grok_write(&kind, &root, &roots, env.as_ref())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("grok setup task failed: {e}"))
+            .and_then(|r| r);
+            prepared.map(|p| {
+                grok_profile = p.profile;
+                trust_grant = p.trust_grant;
+            })
+        }
+    };
     // Announced once per distinct root set, not once per invocation: a fan-out
     // launches the same profile against several archetypes and would otherwise
     // repeat an identical block per run.
@@ -676,7 +735,12 @@ pub async fn invoke(
     // justification for deriving from ambient environment is that the result is
     // visible rather than inferred, so the line must follow the run.
     if !root_paths.is_empty() && claim_roots_announcement(&root_paths) {
-        for line in announcement_lines(&granted_roots, &root_paths) {
+        let other = if resumes_profile {
+            "recorded with the session"
+        } else {
+            "profile config override"
+        };
+        for line in announcement_lines(provider, other, &granted_roots, &root_paths) {
             eprintln!("{line}");
         }
     }
@@ -686,7 +750,7 @@ pub async fn invoke(
     // therefore a policy warning, not a correctness diagnostic - but silence
     // here is what let 40 consecutive runs record no roots unnoticed while every
     // build inside them died at a lock outside the sandbox.
-    if provider == "codex" && sandbox == Some("workspace-write") && root_paths.is_empty() {
+    if derives && root_paths.is_empty() {
         eprintln!(
             "warning: workspace-write run with no writable roots outside the \
              workspace - a build needing one (the build lock, the cargo home, \
@@ -695,57 +759,84 @@ pub async fn invoke(
         );
     }
 
-    let result = match provider {
-        // `sandbox` is an OS filesystem sandbox, which codex and grok both have
-        // and claude does not: claude's `--permission-mode` is a tool-approval
-        // policy on a different axis with no honest mapping, so claude ignores
-        // it. `config` (codex `-c`) stays codex-only.
-        "claude" => {
-            run_claude(
-                session_id,
-                model,
-                effort,
-                env,
-                prompt,
-                project_root,
-                oneshot,
-                launched,
-            )
-            .await
-        }
-        "grok" => {
-            run_grok(
-                session_id,
-                model,
-                effort,
-                sandbox,
-                env,
-                prompt,
-                project_root,
-                oneshot,
-                launched,
-            )
-            .await
-        }
-        "codex" => {
-            run_codex(
-                session_id,
-                model,
-                effort,
-                sandbox,
-                &granted_roots,
-                env,
-                config,
-                prompt,
-                project_root,
-                oneshot,
-                launched,
-                runtime,
-            )
-            .await
-        }
-        other => Err(anyhow::anyhow!("unknown provider: {other}")),
+    let sandbox = grok_profile.as_deref().or(sandbox);
+
+    let result = match (provider, setup) {
+        (_, Err(e)) => Err(e),
+        (provider, Ok(())) => match provider {
+            // `sandbox` is an OS filesystem sandbox, which codex and grok both have
+            // and claude does not: claude's `--permission-mode` is a tool-approval
+            // policy on a different axis with no honest mapping, so claude ignores
+            // it. `config` (codex `-c`) stays codex-only.
+            "claude" => {
+                run_claude(
+                    session_id,
+                    model,
+                    effort,
+                    env,
+                    prompt,
+                    project_root,
+                    oneshot,
+                    launched,
+                )
+                .await
+            }
+            "grok" => {
+                run_grok(
+                    session_id,
+                    model,
+                    effort,
+                    sandbox,
+                    trust_grant.is_some(),
+                    env,
+                    prompt,
+                    project_root,
+                    oneshot,
+                    launched,
+                )
+                .await
+            }
+            "codex" => {
+                run_codex(
+                    session_id,
+                    model,
+                    effort,
+                    sandbox,
+                    &granted_roots,
+                    env,
+                    config,
+                    prompt,
+                    project_root,
+                    oneshot,
+                    launched,
+                    runtime,
+                )
+                .await
+            }
+            other => Err(anyhow::anyhow!("unknown provider: {other}")),
+        },
     };
+    // Record a trust grant only if it actually landed. Grok reports a refused or
+    // process-local grant only on stderr (surfaced by `run_grok`), and a
+    // process-local one leaves the next run untrusted - so "we passed --trust"
+    // is not "the folder is now permanently trusted", and the sidecar field
+    // claims the latter. Re-read after the run; small file, no lock.
+    if trust_grant.is_some() {
+        let landed = crate::grok_home::Grok::resolve(env).is_ok_and(|g| {
+            matches!(
+                g.check_trust(project_root),
+                Ok(crate::grok_home::Trust::Trusted)
+            )
+        });
+        if !landed {
+            eprintln!(
+                "warning: grok --trust did not durably trust {} - the next write run \
+                 there will try again",
+                trust_grant.as_deref().unwrap_or_default()
+            );
+            trust_grant = None;
+        }
+    }
     let completed_epoch = now_epoch_secs();
     match result {
         Ok(run) => ProviderResult {
@@ -759,6 +850,7 @@ pub async fn invoke(
             model: model.map(str::to_string),
             effort: effort.map(str::to_string),
             served: run.served,
+            grok_trust: trust_grant,
         },
         Err(e) => ProviderResult {
             provider: provider.to_string(),
@@ -774,6 +866,9 @@ pub async fn invoke(
             model: model.map(str::to_string),
             effort: effort.map(str::to_string),
             served: Served::default(),
+            // Requested, as `sandbox` is: if grok got as far as running, the
+            // grant happened before whatever failed.
+            grok_trust: trust_grant,
         },
     }
 }
@@ -794,6 +889,8 @@ pub async fn invoke(
 /// effective one, so the two could disagree with nothing failing. A pure
 /// function over both sets is the only shape that can be tested.
 fn announcement_lines(
+    provider: &str,
+    other: &str,
     granted_roots: &[crate::writable_roots::GrantedRoot],
     root_paths: &[String],
 ) -> Vec<String> {
@@ -801,14 +898,123 @@ fn announcement_lines(
         .iter()
         .map(|path| {
             // A derived root can state why a build needs it; one that arrived
-            // through a `config` override cannot, and must not borrow a reason
-            // from the derivation it replaced.
+            // another way - a codex `config` override, or a grok profile root
+            // another project added - cannot, and must not borrow a reason from
+            // a derivation it did not come from.
             match granted_roots.iter().find(|g| &g.path == path) {
-                Some(grant) => format!("codex: writable root {} ({})", grant.path, grant.why),
-                None => format!("codex: writable root {path} (profile config override)"),
+                Some(grant) => format!("{provider}: writable root {} ({})", grant.path, grant.why),
+                None => format!("{provider}: writable root {path} ({other})"),
             }
         })
         .collect()
+}
+
+/// How a grok run that may write is launched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GrokWrite {
+    /// A fresh write run: roots derived, launched under the `review-ws-*`
+    /// profile named for them.
+    Fresh,
+    /// A resume of a session created under a `review-ws-*` profile: the same
+    /// profile, with the roots recorded with the session. Grok fixes a
+    /// session's sandbox profile for its lifetime and refuses a different
+    /// `--sandbox` on resume (`resolve_startup_sandbox` → `Conflict`).
+    Resume(String),
+    /// A resume of a session created under grok's built-in `workspace`, before
+    /// `review` made profiles. It can only continue as it began: trusted, but
+    /// without the extra roots.
+    BuiltinWorkspace,
+}
+
+/// Whether, and how, a grok run writes. A fresh `workspace` run takes a new
+/// profile; a resume passes the recorded name through unchanged, because grok
+/// refuses any other.
+fn grok_write_launch(oneshot: bool, sandbox: Option<&str>) -> Option<GrokWrite> {
+    match sandbox {
+        Some(name) if name.starts_with(crate::grok_home::PROFILE_PREFIX) => {
+            Some(GrokWrite::Resume(name.to_string()))
+        }
+        Some("workspace") if oneshot => Some(GrokWrite::Fresh),
+        Some("workspace") => Some(GrokWrite::BuiltinWorkspace),
+        _ => None,
+    }
+}
+
+/// What `prepare_grok_write` decided.
+#[derive(Debug, Default)]
+struct GrokPrepared {
+    /// The `review-ws-*` profile to launch under, when the run uses one.
+    profile: Option<String>,
+    /// The trust key `--trust` will grant, when the project had no decision
+    /// yet. `None` when it was already trusted: no flag, no grant, nothing to
+    /// announce.
+    trust_grant: Option<String>,
+}
+
+/// Get grok's own config ready for a write run.
+///
+/// Trust is granted by grok (`--trust`, grok's own key and lock), and only when
+/// the project has no decision yet - a grant is a **permanent**, host-wide
+/// decision in `trusted_folders.toml`, and it means more than "may edit": grok's
+/// folder trust gates whether the repo's own `.grok` MCP/LSP config may spawn
+/// servers (`trust.rs` module docs), so from then on every grok session there,
+/// interactive ones included, runs that config without asking. It is therefore
+/// announced on the run that makes it, and recorded in the sidecar.
+/// `check_trust` refuses the cases where the grant would be wrong.
+///
+/// Creating a profile is printed, because it edits the operator's file and an
+/// edit nobody saw is the ambient widening the rest of this file refuses; an
+/// existing profile is silent - it was announced when it was made.
+fn prepare_grok_write(
+    kind: &GrokWrite,
+    project_root: &Path,
+    roots: &[String],
+    env: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<GrokPrepared> {
+    let grok = crate::grok_home::Grok::resolve(env)?;
+    let mut prepared = GrokPrepared::default();
+    if grok.check_trust(project_root)? == crate::grok_home::Trust::Undecided {
+        let key = grok.workspace_key(project_root);
+        eprintln!(
+            "grok: trusting {} permanently in {} - a write run's edits are cancelled in \
+             an untrusted folder; grok will also run this repo's .grok MCP/LSP config \
+             without asking from now on",
+            key.display(),
+            grok.home.join("trusted_folders.toml").display()
+        );
+        prepared.trust_grant = Some(key.to_string_lossy().into_owned());
+    }
+    let name = match kind {
+        GrokWrite::BuiltinWorkspace => return Ok(prepared),
+        GrokWrite::Fresh => crate::grok_home::profile_name(roots),
+        GrokWrite::Resume(name) => {
+            // The recorded roots must be the set the session's profile is named
+            // for; anything else is a row edited by hand or a record from a
+            // different run, and launching would grant a set nobody recorded.
+            if crate::grok_home::profile_name(roots) != *name {
+                anyhow::bail!(
+                    "the roots recorded with this session do not match its grok \
+                     sandbox profile `{name}` - start a fresh run"
+                );
+            }
+            name.clone()
+        }
+    };
+    // Recreated on resume if someone deleted it: the name pins the exact set,
+    // so recreating it grants nothing the session did not already have.
+    if grok.ensure_profile(&name, roots)? {
+        eprintln!(
+            "grok: created sandbox profile `{name}` in {} (writable roots: {})",
+            grok.home.join("sandbox.toml").display(),
+            if roots.is_empty() {
+                "none beyond grok's workspace".to_string()
+            } else {
+                roots.join(", ")
+            }
+        );
+    }
+    prepared.profile = Some(name);
+    Ok(prepared)
 }
 
 fn config_writable_roots_override(config: &[String]) -> Option<Vec<String>> {
@@ -1025,6 +1231,7 @@ async fn run_grok(
     model: Option<&str>,
     effort: Option<&str>,
     sandbox: Option<&str>,
+    trust: bool,
     env: Option<&std::collections::BTreeMap<String, String>>,
     prompt: &str,
     project_root: &Path,
@@ -1060,8 +1267,35 @@ async fn run_grok(
     // Unlike claude, grok has a real filesystem sandbox on the same axis as
     // codex's, so the profile field maps honestly and the default still holds:
     // a bare run cannot modify files.
-    args.push("--sandbox".to_string());
-    args.push(sandbox.unwrap_or("read-only").to_string());
+    //
+    // Except on a resume with no recorded level (a session whose sidecar row
+    // predates sandbox recording, or has no row): grok fixes a session's profile
+    // for its lifetime and refuses an explicit `--sandbox` that differs from the
+    // saved one (`resolve_startup_sandbox`: explicit + saved, different =>
+    // `Conflict`), while no flag applies the saved one. Forcing `read-only` there
+    // made every such write session unresumable. Omitting the flag defers to
+    // what the session already had - no trust or root setup happens, because
+    // there is nothing recorded to say the session writes.
+    match (sandbox, oneshot) {
+        (Some(level), _) => {
+            args.push("--sandbox".to_string());
+            args.push(level.to_string());
+        }
+        (None, true) => {
+            args.push("--sandbox".to_string());
+            args.push("read-only".to_string());
+        }
+        (None, false) => {}
+    }
+    // Grok's own (hidden, headless-honoured) grant: records the project in
+    // `trusted_folders.toml` under grok's key and lock before the turn starts.
+    // Without it every edit in an untrusted folder cancels the turn under
+    // `dontAsk`. Passed only when the project has no decision yet, and
+    // announced by `invoke`, which has also refused the cases where the grant
+    // would be wrong (see `prepare_grok_write`).
+    if trust {
+        args.push("--trust".to_string());
+    }
     if let Some(m) = model {
         args.push("-m".to_string());
         args.push(m.to_string());
@@ -1080,22 +1314,15 @@ async fn run_grok(
     if let Some(vars) = env {
         cmd.envs(vars);
     }
-    let grok_home = crate::grok_home::default_home();
-    // Grok can read in an untrusted folder but cancels the turn at the first
-    // edit (`--permission-mode dontAsk` resolves the trust prompt as
-    // `cancelled`). A run that may write is therefore refused outright: its
-    // first edit is certain to be cancelled, and it only gets there after
-    // spending minutes and real tokens reading. `Err` is the honest outcome:
-    // no turn ran, so nothing was spent and no session exists to resume. A
-    // read-only run is unaffected and proceeds silently; the hint is kept only
-    // to explain a turn that does get cancelled.
-    let untrusted = grok_home
-        .as_deref()
-        .and_then(|home| crate::grok_home::untrusted_warning(home, project_root));
-    if let Some(ref warning) = untrusted
-        && sandbox.unwrap_or("read-only") != "read-only"
-    {
-        anyhow::bail!("refusing a writable grok run: {warning}");
+    let grok = crate::grok_home::Grok::resolve(env).ok();
+    // Re-checked immediately before spawn. `check_trust` in `invoke` and grok's
+    // own grant are two separate reads of the store, and grok's grant overwrites
+    // a `trusted = false` - so a "no" recorded between them (by the operator, or
+    // another grok) would be overturned. This cannot close that race from
+    // outside grok, which offers no "grant unless declined" operation; it
+    // shrinks the window from the whole setup to the time grok takes to start.
+    if trust && let Some(ref g) = grok {
+        g.check_trust(project_root)?;
     }
     let child = cmd.spawn().context("failed to spawn grok")?;
     if let Some(signal) = launched {
@@ -1108,6 +1335,14 @@ async fn run_grok(
         .context("failed to wait for grok")?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    // A failed `--trust` grant is printed only to stderr, which is otherwise
+    // read only when interpreting an error - so it would stay invisible on any
+    // turn that happened not to edit, and the next run would be untrusted.
+    if trust {
+        for line in crate::grok_home::trust_failures(&stderr) {
+            eprintln!("warning: grok --trust: {line}");
+        }
+    }
     // Only a *fresh* run reports a session id: it is new information, and it
     // must survive a turn that produced no answer so that turn can still be
     // resumed. A resume reports `None` because the caller passed the id in and
@@ -1152,12 +1387,13 @@ async fn run_grok(
         } => {
             // The result object says only `cancelled`; grok's own event log
             // says why, and folder trust is the cause worth naming outright.
-            let cause = grok_home.as_deref().and_then(|home| {
+            let cause = grok.as_ref().and_then(|g| {
                 let sid = session_id.as_deref().unwrap_or(&lookup_id);
-                crate::grok_home::session_events(home, sid)
+                crate::grok_home::session_events(&g.home, sid)
                     .as_deref()
                     .and_then(crate::grok_home::cancel_cause)
             });
+            let untrusted = grok.as_ref().and_then(|g| g.untrusted_hint(project_root));
             let reason = explain_grok_no_answer(reason, cause.as_deref(), untrusted.as_deref());
             Ok(RunOutput {
                 text,

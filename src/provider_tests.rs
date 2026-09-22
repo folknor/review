@@ -877,6 +877,32 @@ fn grok_cancelled_turn_is_not_an_answer() {
 }
 
 #[test]
+fn grok_write_launch_keeps_a_resumed_session_on_its_recorded_profile() {
+    use super::GrokWrite::{BuiltinWorkspace, Fresh, Resume};
+    let name = crate::grok_home::profile_name(&["/home/u/.brokkr".to_string()]);
+    // A fresh write run takes a new profile named for its derived roots.
+    assert_eq!(
+        super::grok_write_launch(true, Some("workspace")),
+        Some(Fresh)
+    );
+    // Grok refuses a resume whose --sandbox differs from the session's saved
+    // profile, so a session created under the built-in `workspace` (before
+    // profiles) must resume as `workspace` - trusted, no extra roots ...
+    assert_eq!(
+        super::grok_write_launch(false, Some("workspace")),
+        Some(BuiltinWorkspace)
+    );
+    // ... and one created under a `review-ws-*` profile keeps that exact one.
+    assert_eq!(
+        super::grok_write_launch(false, Some(&name)),
+        Some(Resume(name.clone()))
+    );
+    // Anything else does not write.
+    assert_eq!(super::grok_write_launch(true, Some("read-only")), None);
+    assert_eq!(super::grok_write_launch(true, None), None);
+}
+
+#[test]
 fn grok_turns_and_usage_are_read_from_the_result() {
     // Trimmed from a real grok 1.0.40 run. Before this was read, every grok
     // digest said 0 turns and 0 tokens, which reads as "nothing ran" on a run
@@ -1114,7 +1140,12 @@ fn grant(path: &str, why: &'static str) -> crate::writable_roots::GrantedRoot {
 #[test]
 fn announcement_reports_derived_roots_with_their_reason() {
     let granted = vec![grant("/run/user/1000", "build lock ($XDG_RUNTIME_DIR)")];
-    let lines = super::announcement_lines(&granted, &["/run/user/1000".to_string()]);
+    let lines = super::announcement_lines(
+        "codex",
+        "profile config override",
+        &granted,
+        &["/run/user/1000".to_string()],
+    );
     assert_eq!(
         lines,
         vec!["codex: writable root /run/user/1000 (build lock ($XDG_RUNTIME_DIR))"]
@@ -1128,7 +1159,12 @@ fn announcement_reports_derived_roots_with_their_reason() {
 #[test]
 fn announcement_follows_a_config_override_rather_than_the_derivation() {
     let granted = vec![grant("/run/user/1000", "build lock ($XDG_RUNTIME_DIR)")];
-    let lines = super::announcement_lines(&granted, &["/secret".to_string()]);
+    let lines = super::announcement_lines(
+        "codex",
+        "profile config override",
+        &granted,
+        &["/secret".to_string()],
+    );
     assert_eq!(
         lines,
         vec!["codex: writable root /secret (profile config override)"]
@@ -1144,7 +1180,12 @@ fn announcement_follows_a_config_override_rather_than_the_derivation() {
 /// here, which is the silent-widening case the fence exists to catch.
 #[test]
 fn announcement_covers_roots_added_to_an_empty_derivation() {
-    let lines = super::announcement_lines(&[], &["/srv/cache".to_string()]);
+    let lines = super::announcement_lines(
+        "codex",
+        "profile config override",
+        &[],
+        &["/srv/cache".to_string()],
+    );
     assert_eq!(
         lines,
         vec!["codex: writable root /srv/cache (profile config override)"]
@@ -1161,7 +1202,7 @@ fn announcement_matches_reasons_by_path_not_by_position() {
         grant("/run/user/1000", "build lock ($XDG_RUNTIME_DIR)"),
     ];
     let effective = vec!["/run/user/1000".to_string(), "/srv/extra".to_string()];
-    let lines = super::announcement_lines(&granted, &effective);
+    let lines = super::announcement_lines("codex", "profile config override", &granted, &effective);
     assert_eq!(
         lines,
         vec![
@@ -1177,5 +1218,7 @@ fn announcement_matches_reasons_by_path_not_by_position() {
 #[test]
 fn announcement_is_empty_when_an_override_grants_nothing() {
     let granted = vec![grant("/run/user/1000", "build lock ($XDG_RUNTIME_DIR)")];
-    assert!(super::announcement_lines(&granted, &[]).is_empty());
+    assert!(
+        super::announcement_lines("codex", "profile config override", &granted, &[]).is_empty()
+    );
 }

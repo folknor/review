@@ -118,6 +118,7 @@ fn record_run(
             result.sandbox.as_deref(),
             result.writable_roots.clone(),
             &result.served,
+            result.grok_trust.as_deref(),
             operator_prompt,
             prompt,
             &result.output,
@@ -493,6 +494,7 @@ async fn main() -> Result<()> {
                     model: None,
                     effort: None,
                     served: provider::Served::default(),
+                    grok_trust: None,
                 },
                 also: None,
             },
@@ -672,6 +674,9 @@ fn inherited_settings(
     };
     InheritedSettings {
         sandbox: record.sandbox.clone(),
+        // For grok these are exactly the roots the session's `review-ws-*`
+        // profile is named for, and a resume uses them verbatim rather than
+        // re-deriving - see `provider::GrokWrite::Resume`.
         writable_roots: record.writable_roots.clone(),
         model: record.model.clone(),
         effort: record.effort.clone(),
@@ -898,6 +903,7 @@ async fn run_session_resume(
             result.sandbox.as_deref(),
             result.writable_roots.clone(),
             &result.served,
+            result.grok_trust.as_deref(),
             &stdin_instructions,
             &stdin_instructions,
             &result.output,

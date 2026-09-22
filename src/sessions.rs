@@ -44,6 +44,11 @@ struct SessionEntry<'a> {
     served_model: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cost_usd: Option<f64>,
+    /// The folder a grok run was launched with `--trust` for - a permanent,
+    /// host-wide grant that also lets the repo's `.grok` MCP/LSP config run.
+    /// See `provider::ProviderResult::grok_trust`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grok_trust: Option<&'a str>,
     operator_prompt: &'a str,
     assembled_prompt: &'a str,
     response: Option<String>,
@@ -220,6 +225,7 @@ pub fn record(
     sandbox: Option<&str>,
     writable_roots: Vec<String>,
     served: &crate::provider::Served,
+    grok_trust: Option<&str>,
     operator_prompt: &str,
     assembled_prompt: &str,
     result: &Result<String>,
@@ -257,6 +263,7 @@ pub fn record(
         writable_roots,
         served_model: served.model.as_deref(),
         cost_usd: served.cost_usd,
+        grok_trust,
         operator_prompt,
         assembled_prompt,
         response: result.as_ref().ok().cloned(),
