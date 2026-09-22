@@ -1083,21 +1083,19 @@ async fn run_grok(
     let grok_home = crate::grok_home::default_home();
     // Grok can read in an untrusted folder but cancels the turn at the first
     // edit (`--permission-mode dontAsk` resolves the trust prompt as
-    // `cancelled`), so warn before paying for a run that may be cut off.
-    // Once per folder: a fan-out would otherwise stack identical warnings.
+    // `cancelled`). A run that may write is therefore refused outright: its
+    // first edit is certain to be cancelled, and it only gets there after
+    // spending minutes and real tokens reading. `Err` is the honest outcome:
+    // no turn ran, so nothing was spent and no session exists to resume. A
+    // read-only run is unaffected and proceeds silently; the hint is kept only
+    // to explain a turn that does get cancelled.
     let untrusted = grok_home
         .as_deref()
         .and_then(|home| crate::grok_home::untrusted_warning(home, project_root));
-    if let Some(ref warning) = untrusted {
-        static WARNED: std::sync::Mutex<Vec<std::path::PathBuf>> =
-            std::sync::Mutex::new(Vec::new());
-        let mut warned = WARNED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !warned.iter().any(|p| p == project_root) {
-            warned.push(project_root.to_path_buf());
-            eprintln!("warning: {warning}");
-        }
+    if let Some(ref warning) = untrusted
+        && sandbox.unwrap_or("read-only") != "read-only"
+    {
+        anyhow::bail!("refusing a writable grok run: {warning}");
     }
     let child = cmd.spawn().context("failed to spawn grok")?;
     if let Some(signal) = launched {
