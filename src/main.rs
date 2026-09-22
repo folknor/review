@@ -2,6 +2,7 @@ mod audit;
 mod cli;
 mod config;
 mod config_write;
+mod grok_home;
 mod incident;
 mod inflight;
 mod input;
@@ -394,9 +395,9 @@ async fn main() -> Result<()> {
                     // `stated_failure`).
                     if let Some(why) = stated_failure(&first).filter(|_| died_without_answer(&first))
                     {
-                        eprintln!("codex ended the turn without a final answer: {why}");
+                        eprintln!("{prov} ended the turn without a final answer: {why}");
                         eprintln!(
-                            "not auto-resuming - codex stated a reason, so a retry would hit it again"
+                            "not auto-resuming - {prov} stated a reason, so a retry would hit it again"
                         );
                     } else if prov == "codex"
                         && died_without_answer(&first)

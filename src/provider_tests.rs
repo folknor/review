@@ -876,6 +876,54 @@ fn grok_cancelled_turn_is_not_an_answer() {
     );
 }
 
+#[test]
+fn grok_turns_and_usage_are_read_from_the_result() {
+    // Trimmed from a real grok 1.0.40 run. Before this was read, every grok
+    // digest said 0 turns and 0 tokens, which reads as "nothing ran" on a run
+    // that spent real money.
+    let out = r#"{
+      "text": "",
+      "stopReason": "cancelled",
+      "sessionId": "01a0c86b-18a3-7c70-9851-66dd509787b0",
+      "usage": {
+        "input_tokens": 6716,
+        "cache_read_input_tokens": 30592,
+        "output_tokens": 154,
+        "reasoning_tokens": 82
+      },
+      "num_turns": 2
+    }"#;
+    let (turns, usage) = super::grok_usage(out);
+    assert_eq!(turns, 2);
+    assert_eq!(
+        usage.input_tokens,
+        6716 + 30592,
+        "codex-shaped: input includes cached"
+    );
+    assert_eq!(usage.cached_input_tokens, 30592);
+    assert_eq!(usage.output_tokens, 154);
+    assert_eq!(usage.reasoning_output_tokens, 82);
+    let (turns, usage) = super::grok_usage("not json");
+    assert_eq!((turns, usage.input_tokens), (0, 0));
+}
+
+#[test]
+fn grok_no_answer_reason_carries_the_cause_and_the_trust_hint() {
+    let base = "grok ended the turn without an answer (stopReason: cancelled)".to_string();
+    assert_eq!(
+        super::explain_grok_no_answer(base.clone(), None, None),
+        base
+    );
+    let full = super::explain_grok_no_answer(
+        base,
+        Some("permission_cancelled: permission for `search_replace` was refused"),
+        Some("/p is not in grok's trusted folders"),
+    );
+    assert!(full.contains("stopReason: cancelled"), "{full}");
+    assert!(full.contains("search_replace"), "{full}");
+    assert!(full.contains("trusted folders"), "{full}");
+}
+
 /// An exit status with the given code, for digests that must report what was
 /// observed rather than what was assumed.
 fn exited(code: i32) -> std::process::ExitStatus {

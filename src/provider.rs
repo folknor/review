@@ -1080,6 +1080,25 @@ async fn run_grok(
     if let Some(vars) = env {
         cmd.envs(vars);
     }
+    let grok_home = crate::grok_home::default_home();
+    // Grok can read in an untrusted folder but cancels the turn at the first
+    // edit (`--permission-mode dontAsk` resolves the trust prompt as
+    // `cancelled`), so warn before paying for a run that may be cut off.
+    // Once per folder: a fan-out would otherwise stack identical warnings.
+    let untrusted = grok_home
+        .as_deref()
+        .and_then(|home| crate::grok_home::untrusted_warning(home, project_root));
+    if let Some(ref warning) = untrusted {
+        static WARNED: std::sync::Mutex<Vec<std::path::PathBuf>> =
+            std::sync::Mutex::new(Vec::new());
+        let mut warned = WARNED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !warned.iter().any(|p| p == project_root) {
+            warned.push(project_root.to_path_buf());
+            eprintln!("warning: {warning}");
+        }
+    }
     let child = cmd.spawn().context("failed to spawn grok")?;
     if let Some(signal) = launched {
         let _ = signal.send(());
@@ -1097,8 +1116,16 @@ async fn run_grok(
     // already records it (`main` logs the `--session` argument, not this field);
     // claude does the same. Preferring grok's echoed id over the UUID we
     // generated means a future grok that reassigns it cannot orphan the session.
+    // Where to look for the event log if grok does not echo an id.
+    let lookup_id = oneshot_id.clone().unwrap_or_else(|| session_id.to_string());
     let keep_id = |echoed: Option<String>| if oneshot { echoed.or(oneshot_id) } else { None };
     let served = grok_served(&stdout);
+    let (turns, usage) = grok_usage(&stdout);
+    let with_usage = |digest: Digest| Digest {
+        turns,
+        usage: usage.clone(),
+        ..digest
+    };
 
     match interpret_grok_output(&stdout, &stderr)? {
         GrokOutcome::Answered(answer) => Ok(RunOutput {
@@ -1110,25 +1137,86 @@ async fn run_grok(
             // than discarding - it is the only sign that something went wrong
             // after the turn finished. `captured: true` keeps it out of
             // `died_without_answer`, so the run does not fail on it.
-            digest: (!output.status.success()).then(|| Digest {
-                captured: true,
-                ..grok_no_answer_digest(
-                    "grok exited non-zero after producing an answer".to_string(),
-                    &output.status,
-                )
+            digest: (!output.status.success()).then(|| {
+                with_usage(Digest {
+                    captured: true,
+                    ..grok_no_answer_digest(
+                        "grok exited non-zero after producing an answer".to_string(),
+                        &output.status,
+                    )
+                })
             }),
         }),
         GrokOutcome::NoAnswer {
             reason,
             text,
             session_id,
-        } => Ok(RunOutput {
-            text,
-            session_id: keep_id(session_id),
-            digest: Some(grok_no_answer_digest(reason, &output.status)),
-            served,
-        }),
+        } => {
+            // The result object says only `cancelled`; grok's own event log
+            // says why, and folder trust is the cause worth naming outright.
+            let cause = grok_home.as_deref().and_then(|home| {
+                let sid = session_id.as_deref().unwrap_or(&lookup_id);
+                crate::grok_home::session_events(home, sid)
+                    .as_deref()
+                    .and_then(crate::grok_home::cancel_cause)
+            });
+            let reason = explain_grok_no_answer(reason, cause.as_deref(), untrusted.as_deref());
+            Ok(RunOutput {
+                text,
+                session_id: keep_id(session_id),
+                digest: Some(with_usage(grok_no_answer_digest(reason, &output.status))),
+                served,
+            })
+        }
     }
+}
+
+/// Extend grok's bare stop reason with what its event log and folder trust
+/// say. Pure so the wording is tested without a grok home.
+fn explain_grok_no_answer(reason: String, cause: Option<&str>, untrusted: Option<&str>) -> String {
+    let mut out = reason;
+    if let Some(cause) = cause {
+        out.push_str(&format!(" - {cause}"));
+    }
+    if let Some(untrusted) = untrusted {
+        out.push_str(&format!(" - {untrusted}"));
+    }
+    out
+}
+
+/// Turn count and token usage from grok's result object, mapped onto the
+/// codex-shaped `Usage`: codex's `input_tokens` includes the cached part, so
+/// grok's separately-reported cache reads are added back in. Record-only, like
+/// `grok_served`: a result without these fields records zeros.
+fn grok_usage(stdout: &str) -> (u32, Usage) {
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct RawUsage {
+        input_tokens: u64,
+        cache_read_input_tokens: u64,
+        output_tokens: u64,
+        reasoning_tokens: u64,
+    }
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        #[serde(default)]
+        usage: RawUsage,
+        #[serde(rename = "numTurns", alias = "num_turns", default)]
+        num_turns: u32,
+    }
+    let Ok(raw) = serde_json::from_str::<Raw>(stdout.trim()) else {
+        return (0, Usage::default());
+    };
+    let u = raw.usage;
+    (
+        raw.num_turns,
+        Usage {
+            input_tokens: u.input_tokens + u.cache_read_input_tokens,
+            cached_input_tokens: u.cache_read_input_tokens,
+            output_tokens: u.output_tokens,
+            reasoning_output_tokens: u.reasoning_tokens,
+        },
+    )
 }
 
 /// Pull what served the run out of grok's result object. Parsed separately
