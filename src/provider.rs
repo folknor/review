@@ -505,6 +505,24 @@ pub struct ProviderResult {
     /// a confident wrong record is worse than an incomplete one.
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// What the provider reports actually served the run. Record-only.
+    pub served: Served,
+}
+
+/// What a provider reports, after the fact, about what served a run - as
+/// opposed to `ProviderResult::model`, which is what we asked for.
+///
+/// The two are different names, not two spellings of one: grok's `-m grok-4.7`
+/// is served as `grok-4.7-build`, and `-m grok-4.7-build` is refused as an
+/// unknown model id. So this is recorded but **never** inherited by a
+/// `--session` resume - feeding it back to `-m` would fail the launch. Only grok
+/// reports it today; empty for every other provider.
+#[derive(Default, Clone, Debug, PartialEq)]
+pub struct Served {
+    /// Every model that served a call in the run, sorted and comma-joined (one
+    /// in practice; a subagent on another model would add a second).
+    pub model: Option<String>,
+    pub cost_usd: Option<f64>,
 }
 
 pub fn now_epoch_secs() -> u64 {
@@ -521,6 +539,7 @@ struct RunOutput {
     text: String,
     session_id: Option<String>,
     digest: Option<Digest>,
+    served: Served,
 }
 
 /// Knobs on how a codex run is executed, injectable so tests can drive the real
@@ -739,6 +758,7 @@ pub async fn invoke(
             writable_roots: root_paths,
             model: model.map(str::to_string),
             effort: effort.map(str::to_string),
+            served: run.served,
         },
         Err(e) => ProviderResult {
             provider: provider.to_string(),
@@ -753,6 +773,7 @@ pub async fn invoke(
             writable_roots: root_paths,
             model: model.map(str::to_string),
             effort: effort.map(str::to_string),
+            served: Served::default(),
         },
     }
 }
@@ -947,12 +968,14 @@ async fn run_claude(
         text,
         session_id: oneshot_id,
         digest: None,
+        served: Served::default(),
     })
 }
 
 /// Grok's headless result object (`--output-format json`). One JSON object on
-/// stdout per run, whatever the outcome; the fields we don't use (usage, cost,
-/// requestId, thought) are ignored rather than modelled.
+/// stdout per run, whatever the outcome; the fields we don't use (usage,
+/// requestId, thought) are ignored rather than modelled. The served model and
+/// cost are read separately, by `grok_served`.
 #[derive(serde::Deserialize)]
 struct GrokResult {
     #[serde(default)]
@@ -1075,11 +1098,13 @@ async fn run_grok(
     // claude does the same. Preferring grok's echoed id over the UUID we
     // generated means a future grok that reassigns it cannot orphan the session.
     let keep_id = |echoed: Option<String>| if oneshot { echoed.or(oneshot_id) } else { None };
+    let served = grok_served(&stdout);
 
     match interpret_grok_output(&stdout, &stderr)? {
         GrokOutcome::Answered(answer) => Ok(RunOutput {
             text: answer.text,
             session_id: keep_id(answer.session_id),
+            served,
             // A real answer from a process that nonetheless exited non-zero is
             // still a real answer, but the status is worth surfacing rather
             // than discarding - it is the only sign that something went wrong
@@ -1101,7 +1126,30 @@ async fn run_grok(
             text,
             session_id: keep_id(session_id),
             digest: Some(grok_no_answer_digest(reason, &output.status)),
+            served,
         }),
+    }
+}
+
+/// Pull what served the run out of grok's result object. Parsed separately
+/// from `interpret_grok_output` because it is record-only: nothing about
+/// whether the run answered depends on it, and a result lacking these fields
+/// is still a valid result - it just records nothing here.
+fn grok_served(stdout: &str) -> Served {
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        #[serde(rename = "modelUsage", default)]
+        model_usage: serde_json::Map<String, serde_json::Value>,
+        #[serde(default)]
+        total_cost_usd: Option<f64>,
+    }
+    let Ok(raw) = serde_json::from_str::<Raw>(stdout.trim()) else {
+        return Served::default();
+    };
+    let names: Vec<&str> = raw.model_usage.keys().map(String::as_str).collect();
+    Served {
+        model: (!names.is_empty()).then(|| names.join(",")),
+        cost_usd: raw.total_cost_usd,
     }
 }
 
@@ -1994,6 +2042,7 @@ async fn run_codex_json(
         text,
         session_id,
         digest: Some(digest),
+        served: Served::default(),
     })
 }
 

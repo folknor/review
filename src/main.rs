@@ -116,6 +116,7 @@ fn record_run(
             env_keys.to_vec(),
             result.sandbox.as_deref(),
             result.writable_roots.clone(),
+            &result.served,
             operator_prompt,
             prompt,
             &result.output,
@@ -490,6 +491,7 @@ async fn main() -> Result<()> {
                     writable_roots: Vec::new(),
                     model: None,
                     effort: None,
+                    served: provider::Served::default(),
                 },
                 also: None,
             },
@@ -894,6 +896,7 @@ async fn run_session_resume(
             // chain inherits from this row in turn.
             result.sandbox.as_deref(),
             result.writable_roots.clone(),
+            &result.served,
             &stdin_instructions,
             &stdin_instructions,
             &result.output,

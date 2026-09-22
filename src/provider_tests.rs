@@ -795,6 +795,31 @@ fn grok_end_turn_is_an_answer() {
 }
 
 #[test]
+fn grok_served_model_and_cost_are_read_from_model_usage() {
+    // Trimmed from a real grok 1.0.40 run under the default `-m grok-4.7`: the
+    // served name differs from anything `grok models` lists, which is why it is
+    // recorded separately from `model` rather than replacing it.
+    let out = r#"{
+      "text": "ok",
+      "stopReason": "end_turn",
+      "sessionId": "3b8f1c22-9d4e-4a51-b7c6-2e0f9a8d7c11",
+      "num_turns": 1,
+      "total_cost_usd": 0.02397,
+      "modelUsage": { "grok-4.7-build": { "modelCalls": 1, "costUSD": 0.02397 } }
+    }"#;
+    assert_eq!(
+        super::grok_served(out),
+        super::Served {
+            model: Some("grok-4.7-build".to_string()),
+            cost_usd: Some(0.02397),
+        }
+    );
+    // Absent fields and non-JSON record nothing rather than failing the run.
+    assert_eq!(super::grok_served(GROK_OK), super::Served::default());
+    assert_eq!(super::grok_served("not json"), super::Served::default());
+}
+
+#[test]
 fn grok_cancelled_turn_is_not_an_answer() {
     // Observed by running a tool-using prompt under `--max-turns 1`: a full
     // result object, exit 1, and `text` holding the model's opening remark.

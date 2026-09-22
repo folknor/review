@@ -36,6 +36,14 @@ struct SessionEntry<'a> {
     /// run that widened nothing, which is every read-only run.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     writable_roots: Vec<String>,
+    /// The model the provider reports actually served the run, which is not
+    /// the name `model` holds (grok serves `-m grok-4.7` as `grok-4.7-build`).
+    /// Record-only: deliberately absent from `SessionRecord`, so no resume can
+    /// inherit it into `-m`, which refuses it. See `provider::Served`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    served_model: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_usd: Option<f64>,
     operator_prompt: &'a str,
     assembled_prompt: &'a str,
     response: Option<String>,
@@ -211,6 +219,7 @@ pub fn record(
     // received is only visible in the terminal that launched it.
     sandbox: Option<&str>,
     writable_roots: Vec<String>,
+    served: &crate::provider::Served,
     operator_prompt: &str,
     assembled_prompt: &str,
     result: &Result<String>,
@@ -246,6 +255,8 @@ pub fn record(
         env_keys,
         sandbox,
         writable_roots,
+        served_model: served.model.as_deref(),
+        cost_usd: served.cost_usd,
         operator_prompt,
         assembled_prompt,
         response: result.as_ref().ok().cloned(),
