@@ -2079,8 +2079,10 @@ async fn run_codex(
     // access. This makes that explicit and, unlike the bypass, it applies to
     // every command rather than the ones whose argv happened to match a rule.
     //
-    // Scoped to `workspace-write`: `read-only` is the reviewer profile, which
-    // has no build to run and so no socket to bind. Passed before profile
+    // Scoped to `workspace-write` because this key only exists for that level.
+    // `read-only` needs the same grant - the filter denies `connect` there too -
+    // and gets it from the permissions profile in `codex_sandbox_args`, there
+    // being no `sandbox_read_only.network_access`. Passed before profile
     // `config`, so a profile can restate the key and win.
     if sandbox == Some("workspace-write") {
         args.push("-c".to_string());

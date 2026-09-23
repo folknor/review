@@ -29,7 +29,7 @@
 //! from the rollout. Secondary candidate: `OtelProvider`'s `Drop` shutdown,
 //! which openai/codex#37109 bounded for the TUI only - `codex exec` still drops
 //! the provider synchronously with no timeout. Neither is proven, and root-
-//! causing codex is explicitly out of scope (see CLAUDE.md); this module is the
+//! causing codex is explicitly out of scope (see reference/codex.md); this module is the
 //! "catch" that makes the failure survivable from our side.
 //!
 //! # What it does
