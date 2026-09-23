@@ -52,7 +52,7 @@ mod tests {
         let path = scratch_file("[archetypes]\nbugs = \"x\"\n");
         append_audit_id(&path, "abcd").unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
-        let cfg = config::parse(&raw).unwrap();
+        let cfg = config::parse_file(&raw, "test", config::Layer::Local).unwrap();
         assert_eq!(cfg.audit.id.as_deref(), Some("abcd"));
         let _ = std::fs::remove_file(&path);
     }

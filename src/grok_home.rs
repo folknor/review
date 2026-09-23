@@ -893,12 +893,18 @@ pub fn merge_profile(
 mod tests {
     use super::*;
 
+    /// Canonicalized, because these tests are about symlinks and the only ones
+    /// in play must be the ones a test plants. `target` is itself a symlink on
+    /// hosts that keep the build cache on another drive, and the trust-boundary
+    /// check refuses a path with *any* symlinked ancestor - so an unresolved
+    /// scratch path made every store "reached through a symlink" before a test
+    /// had planted one, failing the suite on those hosts only.
     fn scratch() -> PathBuf {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("target/test-scratch")
             .join(crate::config::generate_uuid());
         std::fs::create_dir_all(&dir).expect("create scratch dir");
-        dir
+        std::fs::canonicalize(&dir).expect("canonicalize scratch dir")
     }
 
     fn roots(v: &[&str]) -> Vec<String> {

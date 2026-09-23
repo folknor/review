@@ -19,22 +19,37 @@ cd /path/to/your/project
 review init
 ```
 
-### 2. Define archetypes
+### 2. Configure
 
-Add archetypes to `.review.toml` - a name mapped to a priming prompt - and list the providers to fan out to:
+Settings shared by every project - default providers, and the profiles naming
+which model serves which tier - go once in the global
+`~/.config/review/config.toml`:
+
+```toml
+[_defaults]
+providers = ["codex"]
+
+[codex.deep]
+model = "gpt-6-luna"
+effort = "max"
+sandbox = "read-only"
+```
+
+Project-specific archetypes - a name mapped to a priming prompt - go in the
+project's `.review.toml`:
 
 ```toml
 [archetypes]
 security = "You are a security expert for this project. Read the codebase."
 bugs = "You hunt for edge cases and correctness bugs."
-
-[_defaults]
-providers = ["claude", "codex"]
 ```
+
+`review config` shows the effective result and which file each value came from.
 
 ### 3. Run reviews
 
 ```
+echo "what does the retry loop guarantee?" | review --profile deep
 echo "look for auth boundary violations" | review security
 echo "check for edge cases in the parsing module" | review bugs
 echo "full review please" | review all
@@ -44,10 +59,10 @@ echo "how should we handle polygon clipping?" | review competitors
 ## Usage
 
 ```
-echo "<instructions>" | review <archetype[,archetype,...]>
+echo "<instructions>" | review [archetype[,archetype,...]]
 ```
 
-Instructions are piped via stdin (required, 20KB limit). The archetype routes to the right sessions. Multiple archetypes and groups can be comma-separated:
+Instructions are piped via stdin (required, 20KB limit). Without an archetype, stdin is sent unchanged - no priming prompt. With one, the archetype routes to the right sessions. Multiple archetypes and groups can be comma-separated:
 
 ```
 echo "review please" | review security,bugs,arch
@@ -58,7 +73,7 @@ Duplicates are removed automatically (e.g. if a group overlaps with an explicit 
 
 ### Archetypes
 
-Archetypes are named reviewer personas defined under `[archetypes]` in `.review.toml` (name = priming prompt). Any name works - use whatever fits your project.
+Archetypes are optional named priming prompts defined under `[archetypes]` (name = priming prompt), in the project's `.review.toml` or the global config; the project wins on a name clash. Any name works except the reserved ones: `all` and the subcommand names (`init`, `config`, `sessions`, `incidents`, `help`).
 
 Use `all` to fan out to every configured archetype, or define **groups** to fan out to a named subset. Groups and individual archetypes can be mixed freely.
 
@@ -66,13 +81,13 @@ Use `all` to fan out to every configured archetype, or define **groups** to fan 
 
 | Flag | Description |
 |------|-------------|
-| `--profile <name>` | Apply a named profile's `model`/`effort`/`env` overrides. Resolved per launched provider from `[<host>.<provider>.<profile>]`. |
+| `--profile <name>` | Apply a named profile's `model`/`effort`/`sandbox`/`env` overrides. Resolved per launched provider from `[<provider>.<profile>]`, project config first, then global. |
 | `--session <id>` | Resume a specific session. Sends raw stdin (no prime prepended). `--provider` is optional - the owning provider is read from the sidecar. |
 | `--dry-run` | Print what would be sent instead of sending it |
 | `--provider <list>` | Limit to specific providers (comma-separated) |
 | `--stagger <secs>` | Seconds between each provider launch (default: 30, 0 to disable) |
 
-Each run starts a fresh session, prepends the archetype's priming prompt to your stdin, and lets the agent fetch code itself. Providers come from `--provider`, or `[_defaults].providers` when `--provider` is omitted.
+Each run starts a fresh session, prepends the archetype's priming prompt (if any) to your stdin, and lets the agent fetch code itself. Providers come from `--provider`, or `[_defaults].providers` when `--provider` is omitted. A provider that is not installed on this machine fails the run before anything launches - `review config` shows which are installed.
 
 Per-provider launch behavior:
 
@@ -86,15 +101,15 @@ Grok is the one provider that takes no prompt on stdin: `-p` requires a value an
 
 ### Profiles
 
-Profiles carry per-provider `model`, `effort`, `sandbox`, and `env` overrides, applied only when you pass `--profile`. They are scoped by host, provider, and profile name so the same name can mean different settings on different machines (e.g. a local proxy `ANTHROPIC_BASE_URL` that differs per host):
+Profiles carry per-provider `model`, `effort`, `sandbox`, and `env` overrides, applied only when you pass `--profile`. They are `[<provider>.<profile>]` tables, and the natural home for them is the global config, so a new model release is one edit rather than one per project:
 
 ```toml
-[myhostname.claude.opus]
+[claude.opus]
 model = "Opus 4.8"
 effort = "medium"
 env = { ANTHROPIC_BASE_URL = "http://localhost:8787" }
 
-[myhostname.codex.implement]
+[codex.implement]
 model = "gpt-5.6-terra"
 effort = "high"
 sandbox = "workspace-write"
@@ -104,7 +119,9 @@ sandbox = "workspace-write"
 echo "audit the auth flow" | review security --profile opus
 ```
 
-`--profile opus` resolves `[<host>.<provider>.opus]` for each launched provider and applies its overrides. If any launched provider lacks that profile table, the run errors naming the missing `[host.provider.profile]`.
+`--profile opus` resolves `[<provider>.opus]` for each launched provider: the project's `.review.toml` first, then the global config. A project profile replaces the global one of the same name **entirely** - nothing is merged field by field, so a project that overrides only `model` also drops the global profile's `sandbox`. If no file defines the profile for a launched provider, the run errors naming every file it searched.
+
+The older host-scoped form `[<host>.<provider>.<profile>]` still parses. It applies only on the host it names, and there it beats a hostless table in the same file - which means such a table keeps overriding the global config on that host until you delete it. `review config` shows it alongside the global profile it hides.
 
 `sandbox` takes one of `review`'s three levels -- `read-only`, `workspace-write`, `danger-full-access` -- and defaults to `read-only` when unset, so a bare `review` run can never modify files. **Claude ignores it** -- claude's `--permission-mode` is a tool-approval policy on a different axis with no honest mapping.
 
@@ -152,7 +169,7 @@ Error: this session belongs to 'codex', but --provider says 'claude'
 
 Other constraints:
 
-- Bypasses `.review.toml` entirely - no profile overrides are applied.
+- Bypasses config archetypes and profiles - no prime and no profile overrides are applied. The sandbox level, writable roots, model and effort are inherited from the session's own recorded run instead.
 - Validation of the session ID is delegated to the provider; an unknown ID produces a provider-specific error, not a `review` error.
 
 ### Sessions sidecar log
@@ -345,7 +362,14 @@ When using `all` or groups, archetype headers are added:
 
 ## Configuration
 
-Per-project `.review.toml` in the project root (discovered by walking up to the git root). Run `review init` to create a starter.
+Settings resolve like a standard command-line tool: the command line, then the project's `.review.toml`, then the global config. Nothing is built in.
+
+| File | Where | Required |
+|---|---|---|
+| Project | `.review.toml` in the project root, discovered by walking up to the git root. `review init` creates a starter. | Yes - it holds `[_audit]`, the project's audit id. A file with only `[_audit]` is enough. |
+| Global | `$XDG_CONFIG_HOME/review/config.toml`, else `~/.config/review/config.toml` | No |
+
+Both files take the same format; `[_audit]` is allowed only in the project file.
 
 ```toml
 [archetypes]
@@ -362,19 +386,41 @@ stall_timeout_secs = 900           # codex-only; 0 disables. See "When codex han
 sweep = ["security", "bugs"]
 competitors = ["tilemaker", "tippecanoe"]
 
-# Named profiles: per-provider model/effort/env overrides, applied via --profile.
-# Scoped by host . provider . profile.
-[myhostname.claude.opus]
+# Named profiles: per-provider model/effort/sandbox/env overrides, applied via
+# --profile. Scoped by provider . profile.
+[claude.opus]
 model = "Opus 4.8"
 effort = "medium"
 env = { ANTHROPIC_BASE_URL = "http://localhost:8787" }
 
-[myhostname.codex.high]
-model = "o3"
+[codex.high]
+model = "gpt-6-luna"
 effort = "high"
 ```
 
-An archetype is just a name mapped to a priming prompt - no session, no host binding. Profiles are what's host-scoped, so the same profile name can carry different `model`/`env` on different machines.
+How the layers combine:
+
+- **Archetypes and groups** are the union of both files; the project wins on a name clash, including a project archetype against a global group of the same name. Within one file, a group and an archetype may not share a name. A project group may name a global archetype; a global group may only name global archetypes, since the global file is read in every project.
+- **`[_defaults]` keys** come from the first file that sets them. An explicit `providers = []` in the project counts as set.
+- **Profiles** come from the first definition found, and win whole. Lookup order: the project's host-scoped table, its hostless table, then the same two in the global file.
+
+### `review config`
+
+Prints the effective configuration for the current directory, computed by the same resolver a run uses: the files consulted, the default providers and whether each provider is installed on this machine, every archetype and group with its source, and every profile with the table it came from and any definitions it shadows. Env vars show by name only.
+
+```
+review config          # for reading
+review config --json   # for scripts and orchestrators
+```
+
+Anything that used to read `.review.toml` to find out what is available should call this instead - the project file no longer tells the whole story. Outside a project it shows the global layer and provider availability on their own.
+
+### Upgrading existing files
+
+Existing `.review.toml` files keep working, including legacy host tables, with two exceptions that now fail to parse:
+
+- A profile containing a key `review` does not know - usually a typo. A project profile replaces the global one whole, so a typo that parsed as an empty profile would silently discard the global settings.
+- An archetype or group named `config` or `incidents`, which are now subcommands.
 
 ### Providers
 

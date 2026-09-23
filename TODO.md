@@ -1,9 +1,5 @@
 # TODO
 
-## `review --help` should print the configured profiles
-
-`--profile <name>` is only discoverable by reading `.review.toml`. Have `--help` list the profiles available for the current host, so an operator can see what `--profile` accepts without opening the config.
-
 ## `review add`
 
 Add a command that creates an archetype from a priming prompt (writes `[archetypes].<name>` in `.review.toml`), so archetypes don't have to be hand-edited. Takes the prompt on stdin.
@@ -15,7 +11,6 @@ Add a command that creates an archetype from a priming prompt (writes `[archetyp
 Non-goals (considered and dropped):
 - **Usage in the sidecar.** Token usage/turns are in the printed digest; persisting them only helps after-the-fact spend aggregation, which we don't need. Skipped.
 
-Note: `goal` needs no code - an archetype whose prompt is `/goal` covers it.
 Note: `sandbox` is codex-only by design. Codex's filesystem sandbox and claude's
 `--permission-mode` (acceptEdits/auto/bypassPermissions/manual/dontAsk/plan) are
 different axes with no honest mapping, so claude ignores `sandbox`.

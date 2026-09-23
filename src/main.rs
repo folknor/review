@@ -1,6 +1,7 @@
 mod audit;
 mod cli;
 mod config;
+mod config_cmd;
 mod config_write;
 mod grok_home;
 mod incident;
@@ -19,6 +20,10 @@ use anyhow::{Result, bail};
 use clap::Parser;
 
 use cli::Cli;
+
+/// The archetype label recorded for a run launched without one: stdin is sent
+/// unchanged, with no priming prompt.
+const BARE: &str = "bare";
 
 /// Nudge sent when auto-resuming a codex run that died without a final answer.
 const RESUME_NUDGE: &str = "The previous turn ended without a final answer. \
@@ -147,6 +152,10 @@ async fn main() -> Result<()> {
         return config::init();
     }
 
+    if let Some(cli::Command::Config { json }) = &cli.command {
+        return config_cmd::run(*json);
+    }
+
     if let Some(cli::Command::Sessions { id, all, limit }) = &cli.command {
         return match id {
             Some(sid) => run_session_show(sid),
@@ -158,13 +167,7 @@ async fn main() -> Result<()> {
         return run_incidents(*limit);
     }
 
-    let archetype_name = match cli.archetype.as_deref() {
-        Some(name) => name,
-        None => {
-            Cli::print_help();
-            std::process::exit(2);
-        }
-    };
+    let archetype_arg = cli.archetype.as_deref();
 
     if let Some(ref session_id) = cli.session {
         if cli.profile.is_some() {
@@ -175,7 +178,7 @@ async fn main() -> Result<()> {
             );
         }
         return run_session_resume(
-            archetype_name,
+            archetype_arg.unwrap_or(BARE),
             cli.provider.as_deref().unwrap_or(&[]),
             session_id,
             cli.dry_run,
@@ -184,86 +187,139 @@ async fn main() -> Result<()> {
         .await;
     }
 
-    let (mut cfg, project_root) = config::load()?;
-    let stdin_instructions = input::read_stdin()?;
+    // A bare `review` - no arguments at all and nothing piped in - gets the help
+    // text. Read before the config so this works outside a project too. With any
+    // flag given the operator meant to run something, so a missing stdin falls
+    // through to `read_stdin`'s error, which says what is missing, rather than
+    // answering with help that silently ignores the flags.
+    let early_stdin = if archetype_arg.is_none() && std::env::args_os().len() == 1 {
+        match input::read_stdin_optional()? {
+            Some(s) => Some(s),
+            None => {
+                Cli::print_help();
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
 
-    let hostname = config::hostname();
+    let (mut cfg, project_root) = config::load()?;
+    let stdin_instructions = match early_stdin {
+        Some(s) => s,
+        None => input::read_stdin()?,
+    };
 
     if cli.dry_run {
-        eprintln!("config: {}", project_root.join(".review.toml").display());
-        eprintln!("hostname: {hostname}");
+        eprintln!("config: {}", cfg.searched());
+        eprintln!("hostname: {}", cfg.hostname);
     }
 
-    // Resolve archetype(s) - supports "all", groups, comma-separated, or single names
-    let names: Vec<&str> = archetype_name.split(',').collect();
-    let mut archetypes_to_run: Vec<&str> = Vec::new();
-
-    for name in &names {
-        if *name == "all" {
-            archetypes_to_run.extend(cfg.archetypes.keys().map(String::as_str));
-        } else if let Some(group) = cfg.groups.get(*name) {
-            archetypes_to_run.extend(group.iter().map(String::as_str));
-        } else if cfg.archetypes.contains_key(*name) {
-            archetypes_to_run.push(name);
-        } else {
-            let mut available: Vec<&str> = cfg.archetypes.keys().map(String::as_str).collect();
-            available.extend(cfg.groups.keys().map(String::as_str));
-            bail!(
-                "'{name}' not found in .review.toml\n  \
-                 configured: {}",
-                if available.is_empty() {
-                    "(none)".to_string()
+    // Resolve archetype(s) - supports "all", groups, comma-separated, or single
+    // names - into (label, prime) pairs. No archetype at all is one bare run.
+    let mut archetypes_to_run: Vec<(String, String)> = Vec::new();
+    match archetype_arg {
+        None => archetypes_to_run.push((BARE.to_string(), String::new())),
+        Some(arg) => {
+            for name in arg.split(',') {
+                if name == "all" {
+                    archetypes_to_run.extend(
+                        cfg.archetypes
+                            .iter()
+                            .map(|(n, p)| (n.clone(), p.value.clone())),
+                    );
+                } else if let Some(group) = cfg.groups.get(name) {
+                    for member in &group.value {
+                        // Resolution checked every member exists.
+                        let prime = cfg.archetype(member).unwrap_or_default();
+                        archetypes_to_run.push((member.clone(), prime.to_string()));
+                    }
+                } else if let Some(prime) = cfg.archetype(name) {
+                    archetypes_to_run.push((name.to_string(), prime.to_string()));
                 } else {
-                    available.join(", ")
+                    let mut available: Vec<&str> =
+                        cfg.archetypes.keys().map(String::as_str).collect();
+                    available.extend(cfg.groups.keys().map(String::as_str));
+                    bail!(
+                        "'{name}' not found in {}\n  \
+                         configured: {}",
+                        cfg.searched(),
+                        if available.is_empty() {
+                            "(none)".to_string()
+                        } else {
+                            available.join(", ")
+                        }
+                    );
                 }
-            );
+            }
         }
     }
 
     // Deduplicate (e.g. "all" + a specific archetype, or overlapping groups)
     let mut seen = std::collections::HashSet::new();
-    archetypes_to_run.retain(|name| seen.insert(*name));
+    archetypes_to_run.retain(|(name, _)| seen.insert(name.clone()));
 
     if archetypes_to_run.is_empty() {
         bail!(
-            "no archetypes configured in .review.toml\n\n\
-             Add archetypes, e.g.:\n\n\
-             [archetypes]\n\
-             security = \"You are a security expert. Read the codebase.\""
+            "no archetypes configured in {}\n  \
+             Omit the archetype to send stdin unchanged, or add one under [archetypes].",
+            cfg.searched()
         );
     }
 
-    // Provider list: --provider wins, otherwise [_defaults].providers.
+    // Provider list: --provider wins, otherwise [_defaults].providers from the
+    // first layer that sets it.
     let providers_to_run: Vec<String> = match cli.provider.as_ref().filter(|v| !v.is_empty()) {
         Some(v) => v.clone(),
-        None => {
-            if cfg.defaults.providers.is_empty() {
-                bail!(
-                    "no providers to run: pass --provider <name> or set [_defaults].providers in .review.toml"
-                );
-            }
-            cfg.defaults.providers.clone()
-        }
+        None => match cfg.default_providers() {
+            Some(p) if !p.is_empty() => p.to_vec(),
+            _ => bail!(
+                "no providers to run: pass --provider <name> or set [_defaults].providers \
+                 (looked in {})",
+                cfg.searched()
+            ),
+        },
     };
 
-    // If a profile was requested, every launched provider must define it under
-    // [<host>.<provider>.<profile>]. Validate up front so we fail before spawning.
+    for prov in &providers_to_run {
+        if !config::KNOWN_PROVIDERS.contains(&prov.as_str()) {
+            bail!(
+                "unknown provider '{prov}'\n  supported: {}",
+                config::KNOWN_PROVIDERS.join(", ")
+            );
+        }
+    }
+
+    // If a profile was requested, every launched provider must have it in some
+    // layer. Validate up front so we fail before spawning.
     if let Some(ref profile) = cli.profile {
         for prov in &providers_to_run {
-            if cfg.resolve_profile(&hostname, prov, profile).is_none() {
+            if cfg.resolve_profile(prov, profile).is_none() {
                 bail!(
-                    "profile '{profile}' not defined for provider '{prov}' on host '{hostname}'\n  \
-                     add [{}.{prov}.{profile}] to .review.toml",
-                    config::toml_key(&hostname)
+                    "profile '{profile}' not defined for provider '{prov}'\n  \
+                     looked for [{prov}.{profile}] and [{}.{prov}.{profile}] in {}",
+                    config::toml_key(&cfg.hostname),
+                    cfg.searched()
                 );
             }
         }
     }
 
+    let missing: Vec<&str> = providers_to_run
+        .iter()
+        .map(String::as_str)
+        .filter(|p| !provider::is_available(p))
+        .collect();
+
     // Dry run: print what would be sent and exit
     if cli.dry_run {
-        for arch_name in &archetypes_to_run {
-            let prime = &cfg.archetypes[*arch_name];
+        if !missing.is_empty() {
+            eprintln!(
+                "warning: not installed on this host: {} - a real run would fail",
+                missing.join(", ")
+            );
+        }
+        for (arch_name, prime) in &archetypes_to_run {
             let prompt = prompt::assemble(prime, &stdin_instructions);
             if archetypes_to_run.len() > 1 {
                 println!("=== {arch_name} ===\n");
@@ -274,6 +330,19 @@ async fn main() -> Result<()> {
             }
         }
         return Ok(());
+    }
+
+    // Every provider must be installed here, checked before anything launches.
+    // With host-scoped config gone, one config reaches every machine, including
+    // ones missing a harness; skipping it would quietly run a narrower fan-out
+    // than was asked for, so it fails instead. A dry run launches nothing, so it
+    // only warns.
+    if !missing.is_empty() {
+        bail!(
+            "not installed on this host (not found on PATH): {}\n  \
+             Nothing was launched. Install it, or choose providers with --provider.",
+            missing.join(", ")
+        );
     }
 
     // Global lock
@@ -298,7 +367,7 @@ async fn main() -> Result<()> {
     // Codex run settings from project config: today just the stall timeout,
     // which is tunable (and disableable) because it rests on an empirical codex
     // property rather than a documented contract.
-    let codex_runtime = provider::CodexRuntime::from_config(cfg.defaults.stall_timeout_secs);
+    let codex_runtime = provider::CodexRuntime::from_config(cfg.stall_timeout_secs());
 
     // Spawn all providers with staggered launches to avoid rate limits
     let stagger = std::time::Duration::from_secs(cli.stagger);
@@ -318,26 +387,17 @@ async fn main() -> Result<()> {
         handle: tokio::task::JoinHandle<TaskOutcome>,
     }
     let mut pending: Vec<PendingResult> = Vec::new();
-    let mut warned_unavailable = std::collections::HashSet::new();
     let mut launch_count = 0u32;
 
-    for arch_name in &archetypes_to_run {
-        let prime = &cfg.archetypes[*arch_name];
+    for (arch_name, prime) in &archetypes_to_run {
         let assembled = prompt::assemble(prime, &stdin_instructions);
 
         for prov_name in &providers_to_run {
-            if !provider::is_available(prov_name) {
-                if warned_unavailable.insert(prov_name.clone()) {
-                    eprintln!("warning: '{prov_name}' not found on PATH, skipping");
-                }
-                continue;
-            }
-
             // Profile overrides (validated above to exist when --profile is set).
             let profile = cli
                 .profile
                 .as_ref()
-                .and_then(|name| cfg.resolve_profile(&hostname, prov_name, name));
+                .and_then(|name| cfg.resolve_profile(prov_name, name));
             let model = profile.and_then(|p| p.model.clone());
             let effort = profile.and_then(|p| p.effort.clone());
             let sandbox = profile.and_then(|p| p.sandbox.clone());
@@ -360,7 +420,7 @@ async fn main() -> Result<()> {
             let prompt_for_audit = prompt.clone();
             let operator_prompt = stdin_instructions.clone();
             pending.push(PendingResult {
-                archetype: (*arch_name).to_string(),
+                archetype: arch_name.clone(),
                 prompt: prompt_for_audit,
                 operator_prompt,
                 env_keys,
@@ -466,13 +526,6 @@ async fn main() -> Result<()> {
         tokio::time::sleep(stagger * launch_count).await;
     }
     drop(lock_file);
-
-    if pending.is_empty() {
-        bail!(
-            "no providers available to run\n  \
-             Check that provider binaries are on PATH."
-        );
-    }
 
     // Collect results
     let mut results: Vec<(String, provider::ProviderResult)> = Vec::new();
@@ -716,9 +769,16 @@ async fn run_session_resume(
     }
 
     let stdin_instructions = input::read_stdin()?;
-    let project_root = config::load()
-        .map(|(_, root)| root)
-        .or_else(|_| std::env::current_dir().map_err(anyhow::Error::from))?;
+    // Loaded once, and a config that exists but does not parse is an error
+    // rather than treated as absent: it decides whether this resume's rows go
+    // to the private log, and a silent fallback would file a private project's
+    // turns in the public one. No `.review.toml` at all still works - a resume
+    // needs no prime or profile - with the rows keyed to the cwd.
+    let (cfg, found_root) = config::load_optional()?;
+    let project_root = match found_root {
+        Some(ref root) => root.clone(),
+        None => std::env::current_dir()?,
+    };
 
     if dry_run {
         eprintln!("session: {session_id}");
@@ -732,14 +792,10 @@ async fn run_session_resume(
         bail!("'{provider_name}' not found on PATH");
     }
 
-    // `--session` bypasses .review.toml for prompt/profile purposes, but the
+    // `--session` bypasses the config for prompt/profile purposes, but the
     // stall timeout is a safety setting rather than a prompt input, so it is
-    // still honoured when a config happens to be present.
-    let codex_runtime = provider::CodexRuntime::from_config(
-        config::load()
-            .ok()
-            .and_then(|(cfg, _)| cfg.defaults.stall_timeout_secs),
-    );
+    // still honoured.
+    let codex_runtime = provider::CodexRuntime::from_config(cfg.stall_timeout_secs());
 
     // Cache-age gate. The sidecar tells us how long it's been since the session
     // last ended; past ~55 minutes (the realistic cap on Anthropic's prompt
@@ -836,13 +892,13 @@ async fn run_session_resume(
         }
     };
 
-    // Resolve audit_id/private for the logs. Load config opportunistically (and
-    // persist a generated id when a config exists), but fall back so logging
-    // works even without a .review.toml - otherwise a successful resume in a
-    // config-less dir would never be recorded and would soon be refused as stale.
-    let (audit_id, private) = match config::load() {
-        Ok((mut cfg, root)) => {
-            let id = match cfg.audit.id.take() {
+    // Resolve audit_id/private for the logs, persisting a generated id when a
+    // project config exists. Without one, logging still happens - otherwise a
+    // successful resume in a config-less dir would never be recorded and would
+    // soon be refused as stale.
+    let (audit_id, private) = match found_root {
+        Some(ref root) => {
+            let id = match cfg.audit.id.clone() {
                 Some(id) => id,
                 None => {
                     let id = config::generate_short_id();
@@ -852,7 +908,7 @@ async fn run_session_resume(
             };
             (id, cfg.audit.private)
         }
-        Err(_) => (config::generate_short_id(), false),
+        None => (config::generate_short_id(), false),
     };
 
     let digest_summary = result.digest.as_ref().map(provider::Digest::summary);
@@ -1123,9 +1179,12 @@ fn run_sessions(all: bool, limit: usize) -> Result<()> {
     let project_filter: Option<String> = if all {
         None
     } else {
-        let root = config::load()
-            .map(|(_, root)| root)
-            .or_else(|_| std::env::current_dir().map_err(anyhow::Error::from))?;
+        // Only which project we are in matters here, so nothing is parsed: a
+        // broken global config must not stop the operator listing sessions.
+        let root = match config::project_root()? {
+            Some(root) => root,
+            None => std::env::current_dir()?,
+        };
         Some(root.to_string_lossy().into_owned())
     };
 

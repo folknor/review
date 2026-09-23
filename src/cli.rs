@@ -1,20 +1,33 @@
 use clap::{CommandFactory, Parser, Subcommand};
 
 const AFTER_HELP: &str = "\
-Archetypes are named reviewer personas defined under [archetypes] in
-.review.toml (name = priming prompt). Groups fan out to multiple archetypes
-(defined under [_groups]). Use \"all\" to fan out to every configured archetype.
+Settings resolve from the command line, then the project's .review.toml, then
+the global config ($XDG_CONFIG_HOME/review/config.toml, else
+~/.config/review/config.toml). Both files share one format. `review config`
+prints the effective result and where each value came from.
+
+Archetypes are optional priming prompts defined under [archetypes] (name =
+prompt). Without one, stdin is sent unchanged. Groups fan out to multiple
+archetypes (defined under [_groups]). Use \"all\" to fan out to every
+configured archetype.
 
 Providers: claude, codex, grok. Providers come from --provider, or
-[_defaults].providers when --provider is omitted.
+[_defaults].providers when --provider is omitted. A provider that is not
+installed fails the run before anything launches.
 
-Each run starts a fresh session, prepends the archetype's priming prompt, and
-lets the agent fetch code itself. For all three providers the new session ID is
-printed above the response so you can follow up while the cache is warm via
---session.
+Profiles are [<provider>.<profile>] tables selected with --profile. A project
+profile replaces a global one of the same name entirely. Legacy
+[<host>.<provider>.<profile>] tables still apply on the host they name, and win
+over a hostless table in the same file.
+
+Each run starts a fresh session and lets the agent fetch code itself. For all
+three providers the new session ID is printed above the response so you can
+follow up while the cache is warm via --session.
 
 Examples:
   review init                                              Create a .review.toml
+  review config --json                                     Effective config, for scripts
+  echo \"what does foo() do?\" | review --profile deep               No archetype: stdin as-is
   echo \"review staged changes\" | review security                   Send to a security session
   echo \"full review please\" | review all                           Fan out to all archetypes
   echo \"review please\" | review security,bugs,arch                 Multiple archetypes
@@ -36,7 +49,7 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Archetype, group, or "all"
+    /// Archetype, group, or "all". Omit to send stdin unchanged.
     #[arg(help_heading = "Archetype")]
     pub archetype: Option<String>,
 
@@ -44,13 +57,14 @@ pub struct Cli {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Apply a named profile's model/effort/env overrides. Resolved per launched
-    /// provider from [<host>.<provider>.<profile>] in .review.toml.
+    /// Apply a named profile's model/effort/sandbox/env overrides. Resolved per
+    /// launched provider from [<provider>.<profile>], project config first, then
+    /// global.
     #[arg(long, value_name = "NAME")]
     pub profile: Option<String>,
 
-    /// Resume a specific session ID (no prime prepended).
-    /// Requires a single --provider.
+    /// Resume a specific session ID (no prime prepended). The provider is
+    /// inferred from the session record when --provider is omitted.
     #[arg(long, value_name = "ID")]
     pub session: Option<String>,
 
@@ -76,6 +90,14 @@ impl Cli {
 pub enum Command {
     /// Create a starter .review.toml in the current directory
     Init,
+
+    /// Show the effective configuration: archetypes, groups, providers (and
+    /// whether each is installed), and profiles, each with the file it came from
+    Config {
+        /// Machine-readable output, for orchestrators
+        #[arg(long)]
+        json: bool,
+    },
 
     /// List recent sessions, or show one session's artifacts by ID
     Sessions {

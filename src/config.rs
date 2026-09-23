@@ -1,6 +1,12 @@
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod config_tests;
+
 use anyhow::{Result, bail};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::PathBuf;
 
 const CONFIG_FILENAME: &str = ".review.toml";
 pub const KNOWN_PROVIDERS: &[&str] = &["claude", "codex", "grok"];
@@ -50,24 +56,47 @@ pub fn sandbox_for(provider: &str, sandbox: &str) -> String {
 }
 
 /// Names that can't be archetypes or groups because the CLI routes them
-/// elsewhere: `all` (fan-out keyword) and the clap subcommands (`init`,
-/// `sessions`, plus the auto-generated `help`). Without this guard such a
-/// config entry parses fine but is unreachable - clap intercepts the name.
-pub const RESERVED_NAMES: &[&str] = &["all", "init", "sessions", "help"];
+/// elsewhere: `all` (fan-out keyword) and the clap subcommands, plus the
+/// auto-generated `help`. Without this guard such a config entry parses fine but
+/// is unreachable - clap intercepts the name. Keep in step with `cli::Command`.
+pub const RESERVED_NAMES: &[&str] = &["all", "init", "sessions", "incidents", "config", "help"];
 
-#[derive(Debug, Default, Deserialize)]
+/// Which file a resolved value came from.
+///
+/// Resolution is POSIX-tool style: the command line beats the project's
+/// `.review.toml`, which beats the operator's global config. Nothing is built
+/// in. The split exists because the two files answer different questions: a
+/// project owns its domain archetypes, while *which model serves a tier* is the
+/// operator's current opinion, which changes with every model release and used
+/// to be restated per project, per host, per tier until nobody could keep up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layer {
+    Local,
+    Global,
+}
+
+impl Layer {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Layer::Local => "local",
+            Layer::Global => "global",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct AuditConfig {
     #[serde(default)]
     pub private: bool,
     pub id: Option<String>,
 }
 
-/// Project-wide defaults under [_defaults]. `providers` is the provider list
-/// used when --provider is omitted.
-#[derive(Debug, Default, Deserialize)]
+/// Defaults under `[_defaults]`. Each field is `Option` so an absent key falls
+/// through to the next layer while a present one - even an empty list - wins.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct DefaultsConfig {
-    #[serde(default)]
-    pub providers: Vec<String>,
+    /// The provider list used when `--provider` is omitted.
+    pub providers: Option<Vec<String>>,
     /// Seconds of rollout silence, with no final answer written, after which a
     /// codex run is treated as stalled: killed, bundled, and reported as a
     /// failure. `0` disables the check; omitted uses the built-in default
@@ -75,38 +104,19 @@ pub struct DefaultsConfig {
     ///
     /// This is a genuine timeout resting on an *empirical* property of codex -
     /// that it wakes itself every few minutes and cannot stay silent - so it is
-    /// deliberately tunable per project, and switchable off, in case a future
-    /// codex changes cadence. codex-only; claude has no rollout to watch.
-    #[serde(default)]
+    /// deliberately tunable, and switchable off, in case a future codex changes
+    /// cadence. codex-only; claude has no rollout to watch.
     pub stall_timeout_secs: Option<u64>,
-}
-
-#[derive(Debug)]
-pub struct ReviewConfig {
-    pub archetypes: BTreeMap<String, String>,
-    pub groups: BTreeMap<String, Vec<String>>,
-    pub audit: AuditConfig,
-    pub defaults: DefaultsConfig,
-    pub hosts: BTreeMap<String, HostConfig>,
-}
-
-/// Per-host config: maps provider name → its named profiles.
-#[derive(Debug, Clone, Deserialize)]
-pub struct HostConfig {
-    #[serde(flatten)]
-    pub providers: BTreeMap<String, ProviderProfiles>,
-}
-
-/// Per-provider config: maps profile name → profile settings.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ProviderProfiles {
-    #[serde(flatten)]
-    pub profiles: BTreeMap<String, Profile>,
 }
 
 /// A named settings profile: optional model, effort, sandbox, and env overrides
 /// applied to a provider invocation when selected via `--profile`.
+///
+/// Unknown keys are an error. A profile wins whole, so a project profile with a
+/// misspelled key (`modle = ...`) would otherwise parse as an empty profile and
+/// silently discard the global definition it replaces - model, sandbox and all.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Profile {
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -128,28 +138,129 @@ pub struct Profile {
     /// this covers what a particular project needs beyond that - a data
     /// directory, a sibling checkout, a generated-asset cache.
     ///
-    /// Per-profile, which is already per-host, so a path that exists on one
-    /// machine cannot leak into a run on another. Ignored unless the profile's
-    /// `sandbox` is `workspace-write`, because widening a `read-only` profile
-    /// would contradict the only thing that profile promises.
+    /// Ignored unless the profile's `sandbox` is `workspace-write`, because
+    /// widening a `read-only` profile would contradict the only thing that
+    /// profile promises. `~`, `$VAR` and `${VAR}` expand, which is what lets one
+    /// hostless profile serve hosts with different layouts.
     #[serde(default)]
     pub writable_roots: Vec<String>,
 }
 
+/// provider -> profile name -> profile.
+type ProfileTables = BTreeMap<String, BTreeMap<String, Profile>>;
+
+/// One config file, parsed and checked on its own but not yet resolved against
+/// the other layer.
+#[derive(Debug, Default)]
+pub struct ConfigFile {
+    pub archetypes: BTreeMap<String, String>,
+    pub groups: BTreeMap<String, Vec<String>>,
+    pub audit: AuditConfig,
+    pub defaults: DefaultsConfig,
+    /// `[<provider>.<profile>]`.
+    pub profiles: ProfileTables,
+    /// Legacy `[<host>.<provider>.<profile>]`, keyed by host. Still parsed so
+    /// existing files need no edit; for the host it names, it beats a hostless
+    /// profile of the same name in the same file.
+    pub hosts: BTreeMap<String, ProfileTables>,
+}
+
+/// A resolved value plus the layer and table it came from.
+#[derive(Debug, Clone)]
+pub struct Sourced<T> {
+    pub value: T,
+    pub layer: Layer,
+    /// The table that supplied it, as written in the file (`[_defaults]`,
+    /// `[codex.deep]`, `[plantasjen.codex.deep]`).
+    pub table: String,
+}
+
+/// One definition of a profile. A legacy host-scoped one carries its host.
+#[derive(Debug, Clone)]
+pub struct ProfileDef {
+    pub profile: Profile,
+    pub layer: Layer,
+    pub table: String,
+    pub host: Option<String>,
+}
+
+/// Every definition of one `(provider, profile)` visible from this host, in
+/// precedence order. The first wins **whole** - a winning profile replaces the
+/// others outright rather than merging field by field, so no field of a run can
+/// come from a table that did not mention it. The rest are kept so `review
+/// config` can show what a stale override is hiding.
+#[derive(Debug, Clone)]
+pub struct ProfileEntry {
+    pub effective: ProfileDef,
+    pub shadowed: Vec<ProfileDef>,
+}
+
+/// The files that were read to build a `ReviewConfig`.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigFiles {
+    /// The project's `.review.toml`. `None` only from `load_optional` outside a
+    /// project, which `review config` uses to show the global layer anyway.
+    pub local: Option<PathBuf>,
+    /// Where the global config is looked for. `None` when neither
+    /// `XDG_CONFIG_HOME` nor `HOME` names a usable directory.
+    pub global: Option<PathBuf>,
+    /// Whether that global file existed and was read.
+    pub global_loaded: bool,
+}
+
+/// The effective configuration: local and global layers resolved, for this
+/// host.
+#[derive(Debug)]
+pub struct ReviewConfig {
+    pub archetypes: BTreeMap<String, Sourced<String>>,
+    pub groups: BTreeMap<String, Sourced<Vec<String>>>,
+    /// Always the project's: an audit id identifies a project.
+    pub audit: AuditConfig,
+    pub providers: Option<Sourced<Vec<String>>>,
+    pub stall_timeout_secs: Option<Sourced<u64>>,
+    /// provider -> profile name -> entry.
+    pub profiles: BTreeMap<String, BTreeMap<String, ProfileEntry>>,
+    pub hostname: String,
+    pub files: ConfigFiles,
+}
+
 impl ReviewConfig {
-    /// Resolve a `[host.provider.profile]` settings block, if present.
-    pub fn resolve_profile(
-        &self,
-        hostname: &str,
-        provider: &str,
-        profile: &str,
-    ) -> Option<&Profile> {
-        self.hosts
-            .get(hostname)?
-            .providers
+    /// The effective profile for `provider`, if any layer defines it.
+    pub fn resolve_profile(&self, provider: &str, profile: &str) -> Option<&Profile> {
+        self.profiles
             .get(provider)?
-            .profiles
             .get(profile)
+            .map(|e| &e.effective.profile)
+    }
+
+    pub fn archetype(&self, name: &str) -> Option<&str> {
+        self.archetypes.get(name).map(|s| s.value.as_str())
+    }
+
+    pub fn default_providers(&self) -> Option<&[String]> {
+        self.providers.as_ref().map(|s| s.value.as_slice())
+    }
+
+    pub fn stall_timeout_secs(&self) -> Option<u64> {
+        self.stall_timeout_secs.as_ref().map(|s| s.value)
+    }
+
+    /// Every file that was consulted, for error messages about something no
+    /// layer defines.
+    pub fn searched(&self) -> String {
+        let mut parts = vec![match self.files.local {
+            Some(ref l) => l.display().to_string(),
+            None => format!("(no {CONFIG_FILENAME})"),
+        }];
+        if let Some(ref g) = self.files.global {
+            let absent = if self.files.global_loaded {
+                ""
+            } else {
+                " (absent)"
+            };
+            parts.push(format!("{}{absent}", g.display()));
+        }
+        parts.join(", ")
     }
 }
 
@@ -204,182 +315,467 @@ pub fn generate_uuid() -> String {
         })
 }
 
-pub fn load() -> Result<(ReviewConfig, std::path::PathBuf)> {
-    let path = find_config()?;
-    let project_root = path
-        .parent()
-        .expect("config file has parent dir")
-        .to_path_buf();
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
-    let config = parse(&raw)?;
-    Ok((config, project_root))
+/// Where the operator's global config lives: `$XDG_CONFIG_HOME/review/config.toml`,
+/// else `$HOME/.config/review/config.toml`.
+pub fn global_config_path() -> Option<PathBuf> {
+    global_config_path_from(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
 }
 
-fn find_config() -> Result<std::path::PathBuf> {
+/// A relative `XDG_CONFIG_HOME` or `HOME` is ignored, as the XDG spec requires
+/// for the former - either would otherwise resolve against whatever directory
+/// `review` was launched from, making the global config a per-directory one.
+fn global_config_path_from(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
+    let base = match xdg.map(PathBuf::from).filter(|p| p.is_absolute()) {
+        Some(p) => p,
+        None => home
+            .map(PathBuf::from)
+            .filter(|h| h.is_absolute())?
+            .join(".config"),
+    };
+    Some(base.join("review").join("config.toml"))
+}
+
+/// Load the project's `.review.toml` (required: it carries the audit id) and
+/// the global config (optional), and resolve them for this host.
+pub fn load() -> Result<(ReviewConfig, PathBuf)> {
+    let local_path = match locate_config()? {
+        Located::Found(path) => path,
+        Located::Missing(why) => bail!("{why}"),
+    };
+    let project_root = project_root_of(&local_path)?;
+    Ok((load_layers(Some(local_path))?, project_root))
+}
+
+/// Like `load`, but a missing `.review.toml` is not an error: the config is the
+/// global layer alone and the project root is `None`. A file that exists but
+/// does not parse still is - callers use this to decide things like whether a
+/// run's logs are private, and silently treating a broken config as an absent
+/// one would downgrade a private project to the public log.
+pub fn load_optional() -> Result<(ReviewConfig, Option<PathBuf>)> {
+    match locate_config()? {
+        Located::Found(path) => {
+            let root = project_root_of(&path)?;
+            Ok((load_layers(Some(path))?, Some(root)))
+        }
+        Located::Missing(_) => Ok((load_layers(None)?, None)),
+    }
+}
+
+/// The project root - the directory holding `.review.toml` - without parsing
+/// anything, for callers that only need to know which project they are in.
+pub fn project_root() -> Result<Option<PathBuf>> {
+    match locate_config()? {
+        Located::Found(path) => Ok(Some(project_root_of(&path)?)),
+        Located::Missing(_) => Ok(None),
+    }
+}
+
+fn project_root_of(local_path: &std::path::Path) -> Result<PathBuf> {
+    local_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", local_path.display()))
+}
+
+fn load_layers(local_path: Option<PathBuf>) -> Result<ReviewConfig> {
+    let local = match local_path {
+        Some(ref p) => {
+            let raw = std::fs::read_to_string(p)
+                .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", p.display()))?;
+            parse_file(&raw, &p.display().to_string(), Layer::Local)?
+        }
+        None => ConfigFile::default(),
+    };
+
+    let global_path = global_config_path();
+    let global = match global_path {
+        Some(ref p) => match std::fs::read_to_string(p) {
+            Ok(raw) => Some(parse_file(&raw, &p.display().to_string(), Layer::Global)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => bail!("failed to read {}: {e}", p.display()),
+        },
+        None => None,
+    };
+    let global_loaded = global.is_some();
+
+    let mut cfg = resolve(local, global, &hostname())?;
+    cfg.files = ConfigFiles {
+        local: local_path,
+        global: global_path,
+        global_loaded,
+    };
+    Ok(cfg)
+}
+
+enum Located {
+    Found(PathBuf),
+    /// Not found; carries the message saying where the search stopped.
+    Missing(String),
+}
+
+fn locate_config() -> Result<Located> {
     let mut dir = std::env::current_dir()
         .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
 
     loop {
         let candidate = dir.join(CONFIG_FILENAME);
         if candidate.exists() {
-            return Ok(candidate);
+            return Ok(Located::Found(candidate));
         }
         if dir.join(".git").exists() {
-            bail!(
+            return Ok(Located::Missing(format!(
                 "no {CONFIG_FILENAME} found (searched up to git root: {})\n\n\
                  Run `review init` to create one.",
                 dir.display()
-            );
+            )));
         }
         if !dir.pop() {
-            bail!(
+            return Ok(Located::Missing(format!(
                 "no {CONFIG_FILENAME} found in current or parent directories\n\n\
                  Run `review init` to create one."
-            );
+            )));
         }
     }
 }
 
-pub fn parse(raw: &str) -> Result<ReviewConfig> {
+fn unknown_provider_hint() -> String {
+    format!("supported: {}", KNOWN_PROVIDERS.join(", "))
+}
+
+/// Parse one config file. `origin` names it in errors. Checks everything that
+/// can be checked within the file alone; cross-file checks (group members,
+/// group/archetype name clashes) happen in `resolve`, because a project's group
+/// may name a global archetype.
+pub fn parse_file(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile> {
     // Parse to a table first, then peel off the reserved sections by name.
-    // Everything left over is a hostname table. This avoids serde `flatten`,
-    // which does not coexist with a sibling named field (`archetypes`).
-    let mut table: toml::Table = toml::from_str(raw)
-        .map_err(|e| anyhow::anyhow!("failed to parse {CONFIG_FILENAME}: {e}"))?;
+    // Everything left over is a provider table or a legacy host table. This
+    // avoids serde `flatten`, which does not coexist with a sibling named field
+    // (`archetypes`).
+    let mut table: toml::Table =
+        toml::from_str(raw).map_err(|e| anyhow::anyhow!("failed to parse {origin}: {e}"))?;
 
     let groups: BTreeMap<String, Vec<String>> = match table.remove("_groups") {
         Some(v) => v
             .try_into()
-            .map_err(|e| anyhow::anyhow!("[_groups] in {CONFIG_FILENAME}: {e}"))?,
+            .map_err(|e| anyhow::anyhow!("[_groups] in {origin}: {e}"))?,
         None => BTreeMap::new(),
     };
     let audit: AuditConfig = match table.remove("_audit") {
+        Some(_) if layer == Layer::Global => bail!(
+            "[_audit] in {origin}: the audit block identifies a project, so it belongs \
+             in that project's {CONFIG_FILENAME}, not in the global config"
+        ),
         Some(v) => v
             .try_into()
-            .map_err(|e| anyhow::anyhow!("[_audit] in {CONFIG_FILENAME}: {e}"))?,
+            .map_err(|e| anyhow::anyhow!("[_audit] in {origin}: {e}"))?,
         None => AuditConfig::default(),
     };
     let defaults: DefaultsConfig = match table.remove("_defaults") {
         Some(v) => v
             .try_into()
-            .map_err(|e| anyhow::anyhow!("[_defaults] in {CONFIG_FILENAME}: {e}"))?,
+            .map_err(|e| anyhow::anyhow!("[_defaults] in {origin}: {e}"))?,
         None => DefaultsConfig::default(),
     };
     let archetypes: BTreeMap<String, String> = match table.remove("archetypes") {
         Some(v) => v
             .try_into()
-            .map_err(|e| anyhow::anyhow!("[archetypes] in {CONFIG_FILENAME}: {e}"))?,
+            .map_err(|e| anyhow::anyhow!("[archetypes] in {origin}: {e}"))?,
         None => BTreeMap::new(),
     };
 
-    // Remaining top-level tables are hostname configs.
-    let mut hosts: BTreeMap<String, HostConfig> = BTreeMap::new();
+    // Remaining top-level tables: a known provider name is a hostless
+    // `[<provider>.<profile>]` table; anything else is a legacy host.
+    let mut profiles: ProfileTables = BTreeMap::new();
+    let mut hosts: BTreeMap<String, ProfileTables> = BTreeMap::new();
     for (key, val) in table {
-        let host: HostConfig = val
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("[{key}.*] in {CONFIG_FILENAME}: {e}"))?;
-        hosts.insert(key, host);
-    }
-
-    // Reserved names
-    for &reserved in RESERVED_NAMES {
-        if archetypes.contains_key(reserved) {
-            bail!(
-                "'{reserved}' is a reserved name and cannot be used as an archetype in {CONFIG_FILENAME}"
-            );
+        let toml::Value::Table(inner) = val else {
+            bail!("unexpected top-level key '{key}' in {origin}: expected a table");
+        };
+        if KNOWN_PROVIDERS.contains(&key.as_str()) {
+            let parsed = parse_profiles(inner, &key, origin)?;
+            profiles.insert(key, parsed);
+            continue;
         }
-    }
-
-    // Validate group names
-    for name in groups.keys() {
-        for &reserved in RESERVED_NAMES {
-            if name == reserved {
+        let mut host_profiles: ProfileTables = BTreeMap::new();
+        for (prov, pv) in inner {
+            if !KNOWN_PROVIDERS.contains(&prov.as_str()) {
                 bail!(
-                    "'{reserved}' is a reserved name and cannot be used as a group in {CONFIG_FILENAME}"
+                    "unknown provider '{prov}' in [{key}.{prov}.*] in {origin}\n  \
+                     {}\n  \
+                     A top-level table is either a provider ([<provider>.<profile>]) \
+                     or a legacy host ([<host>.<provider>.<profile>]).",
+                    unknown_provider_hint()
                 );
             }
+            let toml::Value::Table(pt) = pv else {
+                bail!("[{key}.{prov}] in {origin}: expected a table of profiles");
+            };
+            let prefix = format!("{}.{prov}", toml_key(&key));
+            let parsed = parse_profiles(pt, &prefix, origin)?;
+            host_profiles.insert(prov, parsed);
         }
-        if archetypes.contains_key(name) {
-            bail!(
-                "group '{name}' conflicts with an archetype of the same name in {CONFIG_FILENAME}"
-            );
-        }
+        hosts.insert(key, host_profiles);
     }
 
-    // Validate group members: must exist, no duplicates, not empty
-    for (group_name, members) in &groups {
+    for name in archetypes.keys() {
+        if RESERVED_NAMES.contains(&name.as_str()) {
+            bail!("'{name}' is a reserved name and cannot be used as an archetype in {origin}");
+        }
+    }
+    for (name, members) in &groups {
+        if RESERVED_NAMES.contains(&name.as_str()) {
+            bail!("'{name}' is a reserved name and cannot be used as a group in {origin}");
+        }
         if members.is_empty() {
-            bail!("group '{group_name}' is empty in {CONFIG_FILENAME}");
+            bail!("group '{name}' is empty in {origin}");
         }
         let mut seen = std::collections::HashSet::new();
         for member in members {
-            if !archetypes.contains_key(member) {
+            if !seen.insert(member) {
+                bail!("group '{name}' contains duplicate archetype '{member}' in {origin}");
+            }
+            // A global group may only name global archetypes. The global file
+            // is read in every project, so a group leaning on one project's
+            // archetype would be an error everywhere else - and a global group
+            // shadowed by a project group is checked here or nowhere.
+            if layer == Layer::Global && !archetypes.contains_key(member) {
                 bail!(
-                    "group '{group_name}' references unknown archetype '{member}' in {CONFIG_FILENAME}"
+                    "group '{name}' references archetype '{member}', which {origin} does not \
+                     define\n  A global group may only name global archetypes."
                 );
             }
-            if !seen.insert(member) {
+        }
+    }
+    if let Some(ref providers) = defaults.providers {
+        for prov in providers {
+            if !KNOWN_PROVIDERS.contains(&prov.as_str()) {
                 bail!(
-                    "group '{group_name}' contains duplicate archetype '{member}' in {CONFIG_FILENAME}"
+                    "unknown provider '{prov}' in [_defaults].providers in {origin}\n  {}",
+                    unknown_provider_hint()
                 );
             }
         }
     }
 
-    // Validate provider names in host profile tables.
-    for (host, host_cfg) in &hosts {
-        for prov_name in host_cfg.providers.keys() {
-            if !KNOWN_PROVIDERS.contains(&prov_name.as_str()) {
+    Ok(ConfigFile {
+        archetypes,
+        groups,
+        audit,
+        defaults,
+        profiles,
+        hosts,
+    })
+}
+
+fn parse_profiles(t: toml::Table, prefix: &str, origin: &str) -> Result<BTreeMap<String, Profile>> {
+    let mut out = BTreeMap::new();
+    for (name, v) in t {
+        let profile: Profile = v
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("[{prefix}.{name}] in {origin}: {e}"))?;
+        out.insert(name, profile);
+    }
+    Ok(out)
+}
+
+/// Resolve the local and (optional) global layers for `hostname`.
+///
+/// Everything is first-definition-wins over the precedence order local, then
+/// global; within one file a legacy host table for this host beats a hostless
+/// table. Profiles and lists win whole - nothing is merged field by field or
+/// element by element.
+pub fn resolve(
+    local: ConfigFile,
+    global: Option<ConfigFile>,
+    hostname: &str,
+) -> Result<ReviewConfig> {
+    let audit = local.audit.clone();
+    let mut layers: Vec<(Layer, ConfigFile)> = vec![(Layer::Local, local)];
+    if let Some(g) = global {
+        layers.push((Layer::Global, g));
+    }
+
+    let mut archetypes: BTreeMap<String, Sourced<String>> = BTreeMap::new();
+    let mut groups: BTreeMap<String, Sourced<Vec<String>>> = BTreeMap::new();
+    let mut providers: Option<Sourced<Vec<String>>> = None;
+    let mut stall_timeout_secs: Option<Sourced<u64>> = None;
+    let mut defs: BTreeMap<String, BTreeMap<String, Vec<ProfileDef>>> = BTreeMap::new();
+
+    for (layer, file) in layers {
+        for (name, prime) in file.archetypes {
+            archetypes.entry(name).or_insert_with(|| Sourced {
+                value: prime,
+                layer,
+                table: "[archetypes]".into(),
+            });
+        }
+        for (name, members) in file.groups {
+            groups.entry(name).or_insert_with(|| Sourced {
+                value: members,
+                layer,
+                table: "[_groups]".into(),
+            });
+        }
+        if providers.is_none()
+            && let Some(p) = file.defaults.providers
+        {
+            providers = Some(Sourced {
+                value: p,
+                layer,
+                table: "[_defaults]".into(),
+            });
+        }
+        if stall_timeout_secs.is_none()
+            && let Some(s) = file.defaults.stall_timeout_secs
+        {
+            stall_timeout_secs = Some(Sourced {
+                value: s,
+                layer,
+                table: "[_defaults]".into(),
+            });
+        }
+
+        // Host tables first: pushing in precedence order makes the first
+        // definition of each profile the effective one.
+        let mut hosts = file.hosts;
+        if let Some(host_tables) = hosts.remove(hostname) {
+            for (prov, profiles) in host_tables {
+                for (name, profile) in profiles {
+                    let table = format!("[{}.{prov}.{name}]", toml_key(hostname));
+                    defs.entry(prov.clone())
+                        .or_default()
+                        .entry(name)
+                        .or_default()
+                        .push(ProfileDef {
+                            profile,
+                            layer,
+                            table,
+                            host: Some(hostname.to_string()),
+                        });
+                }
+            }
+        }
+        for (prov, profiles) in file.profiles {
+            for (name, profile) in profiles {
+                let table = format!("[{prov}.{name}]");
+                defs.entry(prov.clone())
+                    .or_default()
+                    .entry(name)
+                    .or_default()
+                    .push(ProfileDef {
+                        profile,
+                        layer,
+                        table,
+                        host: None,
+                    });
+            }
+        }
+    }
+
+    // A group and an archetype share the one positional name the CLI resolves.
+    // Across files the project wins, as it does for every other name: adding a
+    // group to the global file must not break a project that happens to have an
+    // archetype of that name. Within one file there is no winner to pick.
+    let clashes: Vec<String> = groups
+        .keys()
+        .filter(|n| archetypes.contains_key(*n))
+        .cloned()
+        .collect();
+    let mut hidden = std::collections::BTreeSet::new();
+    for name in clashes {
+        let (g, a) = (groups[&name].layer, archetypes[&name].layer);
+        if g == a {
+            bail!(
+                "group '{name}' conflicts with an archetype of the same name ({} config)",
+                g.as_str()
+            );
+        }
+        if g == Layer::Global {
+            groups.remove(&name);
+        } else {
+            archetypes.remove(&name);
+        }
+        hidden.insert(name);
+    }
+
+    for (name, group) in &groups {
+        for member in &group.value {
+            if !archetypes.contains_key(member) {
+                let why = if hidden.contains(member) {
+                    " (a project group of that name hides the global archetype)"
+                } else {
+                    ""
+                };
                 bail!(
-                    "unknown provider '{prov_name}' in [{host}.{prov_name}.*]\n  \
-                     supported: {}",
-                    KNOWN_PROVIDERS.join(", ")
+                    "group '{name}' ({} config) references unknown archetype '{member}'{why}",
+                    group.layer.as_str()
                 );
             }
         }
     }
-    for prov_name in &defaults.providers {
-        if !KNOWN_PROVIDERS.contains(&prov_name.as_str()) {
-            bail!(
-                "unknown provider '{prov_name}' in [_defaults].providers\n  \
-                 supported: {}",
-                KNOWN_PROVIDERS.join(", ")
-            );
-        }
-    }
+
+    let profiles = defs
+        .into_iter()
+        .map(|(prov, by_name)| {
+            let entries = by_name
+                .into_iter()
+                .filter_map(|(name, list)| {
+                    let mut defs = list.into_iter();
+                    let effective = defs.next()?;
+                    Some((
+                        name,
+                        ProfileEntry {
+                            effective,
+                            shadowed: defs.collect(),
+                        },
+                    ))
+                })
+                .collect();
+            (prov, entries)
+        })
+        .collect();
 
     Ok(ReviewConfig {
         archetypes,
         groups,
         audit,
-        defaults,
-        hosts,
+        providers,
+        stall_timeout_secs,
+        profiles,
+        hostname: hostname.to_string(),
+        files: ConfigFiles::default(),
     })
 }
 
 const INIT_TEMPLATE_PREFIX: &str = "\
-# Archetypes are reviewer personas: a name mapped to a priming prompt.
-# Any name works.
+# Project config for `review`. Everything here is optional except [_audit].
+# Settings resolve command line, then this file, then the operator's global
+# config (~/.config/review/config.toml, same format). Run `review config` to see
+# the effective result and where each value came from.
+#
+# Archetypes are priming prompts: a name mapped to text prepended to stdin.
+# A run without an archetype sends stdin unchanged.
 #
 # [archetypes]
 # security = \"You are a security expert for this project. Read the codebase.\"
-# bugs = \"You hunt for edge cases and correctness bugs.\"
 #
 # Providers to fan out to when --provider is omitted:
 # [_defaults]
-# providers = [\"claude\", \"codex\"]
+# providers = [\"codex\"]
 #
 # Groups fan out to multiple archetypes:
 # [_groups]
 # sweep = [\"security\", \"bugs\"]
 #
-# Named profiles carry per-provider model/effort/env overrides, selected with
-# --profile. Scoped by host . provider . profile:
-# [myhostname.claude.opus]
-# model = \"Opus 4.8\"
-# effort = \"medium\"
-# env = { ANTHROPIC_BASE_URL = \"http://localhost:8787\" }
+# Named profiles, selected with --profile, as [<provider>.<profile>]. A profile
+# here replaces a global profile of the same name entirely.
+# [codex.deep]
+# model = \"gpt-6-luna\"
+# effort = \"high\"
+# sandbox = \"read-only\"
 ";
 
 pub fn init() -> Result<()> {
@@ -391,7 +787,7 @@ pub fn init() -> Result<()> {
         bail!("{CONFIG_FILENAME} already exists in current directory");
     }
 
-    if let Ok(existing) = find_config() {
+    if let Located::Found(existing) = locate_config()? {
         bail!(
             "{CONFIG_FILENAME} already exists at {}\n  \
              Creating another here would shadow it.",
@@ -400,7 +796,7 @@ pub fn init() -> Result<()> {
     }
 
     let audit_id = generate_short_id();
-    let mut content = INIT_TEMPLATE_PREFIX.replace("myhostname", &toml_key(&hostname()));
+    let mut content = INIT_TEMPLATE_PREFIX.to_string();
     content.push_str(&format!("\n[_audit]\nid = \"{audit_id}\"\n"));
     std::fs::write(&path, content)
         .map_err(|e| anyhow::anyhow!("failed to write {CONFIG_FILENAME}: {e}"))?;
@@ -408,8 +804,8 @@ pub fn init() -> Result<()> {
     println!("Created {CONFIG_FILENAME}");
     println!();
     println!("Next steps:");
-    println!("  1. Define archetypes under [archetypes] and providers under [_defaults]");
-    println!("  2. Run: echo \"check for issues\" | review security");
+    println!("  1. Run `review config` to see what the global config already provides");
+    println!("  2. Run: echo \"check for issues\" | review --provider codex");
     Ok(())
 }
 
@@ -482,6 +878,12 @@ mod tests {
         }
     }
 
+    /// Parse a single local file and resolve it alone, as a project with no
+    /// global config would be.
+    fn local_only(raw: &str, host: &str) -> Result<ReviewConfig> {
+        resolve(parse_file(raw, "local", Layer::Local)?, None, host)
+    }
+
     #[test]
     fn parses_archetypes() {
         let raw = "\
@@ -489,14 +891,14 @@ mod tests {
 security = \"be a security expert\"
 bugs = \"find edge cases\"
 ";
-        let cfg = parse(raw).unwrap();
+        let cfg = local_only(raw, "h").unwrap();
         assert_eq!(cfg.archetypes.len(), 2);
-        assert_eq!(cfg.archetypes["security"], "be a security expert");
-        assert_eq!(cfg.archetypes["bugs"], "find edge cases");
+        assert_eq!(cfg.archetype("security"), Some("be a security expert"));
+        assert_eq!(cfg.archetype("bugs"), Some("find edge cases"));
     }
 
     #[test]
-    fn parses_profiles() {
+    fn parses_legacy_host_profiles() {
         let raw = "\
 [archetypes]
 bugs = \"find edge cases\"
@@ -511,9 +913,9 @@ model = \"gpt-5.6-terra\"
 effort = \"high\"
 sandbox = \"workspace-write\"
 ";
-        let cfg = parse(raw).unwrap();
+        let cfg = local_only(raw, "myhost").unwrap();
 
-        let opus = cfg.resolve_profile("myhost", "claude", "opus").unwrap();
+        let opus = cfg.resolve_profile("claude", "opus").unwrap();
         assert_eq!(opus.model.as_deref(), Some("Opus 4.8"));
         assert_eq!(opus.effort.as_deref(), Some("medium"));
         assert_eq!(opus.sandbox, None);
@@ -522,21 +924,38 @@ sandbox = \"workspace-write\"
             "http://localhost:8787"
         );
 
-        let implement = cfg.resolve_profile("myhost", "codex", "implement").unwrap();
+        let implement = cfg.resolve_profile("codex", "implement").unwrap();
         assert_eq!(implement.model.as_deref(), Some("gpt-5.6-terra"));
         assert_eq!(implement.effort.as_deref(), Some("high"));
         assert_eq!(implement.sandbox.as_deref(), Some("workspace-write"));
 
-        assert!(cfg.resolve_profile("myhost", "claude", "nope").is_none());
-        assert!(cfg.resolve_profile("otherhost", "claude", "opus").is_none());
+        assert!(cfg.resolve_profile("claude", "nope").is_none());
+
+        // Another host's tables do not apply here.
+        let other = local_only(raw, "otherhost").unwrap();
+        assert!(other.resolve_profile("claude", "opus").is_none());
+    }
+
+    #[test]
+    fn parses_hostless_profiles() {
+        let raw = "\
+[codex.deep]
+model = \"gpt-6-luna\"
+sandbox = \"read-only\"
+";
+        for host in ["a", "b"] {
+            let cfg = local_only(raw, host).unwrap();
+            let deep = cfg.resolve_profile("codex", "deep").unwrap();
+            assert_eq!(deep.model.as_deref(), Some("gpt-6-luna"));
+        }
     }
 
     #[test]
     fn empty_config_parses() {
-        let raw = "";
-        let cfg = parse(raw).unwrap();
+        let cfg = local_only("", "h").unwrap();
         assert!(cfg.archetypes.is_empty());
-        assert!(cfg.hosts.is_empty());
+        assert!(cfg.profiles.is_empty());
+        assert!(cfg.providers.is_none());
     }
 
     #[test]
@@ -548,27 +967,21 @@ bugs = \"x\"
 [myhost.gpt.fast]
 model = \"whatever\"
 ";
-        let result = parse(raw);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("unknown provider 'gpt'")
-        );
+        let err = local_only(raw, "myhost").unwrap_err().to_string();
+        assert!(err.contains("unknown provider 'gpt'"), "{err}");
     }
 
     #[test]
     fn parses_defaults_providers() {
         let raw = "\
-[archetypes]
-bugs = \"x\"
-
 [_defaults]
 providers = [\"claude\", \"codex\"]
 ";
-        let cfg = parse(raw).unwrap();
-        assert_eq!(cfg.defaults.providers, vec!["claude", "codex"]);
+        let cfg = local_only(raw, "h").unwrap();
+        assert_eq!(
+            cfg.default_providers().unwrap(),
+            &["claude".to_string(), "codex".to_string()]
+        );
     }
 
     #[test]
@@ -581,9 +994,9 @@ bugs = \"b\"
 [_groups]
 sweep = [\"security\", \"bugs\"]
 ";
-        let cfg = parse(raw).unwrap();
+        let cfg = local_only(raw, "h").unwrap();
         assert_eq!(cfg.groups.len(), 1);
-        assert_eq!(cfg.groups["sweep"], vec!["security", "bugs"]);
+        assert_eq!(cfg.groups["sweep"].value, vec!["security", "bugs"]);
     }
 
     #[test]
@@ -595,9 +1008,8 @@ security = \"a\"
 [_groups]
 sweep = [\"security\", \"nonexistent\"]
 ";
-        let result = parse(raw);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("nonexistent"));
+        let err = local_only(raw, "h").unwrap_err().to_string();
+        assert!(err.contains("nonexistent"), "{err}");
     }
 
     #[test]
@@ -609,27 +1021,23 @@ security = \"a\"
 [_groups]
 security = [\"security\"]
 ";
-        let result = parse(raw);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("conflicts"));
+        let err = local_only(raw, "h").unwrap_err().to_string();
+        assert!(err.contains("conflicts"), "{err}");
     }
 
     #[test]
     fn reserved_archetype_name_errors() {
-        let raw = "\
-[archetypes]
-all = \"a\"
-";
-        let result = parse(raw);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("reserved"));
+        let err = local_only("[archetypes]\nall = \"a\"\n", "h")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reserved"), "{err}");
     }
 
     #[test]
     fn subcommand_names_reserved_as_archetype() {
-        for name in ["sessions", "help", "init"] {
+        for name in ["sessions", "help", "init", "incidents", "config"] {
             let raw = format!("[archetypes]\n{name} = \"x\"\n");
-            let result = parse(&raw);
+            let result = local_only(&raw, "h");
             assert!(result.is_err(), "'{name}' should be reserved");
             assert!(result.unwrap_err().to_string().contains("reserved"));
         }
@@ -644,8 +1052,21 @@ bugs = \"x\"
 [_groups]
 sessions = [\"bugs\"]
 ";
-        let result = parse(raw);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("reserved"));
+        let err = local_only(raw, "h").unwrap_err().to_string();
+        assert!(err.contains("reserved"), "{err}");
+    }
+
+    #[test]
+    fn global_config_path_prefers_absolute_xdg() {
+        let p = global_config_path_from(Some("/x/cfg".into()), Some("/home/u".into()));
+        assert_eq!(p, Some(PathBuf::from("/x/cfg/review/config.toml")));
+        // Relative XDG_CONFIG_HOME is ignored per the XDG spec.
+        let p = global_config_path_from(Some("rel".into()), Some("/home/u".into()));
+        assert_eq!(p, Some(PathBuf::from("/home/u/.config/review/config.toml")));
+        assert_eq!(global_config_path_from(None, None), None);
+        assert_eq!(global_config_path_from(None, Some("".into())), None);
+        // A relative HOME would make the global config depend on the launch
+        // directory, the same reason a relative XDG_CONFIG_HOME is ignored.
+        assert_eq!(global_config_path_from(None, Some("rel".into())), None);
     }
 }

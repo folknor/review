@@ -7,3 +7,5 @@ target
 # Vendored upstream clones kept for investigation only - never ours to commit,
 # and must stay out of brokkr's tree-wide scans.
 /research/
+# Luna vs Sol model evaluation: one-off analysis scripts, run output and report.
+/notes/eval-luna-vs-sol/
