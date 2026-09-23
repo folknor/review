@@ -789,14 +789,14 @@ async fn run_session_resume(
     let codex_runtime = provider::CodexRuntime::from_config(cfg.stall_timeout_secs());
 
     // Cache-age gate. The sidecar tells us how long it's been since the session
-    // last ended; past ~55 minutes (the realistic cap on Anthropic's prompt
-    // cache TTL - 5 min default, ~1h with the right env vars) the cache is cold,
-    // and resuming means reprocessing the whole session prefix at full cost.
-    // Resuming is the *warm* follow-up path, so a cold resume is refused: do a
-    // fresh run with restated context instead. A row with no usable timestamp
-    // leaves the age unknown, and the resume proceeds rather than blocks.
+    // last ended; past the provider's cutoff (`timings::stale_session`: 27 min
+    // for codex, whose prompt cache lasts ~30 min, ~55 min otherwise) the cache
+    // is cold, and resuming means reprocessing the whole session prefix at full
+    // cost. Resuming is the *warm* follow-up path, so a cold resume is refused:
+    // do a fresh run with restated context instead. A row with no usable
+    // timestamp leaves the age unknown, and the resume proceeds rather than blocks.
     if let Some(age) = sessions::age_secs(&record) {
-        if age > timings::STALE_SESSION.as_secs() {
+        if age > timings::stale_session(provider_name).as_secs() {
             bail!(
                 "session last touched {} ago - its prompt cache is cold.\n  \
                  Resuming would reprocess the whole session prefix at full cost.\n  \

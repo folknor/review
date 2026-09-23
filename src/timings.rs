@@ -79,13 +79,26 @@ pub const SIGKILL_ESCALATION: Duration = Duration::from_secs(10);
 pub const SIGTERM_WINDOW: Duration = Duration::from_millis(250);
 
 /// How long since a session was last touched before `review resume` refuses to
-/// resume it.
+/// resume it, for providers without a cutoff of their own.
 ///
-/// Past this the provider's prompt cache is cold (5 min default, ~1h with the
-/// right env vars, so ~55 min is the realistic cap), and resuming means
-/// reprocessing the whole session prefix at full cost. `review resume` is the
-/// *warm* follow-up path; a cold resume should be a fresh run instead.
+/// Past this the provider's prompt cache is cold (Anthropic's is 5 min by
+/// default, ~1h with the right env vars, so ~55 min is the realistic cap), and
+/// resuming means reprocessing the whole session prefix at full cost.
+/// `review resume` is the *warm* follow-up path; a cold resume should be a
+/// fresh run instead.
 pub const STALE_SESSION: Duration = Duration::from_secs(55 * 60);
+
+/// Codex's cutoff: its prompt cache lasts ~30 min, so resumes are refused a few
+/// minutes short of that, for the same reason `STALE_SESSION` stops short of 1h.
+pub const STALE_SESSION_CODEX: Duration = Duration::from_secs(27 * 60);
+
+/// The stale-session cutoff for a resume of `provider`'s session.
+pub fn stale_session(provider: &str) -> Duration {
+    match provider {
+        "codex" => STALE_SESSION_CODEX,
+        _ => STALE_SESSION,
+    }
+}
 
 /// Default seconds between provider launches, to avoid rate limits. Overridable
 /// with `--stagger`; `0` disables.
@@ -118,5 +131,12 @@ mod tests {
     #[test]
     fn the_sigterm_window_is_shorter_than_the_escalation() {
         assert!(SIGTERM_WINDOW < SIGKILL_ESCALATION);
+    }
+
+    #[test]
+    fn codex_sessions_go_stale_sooner() {
+        assert_eq!(stale_session("codex"), Duration::from_secs(27 * 60));
+        assert_eq!(stale_session("claude"), STALE_SESSION);
+        assert_eq!(stale_session("grok"), STALE_SESSION);
     }
 }
