@@ -132,6 +132,35 @@ fn record_run(
     }
 }
 
+/// The archetype selection: `-a`, or the positional form it replaced.
+///
+/// The archetype used to be the positional argument, which put archetypes and
+/// subcommands in one namespace - every new subcommand silently shadowed any
+/// project's archetype of that name. As a flag it cannot collide. The positional
+/// form is still accepted, with a warning, so orchestration procedures written
+/// against it keep working until they are updated; a positional `bare` (the old
+/// way to say "no archetype") means none.
+fn resolve_archetype_arg(flag: Option<&str>, legacy: Option<&str>) -> Result<Option<String>> {
+    match (flag, legacy) {
+        (Some(_), Some(positional)) => {
+            bail!("archetype given twice: -a and a positional '{positional}'\n  Use -a only.")
+        }
+        (Some(a), None) => Ok(Some(a.to_string())),
+        (None, Some("bare")) => {
+            eprintln!("warning: `review bare` is now plain `review` - no -a means no archetype");
+            Ok(None)
+        }
+        // The name is not echoed back: this runs before the config is loaded,
+        // so a typo would be recommended verbatim (`use review -a secruity`).
+        // The unknown-archetype error that follows lists what is configured.
+        (None, Some(positional)) => {
+            eprintln!("warning: the archetype is now a flag - use `review -a <name>`");
+            Ok(Some(positional.to_string()))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Total wall clock, started before anything else runs. This deliberately
@@ -152,8 +181,12 @@ async fn main() -> Result<()> {
         return config::init();
     }
 
-    if let Some(cli::Command::Config { json }) = &cli.command {
-        return config_cmd::run(*json);
+    if matches!(cli.command, Some(cli::Command::Config)) {
+        return config_cmd::run();
+    }
+
+    if let Some(cli::Command::Resume { id, dry_run }) = &cli.command {
+        return run_session_resume(id, *dry_run, started).await;
     }
 
     if let Some(cli::Command::Sessions { id, all, limit }) = &cli.command {
@@ -167,25 +200,23 @@ async fn main() -> Result<()> {
         return run_incidents(*limit);
     }
 
-    let archetype_arg = cli.archetype.as_deref();
-
+    // Migration: `--session <ID>` is the old spelling of `review resume <ID>`.
+    // Everything that rode along with it is ignored rather than refused, so a
+    // procedure written against the old form keeps working until it is updated.
     if let Some(ref session_id) = cli.session {
-        if cli.profile.is_some() {
-            bail!(
-                "--session and --profile are mutually exclusive: a resumed session \
-                 bypasses .review.toml, so profile model/effort/sandbox/env overrides \
-                 can't be applied"
+        eprintln!("warning: `--session <ID>` is now `review resume <ID>`");
+        if cli.profile.is_some() || cli.provider.is_some() {
+            eprintln!(
+                "warning: --profile/--provider are ignored on a resume - the session \
+                 keeps its own provider and settings"
             );
         }
-        return run_session_resume(
-            archetype_arg.unwrap_or(BARE),
-            cli.provider.as_deref().unwrap_or(&[]),
-            session_id,
-            cli.dry_run,
-            started,
-        )
-        .await;
+        return run_session_resume(session_id, cli.dry_run, started).await;
     }
+
+    let archetype_arg =
+        resolve_archetype_arg(cli.archetype.as_deref(), cli.legacy_archetype.as_deref())?;
+    let archetype_arg = archetype_arg.as_deref();
 
     // A bare `review` - no arguments at all and nothing piped in - gets the help
     // text. Read before the config so this works outside a project too. With any
@@ -611,78 +642,43 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Decide which provider a `--session` resume should talk to.
+/// The provider a `review resume` talks to: the one the sidecar recorded for the
+/// session.
 ///
-/// A session belongs to exactly one provider, and the sidecar already records
-/// which. So `--provider` here is a *filter over a known answer*, not a
-/// declaration - which means the old rule ("exactly one `--provider`, or
-/// error") rejected two cases it had no reason to:
+/// A session belongs to exactly one provider, and the only place an operator
+/// gets a session ID from is `review`'s own output, whose run wrote that record.
+/// So there is nothing to ask for: no `--provider`, and no scanning provider
+/// session stores. No record means the session is not one this host's `review`
+/// created - another host's (whose provider store is not here either), one made
+/// outside `review`, or a lost log - and that is an error, not a guess.
 ///
-/// - **No `--provider` at all.** The answer is on record; asking the operator
-///   to restate it is busywork, and getting it wrong is an error we could
-///   simply not have.
-/// - **A list that contains the right one.** `--provider claude,codex` against
-///   a codex session is not ambiguous - only codex can resume it. This matters
-///   because the same flags otherwise carry over verbatim from the fresh run
-///   that created the session.
-///
-/// What remains an error is a genuine contradiction (a `--provider` the session
-/// does not belong to) or genuine ambiguity (several named providers and no
-/// record to choose between them).
-fn resolve_session_provider(requested: &[String], recorded: Option<&str>) -> Result<String> {
-    // `--provider codex,codex` names one provider, not two.
-    let mut wanted: Vec<&str> = Vec::new();
-    for p in requested {
-        if !wanted.contains(&p.as_str()) {
-            wanted.push(p.as_str());
-        }
-    }
-
-    let chosen: String = match (wanted.as_slice(), recorded) {
-        // Nothing requested: take the recorded owner.
-        ([], Some(rec)) => rec.to_string(),
-        ([], None) => bail!(
-            "--session requires --provider <name>\n  \
-             There is no sidecar record for this session, so the provider \
-             can't be inferred."
-        ),
-        // One requested, and it disagrees with the record: a real conflict.
-        // Resuming under the wrong provider cannot work, so refuse rather than
-        // guess which of the two the operator meant.
-        ([one], Some(rec)) if *one != rec => bail!(
-            "this session belongs to '{rec}', but --provider says '{one}'\n  \
-             A session can only be resumed by the provider that created it.\n  \
-             Drop --provider to use '{rec}'."
-        ),
-        ([one], _) => (*one).to_string(),
-        // Several requested and the record picks one out: not a conflict.
-        (many, Some(rec)) if many.contains(&rec) => rec.to_string(),
-        (many, Some(rec)) => bail!(
-            "session belongs to '{rec}', which is not among --provider {}\n  \
-             A session can only be resumed by the provider that created it.",
-            many.join(",")
-        ),
-        (many, None) => bail!(
-            "--session requires a single --provider, got {}\n  \
-             There is no sidecar record for this session, so the right one \
-             can't be inferred.",
-            many.join(",")
-        ),
-    };
-
-    if !config::KNOWN_PROVIDERS.contains(&chosen.as_str()) {
+/// A recorded provider is still validated, so a row naming a removed provider
+/// (kilo/opencode) cannot turn into an unrunnable invocation.
+fn resume_record(
+    session_id: &str,
+    record: Option<sessions::SessionRecord>,
+) -> Result<sessions::SessionRecord> {
+    let Some(record) = record else {
         bail!(
-            "unknown provider '{chosen}'\n  supported: {}",
+            "no record of session {session_id} on this host\n  \
+             `review sessions` lists the sessions this host's review runs created."
+        );
+    };
+    if !config::KNOWN_PROVIDERS.contains(&record.provider.as_str()) {
+        bail!(
+            "session {session_id} was recorded for provider '{}', which review no \
+             longer supports\n  supported: {}",
+            record.provider,
             config::KNOWN_PROVIDERS.join(", ")
         );
     }
-    Ok(chosen)
+    Ok(record)
 }
 
-/// What a `--session` resume launches with, taken from the session's own last
+/// What a `review resume` launches with, taken from the session's own last
 /// recorded run: sandbox level, writable roots, model and reasoning effort.
 ///
-/// `--session` carries no profile, and the runners default to `read-only`, so a
+/// A resume carries no profile, and the runners default to `read-only`, so a
 /// resume used to silently drop the permissions the session was created with: a
 /// `workspace-write` run that died mid-turn came back as a read-only resume that
 /// could not touch the files it had been editing, and the failure surfaced as
@@ -700,13 +696,17 @@ fn resolve_session_provider(requested: &[String], recorded: Option<&str>) -> Res
 ///
 /// Recorded levels are in the provider's own vocabulary, which `sandbox_for`
 /// maps identically for codex and passes through for grok's already-native
-/// names, so a round trip cannot change the level. No record, or a record from
-/// another provider, inherits nothing and leaves the default in place.
+/// names, so a round trip cannot change the level. A row predating these fields
+/// inherits nothing and leaves the default in place. (A session with no row at
+/// all never gets here - `resume_record` refuses it.) A row from another provider
+/// also inherits nothing: impossible today, since the provider is read from the
+/// same row, but a grok level fed to codex would be a widening nobody asked for,
+/// so the guard stays rather than being assumed upstream.
 ///
 /// Model and effort carry forward for the same reason and were originally left
 /// out on the grounds that only `model` was recorded, so a partial restoration
 /// would be less predictable than none. Measurement killed that argument: every
-/// `--session` resume ran on codex's **built-in default model** at its default
+/// resume ran on codex's **built-in default model** at its default
 /// effort, not the profile's, and since `--ignore-user-config` that default is
 /// not even the operator's configured one. A session's first turn on
 /// `gpt-5.6-sol`/`low` followed by five resumed turns on a different model is
@@ -744,29 +744,21 @@ struct InheritedSettings {
     effort: Option<String>,
 }
 
-/// `--session <id>` mode: resume a specific provider session and send raw
-/// stdin. No `.review.toml` lookup, no prime - the session already has its
-/// grounding from the original interaction. Single provider, single archetype
-/// (the archetype is cosmetic context for audit).
+/// `review resume <id>`: continue a specific provider session and send raw
+/// stdin. No prime and no profile - the session already has its grounding from
+/// the run that created it, and its provider, permissions, model and effort
+/// come from that run's record. The archetype recorded for the resume is the
+/// session's own, so its rows stay grouped under what the session was opened as.
 async fn run_session_resume(
-    archetype: &str,
-    requested_providers: &[String],
     session_id: &str,
     dry_run: bool,
     started: std::time::Instant,
 ) -> Result<()> {
-    // The sidecar knows which provider owns this session, so `--provider` is a
-    // filter rather than a required declaration. Looked up once and reused by
-    // the cache-age gate below.
-    let record = sessions::latest_for_session(session_id);
-    let provider_name = resolve_session_provider(
-        requested_providers,
-        record.as_ref().map(|r| r.provider.as_str()),
-    )?;
-    let provider_name = provider_name.as_str();
-    if requested_providers.is_empty() {
-        eprintln!("provider: {provider_name} (from the session record)");
-    }
+    // Looked up once and reused by the cache-age gate and inheritance below.
+    let record = resume_record(session_id, sessions::latest_for_session(session_id))?;
+    let provider_name = record.provider.as_str();
+    eprintln!("provider: {provider_name} (from the session record)");
+    let archetype = record.archetype.as_str();
 
     let stdin_instructions = input::read_stdin()?;
     // Loaded once, and a config that exists but does not parse is an error
@@ -782,7 +774,6 @@ async fn run_session_resume(
 
     if dry_run {
         eprintln!("session: {session_id}");
-        eprintln!("provider: {provider_name}");
         eprintln!("archetype: {archetype}");
         println!("{stdin_instructions}");
         return Ok(());
@@ -792,7 +783,7 @@ async fn run_session_resume(
         bail!("'{provider_name}' not found on PATH");
     }
 
-    // `--session` bypasses the config for prompt/profile purposes, but the
+    // A resume bypasses the config for prompt/profile purposes, but the
     // stall timeout is a safety setting rather than a prompt input, so it is
     // still honoured.
     let codex_runtime = provider::CodexRuntime::from_config(cfg.stall_timeout_secs());
@@ -801,27 +792,23 @@ async fn run_session_resume(
     // last ended; past ~55 minutes (the realistic cap on Anthropic's prompt
     // cache TTL - 5 min default, ~1h with the right env vars) the cache is cold,
     // and resuming means reprocessing the whole session prefix at full cost.
-    // `--session` is the *warm* follow-up path, so a cold resume is refused: do
-    // a fresh run with restated context instead. When there's no sidecar record
-    // we can't determine age, so we proceed rather than block.
-    if let Some(ref record) = record {
-        if let Some(age) = sessions::age_secs(record) {
-            if age > timings::STALE_SESSION.as_secs() {
-                bail!(
-                    "session last touched {} ago - its prompt cache is cold.\n  \
-                     Resuming would reprocess the whole session prefix at full cost.\n  \
-                     Start a fresh run with restated context instead of `--session`.",
-                    sessions::format_age(age)
-                );
-            }
-            if age < 60 {
-                eprintln!("session last touched just now");
-            } else {
-                eprintln!("session last touched {} ago", sessions::format_age(age));
-            }
+    // Resuming is the *warm* follow-up path, so a cold resume is refused: do a
+    // fresh run with restated context instead. A row with no usable timestamp
+    // leaves the age unknown, and the resume proceeds rather than blocks.
+    if let Some(age) = sessions::age_secs(&record) {
+        if age > timings::STALE_SESSION.as_secs() {
+            bail!(
+                "session last touched {} ago - its prompt cache is cold.\n  \
+                 Resuming would reprocess the whole session prefix at full cost.\n  \
+                 Start a fresh run with restated context instead.",
+                sessions::format_age(age)
+            );
         }
-    } else {
-        eprintln!("note: no sidecar record for this session (age unknown)");
+        if age < 60 {
+            eprintln!("session last touched just now");
+        } else {
+            eprintln!("session last touched {} ago", sessions::format_age(age));
+        }
     }
 
     // Global lock: serialize the *launch* against other `review` invocations,
@@ -848,7 +835,7 @@ async fn run_session_resume(
     // recorded run rather than defaulted (see `inherited_settings`). Each is
     // announced, because the failure this replaced was entirely silent: the
     // resume simply ran on a different model and nothing said so.
-    let inherited = inherited_settings(record.as_ref(), provider_name);
+    let inherited = inherited_settings(Some(&record), provider_name);
     if let Some(ref level) = inherited.sandbox {
         eprintln!("sandbox: {level} (inherited from the session record)");
     }
@@ -1047,15 +1034,19 @@ fn run_session_show(session_id: &str) -> Result<()> {
     let latest = records.last().expect("non-empty");
 
     let now = provider::now_epoch_secs();
-    let age = if latest.epoch_secs == 0 {
-        "?".to_string()
+    // `format_age` says "now" under a minute, which does not take "ago".
+    let last = if latest.epoch_secs == 0 {
+        "at an unknown time".to_string()
     } else {
-        sessions::format_age(now.saturating_sub(latest.epoch_secs))
+        match sessions::format_age(now.saturating_sub(latest.epoch_secs)).as_str() {
+            "now" => "just now".to_string(),
+            age => format!("{age} ago"),
+        }
     };
 
     println!("session: {session_id}");
     println!(
-        "provider: {} / archetype: {} ({}) / {} touch(es), last {age} ago",
+        "provider: {} / archetype: {} ({}) / {} touch(es), last {last}",
         latest.provider,
         latest.archetype,
         latest.kind,
@@ -1305,76 +1296,79 @@ fn first_line_truncated(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
-    fn req(names: &[&str]) -> Vec<String> {
-        names.iter().map(|s| (*s).to_string()).collect()
+    fn minimal_row(provider: &str) -> sessions::SessionRecord {
+        record(serde_json::json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "epoch_secs": 1_767_225_600u64,
+            "project": "/w",
+            "hostname": "h",
+            "audit_id": "a",
+            "provider": provider,
+            "archetype": "security",
+            "session_id": "s",
+            "operator_prompt": "p",
+            "assembled_prompt": "p",
+            "review_version": "0.0.0",
+        }))
     }
 
     #[test]
-    fn infers_the_provider_from_the_session_record() {
-        // The common case: `review goal --session <id>` with no --provider at
-        // all. The answer is on record, so requiring it was busywork.
-        let got = resolve_session_provider(&[], Some("codex")).expect("inferred");
-        assert_eq!(got, "codex");
+    fn a_resume_takes_the_provider_from_the_record() {
+        // The session ID came from review's own output, whose run wrote this
+        // row, so the provider is on record and is never asked for.
+        let rec = resume_record("s", Some(minimal_row("codex"))).expect("resolved");
+        assert_eq!(rec.provider, "codex");
+        assert_eq!(rec.archetype, "security");
+    }
+
+    fn resume_error(record: Option<sessions::SessionRecord>) -> String {
+        match resume_record("s", record) {
+            Ok(_) => panic!("expected the resume to be refused"),
+            Err(e) => e.to_string(),
+        }
     }
 
     #[test]
-    fn a_list_containing_the_owner_is_not_a_conflict() {
-        // The reason this matters: --provider claude,codex carries over verbatim
-        // from the fresh run that created the session. Only codex can resume a
-        // codex session, so there is nothing ambiguous to reject.
-        let got = resolve_session_provider(&req(&["claude", "codex"]), Some("codex"))
-            .expect("resolved to the owner");
-        assert_eq!(got, "codex");
+    fn a_resume_with_no_record_is_refused_and_points_at_sessions() {
+        let err = resume_error(None);
+        assert!(err.contains("review sessions"), "{err}");
     }
 
     #[test]
-    fn a_single_matching_provider_is_accepted() {
-        let got = resolve_session_provider(&req(&["codex"]), Some("codex")).expect("accepted");
-        assert_eq!(got, "codex");
+    fn a_recorded_provider_review_no_longer_supports_is_refused() {
+        // A row naming a removed provider (kilo/opencode) must not turn into
+        // an unrunnable invocation.
+        let err = resume_error(Some(minimal_row("opencode")));
+        assert!(err.contains("supported"), "{err}");
     }
 
     #[test]
-    fn repeats_collapse_to_one_provider() {
-        let got = resolve_session_provider(&req(&["codex", "codex"]), None).expect("accepted");
-        assert_eq!(got, "codex");
+    fn the_archetype_flag_is_taken_as_given() {
+        let got = resolve_archetype_arg(Some("security,bugs"), None).expect("ok");
+        assert_eq!(got.as_deref(), Some("security,bugs"));
+        assert_eq!(resolve_archetype_arg(None, None).expect("ok"), None);
     }
 
     #[test]
-    fn a_contradicting_provider_is_refused() {
-        // Resuming under the wrong provider cannot work, so this stays an error
-        // rather than being silently corrected to the recorded owner.
-        let err = resolve_session_provider(&req(&["claude"]), Some("codex"))
-            .expect_err("must refuse a provider the session does not belong to");
-        let msg = err.to_string();
-        assert!(msg.contains("codex"), "names the owner: {msg}");
-        assert!(msg.contains("claude"), "names what was asked for: {msg}");
+    fn the_old_positional_archetype_still_works() {
+        // Orchestration procedures written against `review security` keep
+        // working until they are updated; they get a warning, not a failure.
+        let got = resolve_archetype_arg(None, Some("security")).expect("ok");
+        assert_eq!(got.as_deref(), Some("security"));
     }
 
     #[test]
-    fn a_list_missing_the_owner_is_refused() {
-        // Deliberately more than one name, so this exercises the multi-provider
-        // arm rather than collapsing into the single-provider contradiction
-        // case above.
-        let err = resolve_session_provider(&req(&["claude", "opencode"]), Some("codex"))
-            .expect_err("must refuse when the owner is absent from the list");
-        let msg = err.to_string();
-        assert!(msg.contains("codex"), "names the owner: {msg}");
-        assert!(msg.contains("claude,opencode"), "names the list: {msg}");
+    fn a_positional_bare_means_no_archetype() {
+        // `review bare` was the old way to say "no priming".
+        assert_eq!(resolve_archetype_arg(None, Some("bare")).expect("ok"), None);
     }
 
     #[test]
-    fn ambiguity_without_a_record_is_refused() {
-        // No record to choose between them, so this is genuinely ambiguous.
-        let err = resolve_session_provider(&req(&["claude", "codex"]), None)
-            .expect_err("must refuse genuine ambiguity");
-        assert!(err.to_string().contains("single --provider"));
-    }
-
-    #[test]
-    fn no_provider_and_no_record_is_refused() {
-        let err = resolve_session_provider(&[], None)
-            .expect_err("nothing to infer from and nothing requested");
-        assert!(err.to_string().contains("--provider"));
+    fn an_archetype_given_both_ways_is_refused() {
+        let err = resolve_archetype_arg(Some("a"), Some("b"))
+            .expect_err("ambiguous")
+            .to_string();
+        assert!(err.contains("twice"), "{err}");
     }
 
     /// A sidecar row, built the way one is actually read back - from JSON, so a
@@ -1462,9 +1456,10 @@ mod tests {
 
     #[test]
     fn permissions_are_not_inherited_across_providers() {
-        // `resolve_session_provider` should already have made this impossible,
-        // but a grok level fed to codex (or vice versa) is a widening nobody
-        // asked for, so the guard is here rather than assumed upstream.
+        // `resume_record` takes the provider from the same row, so this cannot
+        // happen today, but a grok level fed to codex (or vice versa) is a
+        // widening nobody asked for, so the guard is here rather than assumed
+        // upstream.
         let rec = record(serde_json::json!({
             "timestamp": "2026-01-01T00:00:00Z",
             "epoch_secs": 1_767_225_600u64,
@@ -1495,20 +1490,5 @@ mod tests {
         assert!(got.writable_roots.is_empty());
         assert_eq!(got.model, None);
         assert_eq!(got.effort, None);
-    }
-
-    #[test]
-    fn an_unknown_provider_is_refused() {
-        let err = resolve_session_provider(&req(&["kilo"]), None).expect_err("unknown provider");
-        assert!(err.to_string().contains("supported"));
-    }
-
-    #[test]
-    fn an_unknown_recorded_provider_is_refused() {
-        // A sidecar row naming a provider we no longer support (kilo/opencode
-        // were removed) must not be inferred into an unrunnable invocation.
-        let err = resolve_session_provider(&[], Some("opencode"))
-            .expect_err("recorded provider must still be validated");
-        assert!(err.to_string().contains("supported"));
     }
 }

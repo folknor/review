@@ -1,14 +1,14 @@
 # review
 
-A Rust CLI that fans out code reviews to fresh AI sessions across multiple providers (Claude Code, Codex, Grok), each primed with a specific reviewer perspective.
+A Rust CLI that sends a prompt to fresh AI sessions across multiple providers (Claude Code, Codex, Grok) - for reviews, and with a write profile for fixes.
 
 Built with LLMs. See [LLM.md](LLM.md).
 
 ## How it works
 
-You define **archetypes** -- reviewer perspectives like `security`, `bugs`, `perf`, or any custom name -- as a name mapped to a priming prompt. When you run a review, you pipe your instructions via stdin. The tool starts a **fresh session** on each provider, prepends the archetype's priming prompt, and lets the agent fetch code itself. The archetype prompt carries its own grounding (role, whether it may modify files, "inspect current state") -- the tool bakes in nothing.
+You pipe your instructions via stdin. The tool starts a **fresh session** on each provider and lets the agent fetch code itself; it bakes in nothing. Optionally, an **archetype** -- a reviewer perspective like `security`, `bugs`, or any custom name, mapped to a priming prompt -- is prepended, and the archetype prompt carries its own grounding (role, whether it may modify files, "inspect current state").
 
-Every run is a clean session by design. Reviving a long-lived session on a cold prompt cache means reprocessing its entire accumulated history - which only grows - whereas a fresh session costs roughly one review's worth of tokens each time. All three providers print the new session ID above the response, so you can follow up while the cache is still warm via `--session`.
+Every run is a clean session by design. Reviving a long-lived session on a cold prompt cache means reprocessing its entire accumulated history - which only grows - whereas a fresh session costs roughly one review's worth of tokens each time. All three providers print the new session ID above the response, so you can follow up while the cache is still warm with `review resume <ID>`.
 
 ## Quick start
 
@@ -46,62 +46,65 @@ bugs = "You hunt for edge cases and correctness bugs."
 
 `review config` shows the effective result and which file each value came from.
 
-### 3. Run reviews
+### 3. Run
 
 ```
-echo "what does the retry loop guarantee?" | review --profile deep
-echo "look for auth boundary violations" | review security
-echo "check for edge cases in the parsing module" | review bugs
-echo "full review please" | review all
-echo "how should we handle polygon clipping?" | review competitors
+echo "what does the retry loop guarantee?" | review -p deep
+echo "look for auth boundary violations" | review -a security
+echo "check for edge cases in the parsing module" | review -a bugs -p deep
+echo "full review please" | review -a all
+echo "how should we handle polygon clipping?" | review -a competitors
 ```
 
 ## Usage
 
 ```
-echo "<instructions>" | review [archetype[,archetype,...]]
+echo "<instructions>" | review [-a ARCHETYPE[,...]] [-p PROFILE] [--provider P,...] [--dry-run] [--stagger N]
+echo "<instructions>" | review resume <SESSION_ID> [--dry-run]
+review config
+review sessions [ID] [--all] [--limit N]
+review incidents [--limit N]
+review init
 ```
 
-Instructions are piped via stdin (required, 20KB limit). Without an archetype, stdin is sent unchanged - no priming prompt. With one, the archetype routes to the right sessions. Multiple archetypes and groups can be comma-separated:
+Instructions are piped via stdin (required, 20KB limit). Without `-a`, stdin is sent unchanged - no priming prompt. Multiple archetypes and groups can be comma-separated:
 
 ```
-echo "review please" | review security,bugs,arch
-echo "review please" | review bugs,competitors
+echo "review please" | review -a security,bugs,arch
+echo "review please" | review -a bugs,competitors
 ```
 
 Duplicates are removed automatically (e.g. if a group overlaps with an explicit archetype).
 
+All output is plain text, for people and agents alike. There is no JSON mode.
+
 ### Archetypes
 
-Archetypes are optional named priming prompts defined under `[archetypes]` (name = priming prompt), in the project's `.review.toml` or the global config; the project wins on a name clash. Any name works except the reserved ones: `all` and the subcommand names (`init`, `config`, `sessions`, `incidents`, `help`).
+Archetypes are optional named priming prompts defined under `[archetypes]` (name = priming prompt), in the project's `.review.toml` or the global config; the project wins on a name clash. Any name works except the reserved ones, which fail to parse: `all`, the subcommand names (`resume`, `config`, `sessions`, `incidents`, `init`, `help`), and `bare` for anything but an empty archetype (`bare = ""`).
 
-Use `all` to fan out to every configured archetype, or define **groups** to fan out to a named subset. Groups and individual archetypes can be mixed freely.
+Use `-a all` to fan out to every configured archetype, or define **groups** to fan out to a named subset. Groups and individual archetypes can be mixed freely.
 
 ### Options
 
 | Flag | Description |
 |------|-------------|
-| `--profile <name>` | Apply a named profile's `model`/`effort`/`sandbox`/`env` overrides. Resolved per launched provider from `[<provider>.<profile>]`, project config first, then global. |
-| `--session <id>` | Resume a specific session. Sends raw stdin (no prime prepended). `--provider` is optional - the owning provider is read from the sidecar. |
-| `--dry-run` | Print what would be sent instead of sending it |
+| `-a, --archetype <name>` | Archetype(s) to prime with: a name, a group, a comma-separated list, or `all`. Omit to send stdin unchanged. |
+| `-p, --profile <name>` | Apply a named profile's `model`/`effort`/`sandbox`/`env` overrides. Resolved per launched provider from `[<provider>.<profile>]`, project config first, then global. |
 | `--provider <list>` | Limit to specific providers (comma-separated) |
+| `--dry-run` | Print what would be sent instead of sending it |
 | `--stagger <secs>` | Seconds between each provider launch (default: 30, 0 to disable) |
 
 Each run starts a fresh session, prepends the archetype's priming prompt (if any) to your stdin, and lets the agent fetch code itself. Providers come from `--provider`, or `[_defaults].providers` when `--provider` is omitted. A provider that is not installed on this machine fails the run before anything launches - `review config` shows which are installed.
 
-Per-provider launch behavior:
+How each provider is launched, and why, is in [reference/claude.md](reference/claude.md), [reference/codex.md](reference/codex.md) and [reference/grok.md](reference/grok.md). All three capture the new session ID: claude and grok get one generated up front, codex's is parsed from its `thread.started` event. Grok is the one provider that takes no prompt on stdin, so `review` writes the assembled prompt to a temp file and passes `--prompt-file`.
 
-| Provider | Args | Captures session ID? |
-|----------|------|----------------------|
-| claude | `--session-id <generated> --print --permission-mode dontAsk` | yes (UUID generated up front) |
-| codex | `exec --sandbox read-only --json` | yes (parsed from `thread.started`) |
-| grok | `--session-id <generated> --prompt-file <tmp> --output-format json --permission-mode dontAsk --sandbox read-only` | yes (echoed in the result object) |
+### Upgrading from the positional archetype
 
-Grok is the one provider that takes no prompt on stdin: `-p` requires a value and `-p -` is read as a one-character prompt, so `review` writes the assembled prompt to a temp file and passes `--prompt-file`. That escapes shell argument length limits the same way the stdin pipe does for the other two.
+The archetype used to be positional (`review security`) and resuming used `--session <ID>`. Both still work, with a warning, so scripts and orchestration procedures keep running until they are updated: `review security` behaves like `review -a security`, `review bare` like plain `review`, and `--session <ID>` like `review resume <ID>` (any `--profile`/`--provider` given with it is ignored).
 
 ### Profiles
 
-Profiles carry per-provider `model`, `effort`, `sandbox`, and `env` overrides, applied only when you pass `--profile`. They are `[<provider>.<profile>]` tables, and the natural home for them is the global config, so a new model release is one edit rather than one per project:
+Profiles carry per-provider `model`, `effort`, `sandbox`, and `env` overrides, applied only when you pass `-p`/`--profile`. They are `[<provider>.<profile>]` tables, and the natural home for them is the global config, so a new model release is one edit rather than one per project:
 
 ```toml
 [claude.opus]
@@ -116,10 +119,10 @@ sandbox = "workspace-write"
 ```
 
 ```
-echo "audit the auth flow" | review security --profile opus
+echo "audit the auth flow" | review -a security -p opus
 ```
 
-`--profile opus` resolves `[<provider>.opus]` for each launched provider: the project's `.review.toml` first, then the global config. A project profile replaces the global one of the same name **entirely** - nothing is merged field by field, so a project that overrides only `model` also drops the global profile's `sandbox`. If no file defines the profile for a launched provider, the run errors naming every file it searched.
+`-p opus` resolves `[<provider>.opus]` for each launched provider: the project's `.review.toml` first, then the global config. A project profile replaces the global one of the same name **entirely** - nothing is merged field by field, so a project that overrides only `model` also drops the global profile's `sandbox`. If no file defines the profile for a launched provider, the run errors naming every file it searched.
 
 The older host-scoped form `[<host>.<provider>.<profile>]` still parses. It applies only on the host it names, and there it beats a hostless table in the same file - which means such a table keeps overriding the global config on that host until you delete it. `review config` shows it alongside the global profile it hides.
 
@@ -135,46 +138,31 @@ The levels are `review`'s own vocabulary, translated per provider at launch, bec
 
 A value `review` does not recognise is passed through to the provider verbatim, so a custom grok profile defined in `~/.grok/sandbox.toml` still works; the provider validates its own vocabulary and fails before running a turn if the name is wrong.
 
-### Follow-up via `--session`
+### Follow-up with `review resume`
 
-`--session <id>` resumes a specific provider session and sends raw stdin - no prime prepended. The grounding is already in the session's history from the run that created it.
+`review resume <id>` continues a specific provider session and sends raw stdin - no prime prepended. The grounding is already in the session's history from the run that created it.
 
 ```
 echo "what's the worst of those for a single-account user?" | \
-  review bugs --provider claude --session 019deabc-0def-7000-8000-abcdef012345
+  review resume 019deabc-0def-7000-8000-abcdef012345
 ```
 
-Session IDs are provider-scoped, but you rarely need to say which: the sidecar
-records who owns each session, so `--provider` is a filter over a known answer
-rather than a required declaration.
+There is no `--provider`: the sidecar records which provider owns each session, and `resume` uses that. A session this host has no record of is refused - `review sessions` lists the ones it knows:
 
 ```
-review bugs --session 019deabc-...                          # provider inferred
-review bugs --session 019deabc-... --provider claude,codex   # list is fine
-```
-
-The second form matters because those flags carry over verbatim from the fresh
-run that created the session - and a codex session can only be resumed by
-codex, so naming both is not ambiguous.
-
-Two things are still errors: naming a provider the session does not belong to,
-and naming several with no sidecar record to choose between them.
-
-```
-$ review bugs --session 019deabc-... --provider claude
-Error: this session belongs to 'codex', but --provider says 'claude'
-  A session can only be resumed by the provider that created it.
-  Drop --provider to use 'codex'.
+$ echo "follow up" | review resume 019deabc-...
+Error: no record of session 019deabc-... on this host
+  `review sessions` lists the sessions this host's review runs created.
 ```
 
 Other constraints:
 
-- Bypasses config archetypes and profiles - no prime and no profile overrides are applied. The sandbox level, writable roots, model and effort are inherited from the session's own recorded run instead.
-- Validation of the session ID is delegated to the provider; an unknown ID produces a provider-specific error, not a `review` error.
+- No archetype and no profile - no prime and no profile overrides are applied. The sandbox level, writable roots, model and effort are inherited from the session's own recorded run instead.
+- Validation of the session ID itself is delegated to the provider.
 
 ### Sessions sidecar log
 
-Each run that captures a session ID and each `--session` resume appends a JSONL row to `~/.local/share/review/sessions.jsonl` (or `sessions-private.jsonl` when `audit.private = true`). Rows carry:
+Each run that captures a session ID and each `review resume` appends a JSONL row to `~/.local/share/review/sessions.jsonl` (or `sessions-private.jsonl` when `audit.private = true`). Rows carry:
 
 - `timestamp` (UTC), `epoch_secs`, `project` (root path), `hostname`
 - `audit_id`, `provider`, `archetype`, `session_id`
@@ -186,29 +174,27 @@ Each run that captures a session ID and each `--session` resume appends a JSONL 
 
 The sidecar drives two things:
 
-**1. Cache-age gate on `--session`.** When you resume, `review` looks up the last touch and prints how long it's been:
+**1. Cache-age gate on `review resume`.** When you resume, `review` looks up the last touch and prints how long it's been:
 
 ```
-$ echo "follow up" | review bugs --provider claude --session 019deabc-...
+$ echo "follow up" | review resume 019deabc-...
+provider: claude (from the session record)
 session last touched 14m ago
 --- claude ---
 <response>
 ```
 
-`--session` is the *warm* follow-up path. If the session last ended over 55
+Resuming is the *warm* follow-up path. If the session last ended over 55
 minutes ago - past the longest realistic prompt-cache TTL - the cache is cold,
 and resuming would reprocess the whole session prefix at full cost. So `review`
 **refuses** it and tells you to do a fresh run with restated context instead:
 
 ```
-$ echo "follow up" | review bugs --provider claude --session 019deabc-...
+$ echo "follow up" | review resume 019deabc-...
 Error: session last touched 1h17m ago - its prompt cache is cold.
   Resuming would reprocess the whole session prefix at full cost.
-  Start a fresh run with restated context instead of `--session`.
+  Start a fresh run with restated context instead.
 ```
-
-If there's no sidecar record for the session, the age is unknown and the resume
-proceeds.
 
 **2. `review sessions` listing.** Aggregates by `session_id` and shows recent sessions for the current project (or `--all` projects), most recent first:
 
@@ -229,7 +215,7 @@ $ review sessions
        opened:  check OAuth handling on the IMAP path
 ```
 
-Each block shows the age since the last touch, the provider/archetype/touch count, the session ID (copy-paste into `--session <id>`), and the operator prompt that opened the session. `--limit <N>` caps the row count (default 20).
+Each block shows the age since the last touch, the provider/archetype/touch count, the session ID (copy-paste into `review resume <id>`), and the operator prompt that opened the session. `--limit <N>` caps the row count (default 20).
 
 For ad-hoc queries beyond what `review sessions` exposes, the JSONL works directly with `jq` and `grep`.
 
@@ -243,8 +229,8 @@ For ad-hoc queries beyond what `review sessions` exposes, the JSONL works direct
 <review content>
 ```
 
-Codex runs (both fresh and `--session` follow-ups) also print a digest above
-the message, distilled from its `--json` stream plus the
+Codex runs (both fresh and resumed) also print a digest above
+the message, distilled from codex's own `--json` event stream plus the
 `-o`/`--output-last-message` backstop:
 
 ```
@@ -387,7 +373,7 @@ sweep = ["security", "bugs"]
 competitors = ["tilemaker", "tippecanoe"]
 
 # Named profiles: per-provider model/effort/sandbox/env overrides, applied via
-# --profile. Scoped by provider . profile.
+# -p/--profile. Scoped by provider . profile.
 [claude.opus]
 model = "Opus 4.8"
 effort = "medium"
@@ -408,19 +394,11 @@ How the layers combine:
 
 Prints the effective configuration for the current directory, computed by the same resolver a run uses: the files consulted, the default providers and whether each provider is installed on this machine, every archetype and group with its source, and every profile with the table it came from and any definitions it shadows. Env vars show by name only.
 
-```
-review config          # for reading
-review config --json   # for scripts and orchestrators
-```
-
 Anything that used to read `.review.toml` to find out what is available should call this instead - the project file no longer tells the whole story. Outside a project it shows the global layer and provider availability on their own.
 
 ### Upgrading existing files
 
-Existing `.review.toml` files keep working, including legacy host tables, with two exceptions that now fail to parse:
-
-- A profile containing a key `review` does not know - usually a typo. A project profile replaces the global one whole, so a typo that parsed as an empty profile would silently discard the global settings.
-- An archetype or group named `config` or `incidents`, which are now subcommands.
+Existing `.review.toml` files keep working, including legacy host tables, with one exception that now fails to parse: a profile containing a key `review` does not know - usually a typo. A project profile replaces the global one whole, so a typo that parsed as an empty profile would silently discard the global settings.
 
 ### Providers
 
@@ -433,8 +411,8 @@ Existing `.review.toml` files keep working, including legacy host tables, with t
 Use `--provider` to limit which providers run:
 
 ```
-echo "just claude" | review bugs --provider claude
-echo "claude and codex" | review bugs --provider claude,codex
+echo "just claude" | review -a bugs --provider claude
+echo "claude and codex" | review -a bugs --provider claude,codex
 ```
 
 ### Groups
@@ -442,11 +420,11 @@ echo "claude and codex" | review bugs --provider claude,codex
 Groups fan out to multiple archetypes with a single command:
 
 ```
-echo "how to handle clipping?" | review competitors
-echo "full sweep" | review sweep
+echo "how to handle clipping?" | review -a competitors
+echo "full sweep" | review -a sweep
 ```
 
-Define groups in the `[_groups]` table. Group names must not conflict with archetype names. `all` is reserved and runs every configured archetype.
+Define groups in the `[_groups]` table. Within one file, group names must not conflict with archetype names. `all` is reserved and runs every configured archetype.
 
 ## Rate limits and staggering
 
@@ -457,9 +435,9 @@ A single Claude Code invocation generates 8-12 internal API calls through its to
 To avoid this, provider launches are staggered by default. The first provider starts immediately; each subsequent one waits 30 seconds. All run concurrently once launched.
 
 ```
-echo "review" | review sweep                    # 30s stagger (default)
-echo "review" | review sweep --stagger 10       # 10s stagger
-echo "review" | review sweep --stagger 0        # no stagger (risk rate limits)
+echo "review" | review -a sweep                 # 30s stagger (default)
+echo "review" | review -a sweep --stagger 10    # 10s stagger
+echo "review" | review -a sweep --stagger 0     # no stagger (risk rate limits)
 ```
 
 If you're hitting rate limits, increase the stagger. If you're only running 1-2 providers, `--stagger 0` is fine.
@@ -468,7 +446,7 @@ If you're hitting rate limits, increase the stagger. If you're only running 1-2 
 
 A global file lock (`/tmp/review.lock`) serializes provider **launches**, not
 whole runs. An invocation holds it until its providers have been spawned (the
-fan-out path through its staggered launches, a `--session` resume through the
+fan-out path through its staggered launches, a `review resume` through the
 single spawn), then releases it and lets the runs proceed concurrently.
 Additional invocations queue and wait for the launch window only.
 

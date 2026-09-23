@@ -494,7 +494,7 @@ pub struct ProviderResult {
     pub writable_roots: Vec<String>,
     /// The model and reasoning effort this run launched with, recorded for the
     /// same reason `sandbox` is: they are properties of the *run*, and a
-    /// `--session` resume that cannot see them silently falls back to whatever
+    /// `review resume` that cannot see them silently falls back to whatever
     /// the provider defaults to. `None` means "we passed nothing and the
     /// provider chose", which since `--ignore-user-config` means codex's
     /// built-in default rather than the operator's configured one.
@@ -521,7 +521,7 @@ pub struct ProviderResult {
 /// The two are different names, not two spellings of one: grok's `-m grok-4.7`
 /// is served as `grok-4.7-build`, and `-m grok-4.7-build` is refused as an
 /// unknown model id. So this is recorded but **never** inherited by a
-/// `--session` resume - feeding it back to `-m` would fail the launch. Only grok
+/// `review resume` - feeding it back to `-m` would fail the launch. Only grok
 /// reports it today; empty for every other provider.
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct Served {
@@ -1044,10 +1044,12 @@ fn config_writable_roots_override(config: &[String]) -> Option<Vec<String>> {
 /// The two differ wherever the caller passes no level: the runners still pass
 /// `--sandbox read-only`, so the run genuinely is read-only, and recording the
 /// caller's `None` left such rows invisible to the exact query the sidecar
-/// fields exist to answer, `jq 'select(.sandbox=="read-only")'`. On the `--session` path
-/// the caller is `main::inherited_permissions`, which supplies the level the
-/// session was created with; `None` there means there was no record to inherit
-/// from. Claude has no filesystem sandbox on this axis, so it records none.
+/// fields exist to answer, `jq 'select(.sandbox=="read-only")'`. On the
+/// `review resume` path the caller is `main::inherited_settings`, which
+/// supplies the level the session was created with; `None` there means the
+/// session's record carries no level to inherit (a row written before levels
+/// were recorded). Claude has no filesystem sandbox on this axis, so it records
+/// none.
 fn effective_sandbox(provider: &str, sandbox: Option<&str>) -> Option<String> {
     match provider {
         "codex" | "grok" => Some(sandbox.unwrap_or("read-only").to_string()),
@@ -1115,7 +1117,7 @@ async fn run_claude(
 ) -> Result<RunOutput> {
     // In oneshot mode, generate a UUID up front and pass it via --session-id
     // so the fresh session is persistable and the operator can follow up via
-    // `--session <id>`. (Previously used --no-session-persistence, which made
+    // `review resume <id>`. (Previously used --no-session-persistence, which made
     // the session unreachable.)
     let oneshot_id = if oneshot {
         Some(crate::config::generate_uuid())
@@ -1211,7 +1213,7 @@ impl GrokResult {
     /// all-default `GrokResult`. Treating that as "a turn ran but did not
     /// answer" infers the fact from successful parsing rather than from
     /// evidence, and the inference is load-bearing: `NoAnswer` returns `Ok`,
-    /// which tells `--session` the prompt cache was warmed and refreshes the
+    /// which tells `review resume` the prompt cache was warmed and refreshes the
     /// staleness clock. An unrecognised pre-turn failure would therefore mark a
     /// cold session warm. Requiring one of grok's own result fields keeps that
     /// claim tied to something grok actually said.
@@ -1483,10 +1485,10 @@ async fn run_grok_turn(
     args.push("dontAsk".to_string());
     // Unlike claude, grok has a real filesystem sandbox on the same axis as
     // codex's, so the profile field maps honestly and the default still holds:
-    // a bare run cannot modify files.
+    // a run with no profile cannot modify files.
     //
     // Except on a resume with no recorded level (a session whose sidecar row
-    // predates sandbox recording, or has no row): grok fixes a session's profile
+    // predates sandbox recording): grok fixes a session's profile
     // for its lifetime and refuses an explicit `--sandbox` that differs from the
     // saved one (`resolve_startup_sandbox`: explicit + saved, different =>
     // `Conflict`), while no flag applies the saved one. Forcing `read-only` there
@@ -1593,7 +1595,7 @@ async fn run_grok_turn(
     // Only a *fresh* run reports a session id: it is new information, and it
     // must survive a turn that produced no answer so that turn can still be
     // resumed. A resume reports `None` because the caller passed the id in and
-    // already records it (`main` logs the `--session` argument, not this field);
+    // already records it (`main` logs the `review resume` id, not this field);
     // claude does the same. Preferring grok's echoed id over the UUID we
     // generated means a future grok that reassigns it cannot orphan the session.
     // Where to look for the event log if grok does not echo an id.
@@ -1742,7 +1744,7 @@ struct GrokAnswer {
 /// into `Err` too costs two things that are invisible until you need them:
 /// `invoke` forces `session_id: None` on the error path, so the id grok already
 /// minted is dropped and the cut-off turn cannot be resumed - exactly the turn
-/// most worth resuming; and `--session` refreshes its cold-cache clock on
+/// most worth resuming; and `review resume` refreshes its cold-cache clock on
 /// `output.is_ok()`, so a resume that ran and warmed the cache would leave the
 /// clock stale and get the *next* resume refused. Codex avoids both by returning
 /// `Ok` with a death digest, and grok has no reason to differ.

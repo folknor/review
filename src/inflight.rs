@@ -64,10 +64,10 @@ fn dir(data_root: Option<&Path>) -> Option<PathBuf> {
 
 /// Is `id` safe to use as a filename component?
 ///
-/// The session id reaches here straight from `--session <id>` on the command
+/// The session id reaches here straight from `review resume <id>` on the command
 /// line, and `review` deliberately delegates session-id validation to the
 /// provider - so by the time we see it, it is arbitrary operator input. Using it
-/// unchecked as a path component let `--session ../foo` escape the marker
+/// unchecked as a path component let `review resume ../foo` escape the marker
 /// directory and write (and then, via `Guard::drop`, *delete*) a file elsewhere
 /// under the data dir.
 ///
@@ -115,7 +115,7 @@ impl Drop for Guard {
 pub fn mark(session_id: &str, provider: &str, project: &str, data_root: Option<&Path>) -> Guard {
     // Refuse to build a path out of anything that is not plainly a session id.
     // Skipping the marker only costs liveness reporting for that run; letting it
-    // through would let a crafted `--session` write and delete an arbitrary
+    // through would let a crafted resume id write and delete an arbitrary
     // file.
     if !is_safe_filename_component(session_id) {
         eprintln!("warning: session id is not a safe filename; skipping in-flight marker");
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn rejects_path_traversal() {
-        // `--session ../sessions` would otherwise write and then delete a file
+        // `review resume ../sessions` would otherwise write and then delete a file
         // outside the marker directory.
         assert!(!is_safe_filename_component("../sessions"));
         assert!(!is_safe_filename_component("../../etc/passwd"));

@@ -401,8 +401,6 @@ model = \"global-host\"
 
     #[test]
     fn every_reserved_name_errors_as_a_local_group() {
-        // `config.rs`'s own tests spot-check one; this pins the full list,
-        // `config` included, which is the newest subcommand.
         for name in RESERVED_NAMES {
             let raw = format!("[archetypes]\nbugs = \"x\"\n[_groups]\n{name} = [\"bugs\"]\n");
             let err = parse_file(&raw, "local.toml", Layer::Local)

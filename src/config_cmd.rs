@@ -4,21 +4,21 @@
 //! archetypes, providers and profiles exist. With the global layer that file no
 //! longer tells the whole story - a profile may come from
 //! `~/.config/review/config.toml`, and a stale local one may be hiding it - so
-//! this command is the single source of truth. It renders what `config::load`
-//! resolved, i.e. exactly what a run would use; it never re-parses TOML, because
+//! this command is the single source of truth. It renders what the resolver
+//! produced, i.e. exactly what a run would use; it never re-parses TOML, because
 //! a second reader is a second opinion that can disagree with the one that
 //! actually launches providers.
 //!
-//! Rendering is pure (`render_text`, `render_json` take the resolved config and
-//! an availability map), so it is testable without `PATH` or files; `run` only
+//! Plain text only, for people and agents alike. There is deliberately no JSON
+//! mode: agents read text as reliably as people do, and in practice they switch
+//! a JSON default off when given one.
+//!
+//! Rendering is pure (`render_text` takes the resolved config and an
+//! availability map), so it is testable without `PATH` or files; `run` only
 //! loads, probes and prints.
 
-use crate::config::{
-    self, KNOWN_PROVIDERS, Profile, ProfileDef, ProfileEntry, ReviewConfig, Sourced,
-};
+use crate::config::{self, KNOWN_PROVIDERS, Profile, ProfileDef, ProfileEntry, ReviewConfig};
 use anyhow::Result;
-use serde::Serialize;
-use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -32,15 +32,10 @@ const PRIME_PREVIEW_CHARS: usize = 72;
 /// Works outside a project too: with no `.review.toml` it shows the global
 /// layer and provider availability, which is what an orchestrator needs before
 /// it has picked a project.
-pub fn run(json: bool) -> Result<()> {
+pub fn run() -> Result<()> {
     let (cfg, project_root) = config::load_optional()?;
     let avail = probe_availability();
-    if json {
-        let value = render_json(&cfg, project_root.as_deref(), &avail);
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    } else {
-        print!("{}", render_text(&cfg, project_root.as_deref(), &avail));
-    }
+    print!("{}", render_text(&cfg, project_root.as_deref(), &avail));
     Ok(())
 }
 
@@ -55,109 +50,12 @@ fn installed(avail: &Availability, provider: &str) -> bool {
     avail.get(provider).copied().unwrap_or(false)
 }
 
-/// The machine-readable view. Key names are a contract with orchestrators.
-/// Values are raw: an unset sandbox is `null`, not the runner's default, so a
-/// consumer can tell "the profile says read-only" from "nothing was said".
-/// Env *values* never appear - they can carry secrets - only their names.
-pub fn render_json(cfg: &ReviewConfig, project_root: Option<&Path>, avail: &Availability) -> Value {
-    let available: Map<String, Value> = KNOWN_PROVIDERS
-        .iter()
-        .map(|p| ((*p).to_string(), Value::Bool(installed(avail, p))))
-        .collect();
-
-    let archetypes: Map<String, Value> = cfg
-        .archetypes
-        .iter()
-        .map(|(name, s)| {
-            (
-                name.clone(),
-                json!({"layer": s.layer.as_str(), "prompt": s.value}),
-            )
-        })
-        .collect();
-
-    let groups: Map<String, Value> = cfg
-        .groups
-        .iter()
-        .map(|(name, s)| {
-            (
-                name.clone(),
-                json!({"layer": s.layer.as_str(), "members": s.value}),
-            )
-        })
-        .collect();
-
-    let profiles: Map<String, Value> = cfg
-        .profiles
-        .iter()
-        .map(|(provider, by_name)| {
-            let entries: Map<String, Value> = by_name
-                .iter()
-                .map(|(name, entry)| (name.clone(), profile_json(entry)))
-                .collect();
-            (provider.clone(), Value::Object(entries))
-        })
-        .collect();
-
-    json!({
-        "project_root": project_root.map(|p| p.display().to_string()),
-        "hostname": cfg.hostname,
-        "files": {
-            "local": cfg.files.local.as_ref().map(|l| l.display().to_string()),
-            "global": cfg.files.global.as_ref().map(|g| g.display().to_string()),
-            "global_loaded": cfg.files.global_loaded,
-        },
-        "providers": {
-            "default": cfg.providers.as_ref().map(sourced_json),
-            "available": available,
-        },
-        "archetypes": archetypes,
-        "groups": groups,
-        "profiles": profiles,
-        "stall_timeout_secs": cfg.stall_timeout_secs.as_ref().map(sourced_json),
-    })
-}
-
-fn sourced_json<T: Serialize>(s: &Sourced<T>) -> Value {
-    json!({"value": s.value, "layer": s.layer.as_str(), "table": s.table})
-}
-
+/// Env var *names* only - values can carry secrets.
 fn env_keys(p: &Profile) -> Vec<&str> {
     p.env
         .as_ref()
         .map(|e| e.keys().map(String::as_str).collect())
         .unwrap_or_default()
-}
-
-fn profile_json(entry: &ProfileEntry) -> Value {
-    let def = &entry.effective;
-    let p = &def.profile;
-    let shadows: Vec<Value> = entry
-        .shadowed
-        .iter()
-        .map(|s| {
-            json!({
-                "layer": s.layer.as_str(),
-                "table": s.table,
-                "host": s.host,
-                "model": s.profile.model,
-                "effort": s.profile.effort,
-                "sandbox": s.profile.sandbox,
-            })
-        })
-        .collect();
-    json!({
-        "layer": def.layer.as_str(),
-        "table": def.table,
-        "host": def.host,
-        "model": p.model,
-        "effort": p.effort,
-        "sandbox": p.sandbox,
-        "writable_roots": p.writable_roots,
-        "env_keys": env_keys(p),
-        "config": p.config,
-        "shadows": shadows,
-    })
 }
 
 /// The terminal view: compact, no colours, one block per section.
@@ -429,76 +327,61 @@ model = \"opus\"
             .collect()
     }
 
+    fn text(avail_codex: bool) -> String {
+        render_text(&cfg(), Some(Path::new("/proj")), &avail(avail_codex))
+    }
+
     #[test]
-    fn json_reports_layers_and_first_definition_wins() {
-        let v = render_json(&cfg(), Some(Path::new("/proj")), &avail(true));
-        assert_eq!(v["project_root"], "/proj");
-        assert_eq!(v["hostname"], "host");
-        assert_eq!(v["archetypes"]["security"]["layer"], "local");
-        assert_eq!(v["archetypes"]["bugs"]["layer"], "global");
-        assert_eq!(v["groups"]["sweep"]["layer"], "local");
-        assert_eq!(v["groups"]["sweep"]["members"], json!(["security", "bugs"]));
-        assert_eq!(
-            v["providers"]["default"],
-            json!({"value": ["codex"], "layer": "local", "table": "[_defaults]"})
-        );
-        assert_eq!(
-            v["stall_timeout_secs"],
-            json!({"value": 600, "layer": "global", "table": "[_defaults]"})
+    fn each_value_shows_the_layer_it_came_from() {
+        let t = text(true);
+        assert!(t.contains("project:   /proj"), "{t}");
+        assert!(t.contains("host:      host"), "{t}");
+        // The local archetype wins over the global one of the same name.
+        assert!(t.contains("security  local"), "{t}");
+        assert!(t.contains("bugs      global"), "{t}");
+        assert!(!t.contains("global security prime"), "{t}");
+        assert!(t.contains("sweep  local   security, bugs"), "{t}");
+        assert!(t.contains("default: codex  (local [_defaults])"), "{t}");
+        assert!(
+            t.contains("stall_timeout_secs: 600  (global [_defaults])"),
+            "{t}"
         );
     }
 
     #[test]
-    fn json_shows_what_a_stale_local_profile_shadows() {
-        let v = render_json(&cfg(), Some(Path::new("/proj")), &avail(true));
-        let deep = &v["profiles"]["codex"]["deep"];
-        assert_eq!(deep["layer"], "local");
-        assert_eq!(deep["table"], "[host.codex.deep]");
-        assert_eq!(deep["host"], "host");
-        assert_eq!(deep["model"], "stale-model");
-        // No invented default: the winning profile set no sandbox.
-        assert_eq!(deep["sandbox"], Value::Null);
-        assert_eq!(deep["writable_roots"], json!([]));
-
-        let shadows = deep["shadows"].as_array().unwrap();
-        assert_eq!(shadows.len(), 1);
-        assert_eq!(shadows[0]["layer"], "global");
-        assert_eq!(shadows[0]["table"], "[codex.deep]");
-        assert_eq!(shadows[0]["host"], Value::Null);
-        assert_eq!(shadows[0]["model"], "fresh-model");
-        assert_eq!(shadows[0]["sandbox"], "workspace-write");
-
-        let opus = &v["profiles"]["claude"]["opus"];
-        assert_eq!(opus["layer"], "global");
-        assert_eq!(opus["shadows"], json!([]));
+    fn a_stale_local_profile_is_shown_next_to_what_it_shadows() {
+        let t = text(true);
+        assert!(
+            t.contains("deep  (local [host.codex.deep], legacy host table)"),
+            "{t}"
+        );
+        assert!(t.contains("model stale-model, effort low"), "{t}");
+        assert!(
+            t.contains(
+                "shadows global [codex.deep]: model fresh-model, effort high, \
+                 sandbox workspace-write"
+            ),
+            "{t}"
+        );
+        // The winner replaces the shadowed profile whole: none of its roots or
+        // overrides leak into the effective view.
+        assert!(!t.contains("/srv/data"), "{t}");
+        assert!(t.contains("opus  (global [claude.opus])"), "{t}");
     }
 
     #[test]
     fn env_names_appear_but_values_never_do() {
-        let c = cfg();
-        let v = render_json(&c, Some(Path::new("/proj")), &avail(true));
-        assert_eq!(
-            v["profiles"]["codex"]["deep"]["env_keys"],
-            json!(["SECRET_TOKEN"])
-        );
-        let json_text = v.to_string();
-        assert!(!json_text.contains("hunter2"), "{json_text}");
-
-        let text = render_text(&c, Some(Path::new("/proj")), &avail(true));
-        assert!(text.contains("SECRET_TOKEN"), "{text}");
-        assert!(!text.contains("hunter2"), "{text}");
+        let t = text(true);
+        assert!(t.contains("env: SECRET_TOKEN"), "{t}");
+        assert!(!t.contains("hunter2"), "{t}");
     }
 
     #[test]
     fn availability_is_reported_and_a_missing_default_stands_out() {
         let c = cfg();
-        let v = render_json(&c, Some(Path::new("/proj")), &avail(false));
-        assert_eq!(
-            v["providers"]["available"],
-            json!({"claude": true, "codex": false, "grok": false})
-        );
-
         let text = render_text(&c, Some(Path::new("/proj")), &avail(false));
+        assert!(text.contains("claude  installed"), "{text}");
+        assert!(text.contains("grok    NOT INSTALLED"), "{text}");
         assert!(text.contains("NOT INSTALLED  default"), "{text}");
         assert!(
             text.contains("default provider 'codex' is not installed"),
@@ -543,13 +426,11 @@ model = \"opus\"
         // profiles and provider availability are the answer it needs.
         let global = parse_file(GLOBAL, "global", Layer::Global).unwrap();
         let c = resolve(config::ConfigFile::default(), Some(global), "host").unwrap();
-        let v = render_json(&c, None, &avail(true));
-        assert_eq!(v["project_root"], Value::Null);
-        assert_eq!(v["files"]["local"], Value::Null);
-        assert_eq!(v["profiles"]["codex"]["deep"]["model"], "fresh-model");
-
         let text = render_text(&c, None, &avail(true));
         assert!(text.contains("not in a project"), "{text}");
+        assert!(text.contains("project:   none"), "{text}");
+        assert!(text.contains("deep  (global [codex.deep])"), "{text}");
+        assert!(text.contains("model fresh-model"), "{text}");
     }
 
     #[test]

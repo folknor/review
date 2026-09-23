@@ -14,11 +14,11 @@ struct SessionEntry<'a> {
     provider: &'a str,
     archetype: &'a str,
     session_id: &'a str,
-    /// "oneshot" for --oneshot creation events, "session" for --session resumes.
+    /// "oneshot" for --oneshot creation events, "session" for `review resume` resumes.
     kind: &'static str,
     model: Option<&'a str>,
     /// Reasoning effort the run launched with. Recorded alongside `model`
-    /// because a `--session` resume inherits both from this row, and a resume
+    /// because a `review resume` inherits both from this row, and a resume
     /// that restored the model but not the effort would run the right model at
     /// the provider's default depth.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -81,7 +81,7 @@ pub struct SessionRecord {
     /// field existed (none in practice - included for forward compat).
     #[serde(default)]
     pub kind: String,
-    /// Read back by `main::inherited_settings` so a `--session` resume launches
+    /// Read back by `main::inherited_settings` so a `review resume` launches
     /// on the session's own model rather than the provider's default.
     pub model: Option<String>,
     /// Absent on rows written before this was recorded, and on any run that

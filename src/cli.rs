@@ -1,82 +1,79 @@
 use clap::{CommandFactory, Parser, Subcommand};
 
 const AFTER_HELP: &str = "\
+Instructions come on stdin. With no archetype they are sent unchanged; with
+-a, the archetype's priming prompt is prepended. Every run starts a fresh
+session on each provider, and the session ID is printed above the response so
+you can follow up with `review resume <ID>` while the cache is warm.
+
 Settings resolve from the command line, then the project's .review.toml, then
 the global config ($XDG_CONFIG_HOME/review/config.toml, else
-~/.config/review/config.toml). Both files share one format. `review config`
-prints the effective result and where each value came from.
+~/.config/review/config.toml). `review config` shows the effective result and
+where each value came from.
 
-Archetypes are optional priming prompts defined under [archetypes] (name =
-prompt). Without one, stdin is sent unchanged. Groups fan out to multiple
-archetypes (defined under [_groups]). Use \"all\" to fan out to every
-configured archetype.
-
-Providers: claude, codex, grok. Providers come from --provider, or
-[_defaults].providers when --provider is omitted. A provider that is not
-installed fails the run before anything launches.
-
-Profiles are [<provider>.<profile>] tables selected with --profile. A project
-profile replaces a global one of the same name entirely. Legacy
-[<host>.<provider>.<profile>] tables still apply on the host they name, and win
-over a hostless table in the same file.
-
-Each run starts a fresh session and lets the agent fetch code itself. For all
-three providers the new session ID is printed above the response so you can
-follow up while the cache is warm via --session.
+Providers: claude, codex, grok, from --provider or [_defaults].providers. A
+provider that is not installed fails the run before anything launches.
 
 Examples:
-  review init                                              Create a .review.toml
-  review config --json                                     Effective config, for scripts
-  echo \"what does foo() do?\" | review --profile deep               No archetype: stdin as-is
-  echo \"review staged changes\" | review security                   Send to a security session
-  echo \"full review please\" | review all                           Fan out to all archetypes
-  echo \"review please\" | review security,bugs,arch                 Multiple archetypes
-  echo \"how to handle X?\" | review competitors                     Fan out to a group
-  echo \"check now\" | review security --profile opus               Apply the 'opus' profile
-  echo \"follow up\" | review bugs --provider claude --session ID    Resume a specific session
-  echo \"just claude\" | review bugs --provider claude               Only use claude
-  echo \"check for issues\" | review bugs --dry-run                  Preview the prompt";
+  echo \"what does foo() do?\" | review -p deep          Plain prompt, 'deep' profile
+  echo \"audit the auth flow\" | review -a security      With an archetype
+  echo \"full sweep\" | review -a security,bugs          Several archetypes
+  echo \"how to handle X?\" | review -a competitors      A group of archetypes
+  echo \"everything\" | review -a all                    Every configured archetype
+  echo \"just claude\" | review --provider claude        Only one provider
+  echo \"check\" | review -a bugs --dry-run              Preview the prompt
+  echo \"follow up\" | review resume <ID>                Continue a session
+  review config                                        Effective configuration";
 
 #[derive(Parser)]
 #[command(
     name = "review",
-    about = "Fan out code reviews to fresh AI sessions",
-    override_usage = "review [ARCHETYPE|COMMAND] [OPTIONS]",
+    about = "Send a prompt to fresh AI sessions across providers",
+    override_usage = "echo <instructions> | review [OPTIONS]\n       review <COMMAND>",
     after_help = AFTER_HELP,
-    subcommand_precedence_over_arg = true
+    subcommand_precedence_over_arg = true,
+    // The run flags belong to the run. Without this clap accepts them in front
+    // of a subcommand and the subcommand never sees them: `review --dry-run
+    // resume <ID>` parsed, dropped the `--dry-run`, and sent the turn for real.
+    args_conflicts_with_subcommands = true
 )]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Archetype, group, or "all". Omit to send stdin unchanged.
-    #[arg(help_heading = "Archetype")]
+    /// Archetype(s) to prime with: a name, a group, a comma-separated list, or
+    /// "all". Omit to send stdin unchanged.
+    #[arg(short = 'a', long, value_name = "NAME")]
     pub archetype: Option<String>,
 
-    /// Print the assembled prompt instead of sending it
-    #[arg(long)]
-    pub dry_run: bool,
-
-    /// Apply a named profile's model/effort/sandbox/env overrides. Resolved per
-    /// launched provider from [<provider>.<profile>], project config first, then
-    /// global.
-    #[arg(long, value_name = "NAME")]
+    /// Named profile (model/effort/sandbox/env), resolved per launched provider
+    /// from [<provider>.<profile>]
+    #[arg(short = 'p', long, value_name = "NAME")]
     pub profile: Option<String>,
-
-    /// Resume a specific session ID (no prime prepended). The provider is
-    /// inferred from the session record when --provider is omitted.
-    #[arg(long, value_name = "ID")]
-    pub session: Option<String>,
 
     /// Limit to specific providers (comma-separated, e.g. claude,codex)
     #[arg(long, value_delimiter = ',')]
     pub provider: Option<Vec<String>>,
 
-    /// Seconds between each provider launch to avoid rate limits (default: 30, 0 to disable)
+    /// Print the assembled prompt instead of sending it
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Seconds between provider launches, to avoid rate limits (0 disables)
     // Default sourced from `timings` so every production timing value has one
     // home; clap needs a `&'static str`, hence the const rather than the literal.
     #[arg(long, default_value = crate::timings::STAGGER_SECS_STR)]
     pub stagger: u64,
+
+    /// Migration: the archetype used to be positional (`review security`). Still
+    /// accepted, with a warning, so orchestration procedures written against
+    /// the old form keep working until they are updated; `bare` means none.
+    #[arg(hide = true, value_name = "ARCHETYPE")]
+    pub legacy_archetype: Option<String>,
+
+    /// Migration: `--session <ID>` is the old spelling of `review resume <ID>`.
+    #[arg(long, hide = true, value_name = "ID")]
+    pub session: Option<String>,
 }
 
 impl Cli {
@@ -88,16 +85,19 @@ impl Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Create a starter .review.toml in the current directory
-    Init,
+    /// Continue a session from an earlier run, sending stdin as the next turn
+    Resume {
+        /// Session ID, as printed above the earlier run's response
+        #[arg(value_name = "ID")]
+        id: String,
 
-    /// Show the effective configuration: archetypes, groups, providers (and
-    /// whether each is installed), and profiles, each with the file it came from
-    Config {
-        /// Machine-readable output, for orchestrators
+        /// Print what would be sent instead of sending it
         #[arg(long)]
-        json: bool,
+        dry_run: bool,
     },
+
+    /// Show the effective configuration and where each value came from
+    Config,
 
     /// List recent sessions, or show one session's artifacts by ID
     Sessions {
@@ -115,10 +115,112 @@ pub enum Command {
         limit: usize,
     },
 
-    /// List recent forensic bundles written for suspicious/dead codex runs
+    /// List recent forensic bundles written for suspicious codex runs
     Incidents {
         /// Maximum number of incidents to list (most recent first)
         #[arg(long, default_value = "20")]
         limit: usize,
     },
+
+    /// Create a starter .review.toml in the current directory
+    Init,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("review").chain(args.iter().copied()))
+    }
+
+    fn parsed(args: &[&str]) -> Cli {
+        match parse(args) {
+            Ok(cli) => cli,
+            Err(e) => panic!("{args:?} should parse: {e}"),
+        }
+    }
+
+    #[test]
+    fn the_command_definition_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn a_run_takes_its_archetype_and_profile_as_flags() {
+        let cli = parsed(&["-a", "security,bugs", "-p", "deep", "--dry-run"]);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.archetype.as_deref(), Some("security,bugs"));
+        assert_eq!(cli.profile.as_deref(), Some("deep"));
+        assert!(cli.dry_run);
+        assert!(cli.legacy_archetype.is_none());
+    }
+
+    #[test]
+    fn a_plain_run_needs_no_arguments_at_all() {
+        let cli = parsed(&[]);
+        assert!(cli.command.is_none());
+        assert!(cli.archetype.is_none());
+        assert!(cli.legacy_archetype.is_none());
+    }
+
+    #[test]
+    fn resume_takes_its_own_dry_run() {
+        match parsed(&["resume", "abc", "--dry-run"]).command {
+            Some(Command::Resume { id, dry_run }) => {
+                assert_eq!(id, "abc");
+                assert!(dry_run);
+            }
+            _ => panic!("expected resume"),
+        }
+    }
+
+    #[test]
+    fn run_flags_in_front_of_a_subcommand_are_refused() {
+        // Accepting them meant dropping them: `--dry-run resume <ID>` parsed,
+        // the subcommand never saw the flag, and a real turn was sent.
+        for args in [
+            &["--dry-run", "resume", "abc"][..],
+            &["-p", "deep", "resume", "abc"],
+            &["-a", "bugs", "resume", "abc"],
+            &["--provider", "claude", "resume", "abc"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn a_run_flag_never_reaches_a_subcommand() {
+        // After a run flag clap stops matching subcommands, so a lone word is
+        // taken as the legacy positional archetype instead: `-p deep config`
+        // is a run primed with an archetype named `config` (warned about, and
+        // an error unless one exists) - never `review config` with the flag
+        // silently dropped.
+        let cli = parsed(&["-p", "deep", "config"]);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.legacy_archetype.as_deref(), Some("config"));
+    }
+
+    #[test]
+    fn the_old_positional_archetype_still_parses() {
+        let cli = parsed(&["security", "--profile", "deep"]);
+        assert!(cli.command.is_none());
+        assert_eq!(cli.legacy_archetype.as_deref(), Some("security"));
+        assert_eq!(cli.profile.as_deref(), Some("deep"));
+    }
+
+    #[test]
+    fn the_old_session_flag_still_parses() {
+        let cli = parsed(&["bugs", "--session", "abc", "--provider", "codex"]);
+        assert_eq!(cli.session.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn a_subcommand_name_is_the_subcommand() {
+        assert!(matches!(parsed(&["config"]).command, Some(Command::Config)));
+        assert!(matches!(
+            parsed(&["sessions", "--all"]).command,
+            Some(Command::Sessions { all: true, .. })
+        ));
+    }
 }

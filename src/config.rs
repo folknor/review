@@ -55,11 +55,27 @@ pub fn sandbox_for(provider: &str, sandbox: &str) -> String {
     }
 }
 
-/// Names that can't be archetypes or groups because the CLI routes them
-/// elsewhere: `all` (fan-out keyword) and the clap subcommands, plus the
-/// auto-generated `help`. Without this guard such a config entry parses fine but
-/// is unreachable - clap intercepts the name. Keep in step with `cli::Command`.
-pub const RESERVED_NAMES: &[&str] = &["all", "init", "sessions", "incidents", "config", "help"];
+/// Names that can't be archetypes or groups: `all`, the `-a` keyword for every
+/// configured archetype, and the subcommand names. `-a` itself cannot collide
+/// with a subcommand, but the legacy positional form can - `review sessions`
+/// runs the subcommand, silently, rather than the archetype - so they stay
+/// reserved while that alias exists. Keep in step with `cli::Command` and the
+/// "Reserved words" table in CLAUDE.md.
+pub const RESERVED_NAMES: &[&str] = &[
+    "all",
+    "resume",
+    "config",
+    "sessions",
+    "incidents",
+    "init",
+    "help",
+];
+
+/// The legacy positional `review bare` means "no archetype" regardless of the
+/// config, so an archetype named `bare` must mean that too: an empty prime.
+/// `bare = ""` is in most existing configs and stays valid; anything else would
+/// be silently ignored by `review bare`.
+const BARE: &str = "bare";
 
 /// Which file a resolved value came from.
 ///
@@ -520,13 +536,19 @@ pub fn parse_file(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile> {
         hosts.insert(key, host_profiles);
     }
 
-    for name in archetypes.keys() {
+    for (name, prime) in &archetypes {
         if RESERVED_NAMES.contains(&name.as_str()) {
             bail!("'{name}' is a reserved name and cannot be used as an archetype in {origin}");
         }
+        if name == BARE && !prime.trim().is_empty() {
+            bail!(
+                "archetype 'bare' in {origin} has a prompt, but `bare` means no archetype - \
+                 `review bare` ignores it\n  Give it an empty prompt (bare = \"\") or rename it."
+            );
+        }
     }
     for (name, members) in &groups {
-        if RESERVED_NAMES.contains(&name.as_str()) {
+        if RESERVED_NAMES.contains(&name.as_str()) || name == BARE {
             bail!("'{name}' is a reserved name and cannot be used as a group in {origin}");
         }
         if members.is_empty() {
@@ -1034,25 +1056,32 @@ security = [\"security\"]
     }
 
     #[test]
-    fn subcommand_names_reserved_as_archetype() {
-        for name in ["sessions", "help", "init", "incidents", "config"] {
-            let raw = format!("[archetypes]\n{name} = \"x\"\n");
-            let result = local_only(&raw, "h");
-            assert!(result.is_err(), "'{name}' should be reserved");
-            assert!(result.unwrap_err().to_string().contains("reserved"));
+    fn subcommand_names_are_reserved_as_archetype_and_group_names() {
+        // `-a` cannot collide with a subcommand, but the legacy positional form
+        // can: `review sessions` runs the subcommand, silently, instead of the
+        // archetype.
+        for name in ["sessions", "help", "init", "incidents", "config", "resume"] {
+            let as_archetype = format!("[archetypes]\n{name} = \"x\"\n");
+            let err = local_only(&as_archetype, "h").unwrap_err().to_string();
+            assert!(err.contains("reserved"), "{name} as archetype: {err}");
+            let as_group = format!("[archetypes]\nx = \"x\"\n[_groups]\n{name} = [\"x\"]\n");
+            let err = local_only(&as_group, "h").unwrap_err().to_string();
+            assert!(err.contains("reserved"), "{name} as group: {err}");
         }
     }
 
     #[test]
-    fn subcommand_name_reserved_as_group() {
-        let raw = "\
-[archetypes]
-bugs = \"x\"
-
-[_groups]
-sessions = [\"bugs\"]
-";
-        let err = local_only(raw, "h").unwrap_err().to_string();
+    fn bare_may_only_be_an_empty_archetype() {
+        // `bare = ""` is in most existing configs and means what `review bare`
+        // means. A prompt under that name would be silently ignored by it.
+        assert!(local_only("[archetypes]\nbare = \"\"\n", "h").is_ok());
+        let err = local_only("[archetypes]\nbare = \"be terse\"\n", "h")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bare"), "{err}");
+        let err = local_only("[archetypes]\nx = \"x\"\n[_groups]\nbare = [\"x\"]\n", "h")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("reserved"), "{err}");
     }
 

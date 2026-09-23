@@ -78,12 +78,12 @@ pub const SIGKILL_ESCALATION: Duration = Duration::from_secs(10);
 /// to shut down cleanly once the operator has asked us to stop.
 pub const SIGTERM_WINDOW: Duration = Duration::from_millis(250);
 
-/// How long since a session was last touched before `--session` refuses to
+/// How long since a session was last touched before `review resume` refuses to
 /// resume it.
 ///
 /// Past this the provider's prompt cache is cold (5 min default, ~1h with the
 /// right env vars, so ~55 min is the realistic cap), and resuming means
-/// reprocessing the whole session prefix at full cost. `--session` is the
+/// reprocessing the whole session prefix at full cost. `review resume` is the
 /// *warm* follow-up path; a cold resume should be a fresh run instead.
 pub const STALE_SESSION: Duration = Duration::from_secs(55 * 60);
 

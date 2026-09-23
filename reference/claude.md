@@ -7,7 +7,7 @@ handling of the three; the cross-provider pieces are in
 ## Invocation
 
 A fresh run is `claude --session-id <generated UUID> --print --permission-mode
-dontAsk`; `--session` resume is `claude --resume <id> --print --permission-mode
+dontAsk`; a `review resume` is `claude --resume <id> --print --permission-mode
 dontAsk`. Profile settings: `model` as `--model`, `effort` as `--effort`, `env`.
 The prompt is piped via stdin. The session ID is generated up front, so it is
 known before the run starts.
@@ -34,6 +34,6 @@ few minutes (see [codex.md](codex.md#the-stall-timeout)).
 
 ## Resume
 
-A `--session` resume carries the model and effort recorded for the session
+A `review resume` carries the model and effort recorded for the session
 (`--model`/`--effort`), as every provider's does - see
 [sandbox.md](sandbox.md#what-a-resume-inherits).

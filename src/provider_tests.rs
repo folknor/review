@@ -983,7 +983,7 @@ fn json_that_is_not_a_result_object_is_a_launch_failure() {
     // deserializes into an all-default `GrokResult`. Reading that as "a turn
     // ran but did not answer" would infer the fact from successful parsing
     // rather than from evidence - and `NoAnswer` returns `Ok`, which tells
-    // `--session` the prompt cache was warmed. An unrecognised pre-turn failure
+    // `review resume` the prompt cache was warmed. An unrecognised pre-turn failure
     // would then mark a cold session warm and get the *next* resume refused.
     let err = super::interpret_grok_output(r#"{"unexpected": "shape"}"#, "Error: something else")
         .expect_err("nothing here says a turn ran");
