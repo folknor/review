@@ -760,6 +760,131 @@ exit 1
     );
 }
 
+/// A stub that answers `SIGINT` the way `codex exec` does: it aborts the turn
+/// and exits 1. `before` runs first - e.g. writing a final answer.
+fn interruptible_stub(scratch: &Scratch, before: &str) -> String {
+    scratch.write_stub(&format!(
+        r#"{preamble}
+printf '%s\n' '{{"type":"event_msg","payload":{{"type":"agent_message","message":"I am now working.","phase":"commentary"}}}}' >> "$ROLL"
+{before}
+trap 'printf "%s\n" "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"turn_aborted\",\"reason\":\"interrupted\"}}}}" >> "$ROLL"; exit 1' INT
+# Short sleeps, so the trap runs promptly: sh defers it until the foreground
+# command returns.
+while :; do sleep 0.05; done
+"#,
+        preamble = stub_preamble()
+    ))
+}
+
+/// Run `stub` as the owner and `interrupt_cmd::interrupt` against it, the way
+/// `review interrupt` would from another process. The owner's sidecar row -
+/// which `run_codex_json` does not write itself - is appended when its run
+/// returns, as the fan-out task does.
+async fn interrupt_stub(
+    scratch: &Scratch,
+    stub: &str,
+) -> (RunOutput, Result<crate::interrupt_cmd::Outcome>) {
+    let mut runtime = fast_runtime(scratch);
+    // The stub is silent while it waits to be interrupted; the stall timeout
+    // must not be what ends it.
+    runtime.timings.stall_grace = None;
+    let data_root = scratch.data_root();
+    let rows = std::sync::Mutex::new(Vec::<crate::sessions::SessionRecord>::new());
+
+    let owner = async {
+        let run = run_stub_with(scratch, stub, &runtime)
+            .await
+            .expect("run completes");
+        let row = serde_json::json!({
+            "timestamp": "t", "epoch_secs": 1, "project": "/p", "hostname": "h",
+            "audit_id": "a", "provider": "codex", "archetype": "bare",
+            "session_id": run.session_id.clone().expect("session id"),
+            "operator_prompt": "", "assembled_prompt": "", "review_version": "0",
+            "digest": run.digest.as_ref().map(Digest::summary),
+        });
+        rows.lock()
+            .expect("rows")
+            .push(serde_json::from_value(row).expect("row parses"));
+        run
+    };
+    let interrupter = async {
+        // `review interrupt` refuses a run whose pid is not offered yet, so
+        // wait for it the way an operator would retry.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::inflight::live_marker(STUB_SESSION, Some(&data_root))
+            .and_then(|m| m.child_pid)
+            .is_none()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "codex's pid never offered"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        crate::interrupt_cmd::interrupt(STUB_SESSION, Some(&data_root), || {
+            rows.lock().expect("rows").clone()
+        })
+        .await
+    };
+    tokio::join!(owner, interrupter)
+}
+
+/// `review interrupt` end to end, against a run that has no answer yet. From
+/// the exit status alone this is a mid-turn death; the request is what must
+/// turn it into an interrupt: flagged on the digest (so the fan-out does not
+/// auto-resume past it), no incident bundle, the request consumed, and the verb
+/// reporting an interrupted session.
+#[tokio::test]
+async fn an_operator_interrupt_is_not_reported_as_a_death() {
+    let scratch = Scratch::new();
+    let stub = interruptible_stub(&scratch, "");
+    let (run, outcome) = interrupt_stub(&scratch, &stub).await;
+    let outcome = outcome.expect("the verb succeeds");
+    assert!(outcome.interrupted, "the verb reports the interrupt");
+    let digest = run.digest.expect("digest");
+
+    assert!(digest.interrupted, "the digest must record the interrupt");
+    assert!(digest.summary().interrupted, "and persist it");
+    assert!(
+        digest
+            .terminated_by_review
+            .as_deref()
+            .is_some_and(|why| why.contains("operator interrupt")),
+        "got {:?}",
+        digest.terminated_by_review
+    );
+    assert_eq!(digest.exit_code, Some(1));
+    assert_eq!(run.session_id.as_deref(), Some(STUB_SESSION));
+    assert!(
+        scratch.incident_dirs().is_empty(),
+        "an interrupt is explained, so it is not an incident"
+    );
+    assert!(
+        !crate::inflight::take_interrupt_request(STUB_SESSION, Some(&scratch.data_root())),
+        "the run consumed the request"
+    );
+}
+
+/// A request is not an interrupt when the run already has its answer - codex
+/// finished before the signal landed, or answered and then took the signal.
+/// Calling that interrupted would report a completed run as cut short.
+#[tokio::test]
+async fn a_run_that_already_answered_is_not_marked_interrupted() {
+    let scratch = Scratch::new();
+    let stub = interruptible_stub(&scratch, r#"printf '%s' 'THE ANSWER' > "$LAST_MSG""#);
+    let (run, outcome) = interrupt_stub(&scratch, &stub).await;
+
+    let digest = run.digest.expect("digest");
+    assert!(digest.captured, "the answer was written before the signal");
+    assert!(!digest.interrupted, "so the run is not an interrupt");
+    assert!(digest.terminated_by_review.is_none());
+    assert_eq!(run.text, "THE ANSWER");
+    assert!(
+        !outcome.expect("the verb succeeds").interrupted,
+        "and the verb says the run ended first"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // grok output classification
 //

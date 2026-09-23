@@ -64,6 +64,7 @@ pub fn sandbox_for(provider: &str, sandbox: &str) -> String {
 pub const RESERVED_NAMES: &[&str] = &[
     "all",
     "resume",
+    "interrupt",
     "config",
     "sessions",
     "incidents",

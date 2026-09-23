@@ -101,8 +101,9 @@ pub fn log_result(
         }
     };
 
+    // One `write_all` of the whole line - see `sessions::record`.
     use std::io::Write;
-    if let Err(e) = writeln!(file, "{line}") {
+    if let Err(e) = file.write_all(format!("{line}\n").as_bytes()) {
         eprintln!("warning: failed to write audit entry: {e}");
     }
 }

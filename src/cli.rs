@@ -23,6 +23,7 @@ Examples:
   echo \"just claude\" | review --provider claude        Only one provider
   echo \"check\" | review -a bugs --dry-run              Preview the prompt
   echo \"follow up\" | review resume <ID>                Continue a session
+  review interrupt <ID>                                Stop a codex run mid-turn
   review config                                        Effective configuration";
 
 #[derive(Parser)]
@@ -94,6 +95,13 @@ pub enum Command {
         /// Print what would be sent instead of sending it
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// Interrupt a codex run in flight, then print how to resume its session
+    Interrupt {
+        /// Session ID of the run, as listed by `review sessions`
+        #[arg(value_name = "ID")]
+        id: String,
     },
 
     /// Show the effective configuration and where each value came from
@@ -213,6 +221,15 @@ mod tests {
     fn the_old_session_flag_still_parses() {
         let cli = parsed(&["bugs", "--session", "abc", "--provider", "codex"]);
         assert_eq!(cli.session.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn interrupt_takes_a_session_id() {
+        match parsed(&["interrupt", "abc"]).command {
+            Some(Command::Interrupt { id }) => assert_eq!(id, "abc"),
+            _ => panic!("expected interrupt"),
+        }
+        assert!(parse(&["interrupt"]).is_err(), "the id is required");
     }
 
     #[test]

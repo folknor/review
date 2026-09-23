@@ -7,6 +7,7 @@ mod grok_home;
 mod incident;
 mod inflight;
 mod input;
+mod interrupt_cmd;
 mod lock;
 mod prompt;
 mod provider;
@@ -132,6 +133,193 @@ fn record_run(
     }
 }
 
+/// What one fan-out task needs to record its runs.
+struct RecordCtx {
+    project_root: std::path::PathBuf,
+    private: bool,
+    audit_id: String,
+    archetype: String,
+    env_keys: Vec<String>,
+    operator_prompt: String,
+    prompt: String,
+}
+
+impl RecordCtx {
+    fn record(&self, result: &provider::ProviderResult) {
+        record_run(
+            &self.project_root,
+            self.private,
+            &self.audit_id,
+            &self.archetype,
+            &self.env_keys,
+            &self.operator_prompt,
+            &self.prompt,
+            result,
+        );
+    }
+}
+
+/// One provider launch in the fan-out, with its resolved profile.
+struct Launch {
+    provider: String,
+    model: Option<String>,
+    effort: Option<String>,
+    sandbox: Option<String>,
+    writable_roots: Vec<String>,
+    env: Option<std::collections::BTreeMap<String, String>>,
+    config: Vec<String>,
+    prompt: String,
+    root: std::path::PathBuf,
+    runtime: provider::CodexRuntime,
+    delay: std::time::Duration,
+}
+
+impl Launch {
+    /// A fresh run (`session` empty) or the auto-resume of one, on this
+    /// launch's profile. An auto-resume must reuse the profile whole - roots
+    /// included - or the retry launches narrower than the run it replaces.
+    async fn invoke(&self, session: &str, prompt: &str) -> provider::ProviderResult {
+        provider::invoke(
+            &self.provider,
+            session,
+            self.model.as_deref(),
+            self.effort.as_deref(),
+            self.sandbox.as_deref(),
+            &self.writable_roots,
+            self.env.as_ref(),
+            &self.config,
+            prompt,
+            &self.root,
+            session.is_empty(),
+            // The fan-out serializes launches with its own stagger sleep, and an
+            // auto-resume runs inside an already-launched task, so neither needs
+            // a launch handshake.
+            None,
+            &self.runtime,
+        )
+        .await
+    }
+}
+
+/// A task's reportable `result` plus, when auto-resume ran, the *other*
+/// invocation (`also`). Both are persisted so no provider work or death is
+/// invisible to the audit/sidecar logs.
+struct TaskOutcome {
+    result: provider::ProviderResult,
+    also: Option<provider::ProviderResult>,
+}
+
+/// What to do about a fresh run that has just ended.
+#[derive(Debug, PartialEq)]
+enum AfterRun {
+    /// Report it as it is.
+    Report,
+    /// The operator interrupted it; resuming past that would undo exactly what
+    /// they asked for.
+    Interrupted,
+    /// It stated why it produced nothing; a retry would buy the same refusal.
+    StatedFailure(String),
+    /// A codex mid-turn death: resume this session once, cache still warm.
+    AutoResume(String),
+}
+
+/// The "work around" for codex mid-turn deaths: a run that ended with no real
+/// final answer gets one immediate resume with a nudge, on the same profile. A
+/// manual resume is what rescued the original Death 2. Only a run that produced
+/// nothing is a candidate at all; of those, an interrupted one and one with a
+/// stated reason are left alone.
+fn after_run(provider_name: &str, first: &provider::ProviderResult) -> AfterRun {
+    if first.digest.as_ref().is_some_and(|d| d.interrupted) {
+        return AfterRun::Interrupted;
+    }
+    if let Some(why) = stated_failure(first).filter(|_| died_without_answer(first)) {
+        return AfterRun::StatedFailure(why.to_string());
+    }
+    match &first.session_id {
+        Some(sid) if provider_name == "codex" && died_without_answer(first) => {
+            AfterRun::AutoResume(sid.clone())
+        }
+        _ => AfterRun::Report,
+    }
+}
+
+/// Which of a dead run and its auto-resume to report. The resume wins when it
+/// produced an answer, and also when the operator interrupted it: then it is
+/// the run the interrupt is about, and reporting the first run's death instead
+/// would hide the resume command.
+fn after_auto_resume(
+    first: provider::ProviderResult,
+    mut second: provider::ProviderResult,
+) -> TaskOutcome {
+    if got_final_answer(&second) {
+        if let Ok(text) = second.output.as_mut() {
+            *text = format!(
+                "(auto-resumed after the initial run died without a final answer)\n\n{text}"
+            );
+        }
+        return TaskOutcome {
+            result: second,
+            also: Some(first),
+        };
+    }
+    if second.digest.as_ref().is_some_and(|d| d.interrupted) {
+        return TaskOutcome {
+            result: second,
+            also: Some(first),
+        };
+    }
+    // Resume didn't help: keep the death as the result, but still persist the
+    // resume's digest/incident.
+    TaskOutcome {
+        result: first,
+        also: Some(second),
+    }
+}
+
+/// One fan-out task: launch, maybe auto-resume, then record.
+///
+/// Recorded here, as each run ends, rather than once every run in the fan-out
+/// has: `review resume` needs the sidecar row, and `review interrupt` waits for
+/// it, so a run must not stay unresumable until its slowest sibling finishes.
+/// The other invocation goes first, so the reported one is the session's latest.
+async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -> TaskOutcome {
+    if !launch.delay.is_zero() {
+        tokio::time::sleep(launch.delay).await;
+    }
+    let prov = &launch.provider;
+    let first = launch.invoke("", &launch.prompt).await;
+    let outcome = match after_run(prov, &first) {
+        AfterRun::Report => TaskOutcome {
+            result: first,
+            also: None,
+        },
+        AfterRun::Interrupted => {
+            eprintln!("{prov} run interrupted by `review interrupt` - not auto-resuming");
+            TaskOutcome {
+                result: first,
+                also: None,
+            }
+        }
+        AfterRun::StatedFailure(why) => {
+            eprintln!("{prov} ended the turn without a final answer: {why}");
+            eprintln!("not auto-resuming - {prov} stated a reason, so a retry would hit it again");
+            TaskOutcome {
+                result: first,
+                also: None,
+            }
+        }
+        AfterRun::AutoResume(sid) => {
+            eprintln!("codex session {sid} died without a final answer - auto-resuming once");
+            let second = launch.invoke(&sid, RESUME_NUDGE).await;
+            after_auto_resume(first, second)
+        }
+    };
+    for run in outcome.also.iter().chain(std::iter::once(&outcome.result)) {
+        ctx.record(run);
+    }
+    outcome
+}
+
 /// The archetype selection: `-a`, or the positional form it replaced.
 ///
 /// The archetype used to be the positional argument, which put archetypes and
@@ -187,6 +375,10 @@ async fn main() -> Result<()> {
 
     if let Some(cli::Command::Resume { id, dry_run }) = &cli.command {
         return run_session_resume(id, *dry_run, started).await;
+    }
+
+    if let Some(cli::Command::Interrupt { id }) = &cli.command {
+        return interrupt_cmd::run(id).await;
     }
 
     if let Some(cli::Command::Sessions { id, all, limit }) = &cli.command {
@@ -402,19 +594,8 @@ async fn main() -> Result<()> {
 
     // Spawn all providers with staggered launches to avoid rate limits
     let stagger = std::time::Duration::from_secs(cli.stagger);
-    // A task yields its reportable `result` plus, when auto-resume ran, the
-    // *other* invocation (`also`): the initial death when the resume rescued it,
-    // or the failed resume when it didn't. Both are persisted so no provider
-    // work or death is invisible to the audit/sidecar logs.
-    struct TaskOutcome {
-        result: provider::ProviderResult,
-        also: Option<provider::ProviderResult>,
-    }
     struct PendingResult {
-        archetype: String,
-        prompt: String,
-        operator_prompt: String,
-        env_keys: Vec<String>,
+        ctx: std::sync::Arc<RecordCtx>,
         handle: tokio::task::JoinHandle<TaskOutcome>,
     }
     let mut pending: Vec<PendingResult> = Vec::new();
@@ -442,107 +623,31 @@ async fn main() -> Result<()> {
                 .map(|m| m.keys().cloned().collect())
                 .unwrap_or_default();
 
-            let prov = prov_name.clone();
-            let prompt = assembled.clone();
-            let root = project_root.clone();
-            let runtime = codex_runtime.clone();
-            let delay = stagger * launch_count;
-
-            let prompt_for_audit = prompt.clone();
-            let operator_prompt = stdin_instructions.clone();
-            pending.push(PendingResult {
+            let launch = Launch {
+                provider: prov_name.clone(),
+                model,
+                effort,
+                sandbox,
+                writable_roots: profile_roots,
+                env,
+                config,
+                prompt: assembled.clone(),
+                root: project_root.clone(),
+                runtime: codex_runtime.clone(),
+                delay: stagger * launch_count,
+            };
+            let ctx = std::sync::Arc::new(RecordCtx {
+                project_root: project_root.clone(),
+                private: cfg.audit.private,
+                audit_id: audit_id.clone(),
                 archetype: arch_name.clone(),
-                prompt: prompt_for_audit,
-                operator_prompt,
                 env_keys,
-                handle: tokio::spawn(async move {
-                    if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
-                    }
-                    let first = provider::invoke(
-                        &prov,
-                        "",
-                        model.as_deref(),
-                        effort.as_deref(),
-                        sandbox.as_deref(),
-                        &profile_roots,
-                        env.as_ref(),
-                        &config,
-                        &prompt,
-                        &root,
-                        true,
-                        // The fan-out path serializes launches with its own
-                        // stagger sleep, so it needs no launch handshake.
-                        None,
-                        &runtime,
-                    )
-                    .await;
-                    // The "work around" for codex mid-turn deaths: a run that
-                    // ended with no real final answer gets one immediate resume
-                    // (cache still warm) with a nudge, reusing the same profile.
-                    // A manual resume is what rescued the original Death 2.
-                    // Only a run that produced nothing is a resume candidate at
-                    // all; of those, one with a stated reason is skipped, because
-                    // resending it just buys the same refusal twice (see
-                    // `stated_failure`).
-                    if let Some(why) = stated_failure(&first).filter(|_| died_without_answer(&first))
-                    {
-                        eprintln!("{prov} ended the turn without a final answer: {why}");
-                        eprintln!(
-                            "not auto-resuming - {prov} stated a reason, so a retry would hit it again"
-                        );
-                    } else if prov == "codex"
-                        && died_without_answer(&first)
-                        && let Some(sid) = first.session_id.clone()
-                    {
-                        eprintln!(
-                            "codex session {sid} died without a final answer - auto-resuming once"
-                        );
-                        let second = provider::invoke(
-                            &prov,
-                            &sid,
-                            model.as_deref(),
-                            effort.as_deref(),
-                            sandbox.as_deref(),
-                            // An auto-resume reuses the dead run's profile, so
-                            // it must reuse its roots too or the retry launches
-                            // narrower than the run it is replacing.
-                            &profile_roots,
-                            env.as_ref(),
-                            &config,
-                            RESUME_NUDGE,
-                            &root,
-                            false,
-                            // Auto-resume runs inside an already-launched task.
-                            None,
-                            &runtime,
-                        )
-                        .await;
-                        if got_final_answer(&second) {
-                            let mut second = second;
-                            if let Ok(text) = second.output.as_mut() {
-                                *text = format!(
-                                    "(auto-resumed after the initial run died without a final answer)\n\n{text}"
-                                );
-                            }
-                            // Resume rescued it: report it, keep the death's record.
-                            return TaskOutcome {
-                                result: second,
-                                also: Some(first),
-                            };
-                        }
-                        // Resume didn't help: keep the death as the result, but
-                        // still persist the resume's digest/incident.
-                        return TaskOutcome {
-                            result: first,
-                            also: Some(second),
-                        };
-                    }
-                    TaskOutcome {
-                        result: first,
-                        also: None,
-                    }
-                }),
+                operator_prompt: stdin_instructions.clone(),
+                prompt: assembled.clone(),
+            });
+            pending.push(PendingResult {
+                ctx: std::sync::Arc::clone(&ctx),
+                handle: tokio::spawn(run_launch(launch, ctx)),
             });
             launch_count += 1;
         }
@@ -561,10 +666,12 @@ async fn main() -> Result<()> {
     // Collect results
     let mut results: Vec<(String, provider::ProviderResult)> = Vec::new();
     for p in pending {
-        let outcome = match p.handle.await {
-            Ok(o) => o,
-            Err(err) => TaskOutcome {
-                result: provider::ProviderResult {
+        // A finished task has already recorded its runs; only a panicked one
+        // (which never got the chance) is recorded here.
+        let result = match p.handle.await {
+            Ok(outcome) => outcome.result,
+            Err(err) => {
+                let result = provider::ProviderResult {
                     provider: "unknown".into(),
                     output: Err(anyhow::anyhow!("task panicked: {err}")),
                     session_id: None,
@@ -579,38 +686,13 @@ async fn main() -> Result<()> {
                     effort: None,
                     served: provider::Served::default(),
                     grok_trust: None,
-                },
-                also: None,
-            },
+                };
+                p.ctx.record(&result);
+                result
+            }
         };
-        let TaskOutcome { result, also } = outcome;
 
-        // Record the other invocation first (an auto-resume's initial death or
-        // failed retry) so both are in the logs regardless of which we report.
-        if let Some(ref also) = also {
-            record_run(
-                &project_root,
-                cfg.audit.private,
-                &audit_id,
-                &p.archetype,
-                &p.env_keys,
-                &p.operator_prompt,
-                &p.prompt,
-                also,
-            );
-        }
-        record_run(
-            &project_root,
-            cfg.audit.private,
-            &audit_id,
-            &p.archetype,
-            &p.env_keys,
-            &p.operator_prompt,
-            &p.prompt,
-            &result,
-        );
-
-        results.push((p.archetype, result));
+        results.push((p.ctx.archetype.clone(), result));
     }
 
     // Print results
@@ -1139,6 +1221,8 @@ fn print_digest_summary(d: &provider::DigestSummary) {
     }
     if d.recovered_from_transcript {
         println!("recovered: final answer restored from transcript");
+    } else if d.interrupted {
+        println!("note: interrupted by the operator (`review interrupt`)");
     } else if d.turn_error.is_some() {
         // Explained above - don't also guess "died mid-turn" at it.
         println!("note: no conclusion was produced");
@@ -1185,7 +1269,7 @@ fn run_sessions(all: bool, limit: usize) -> Result<()> {
     // touch count that has not moved. During the codex hang that motivated the
     // watchdog, that ambiguity is what made a wedged 10-hour run look like
     // nothing was happening at all.
-    let mut live = inflight::read_live();
+    let mut live = inflight::read_live(None);
     if let Some(ref proj) = project_filter {
         live.retain(|m| &m.project == proj);
     }
@@ -1490,5 +1574,101 @@ mod tests {
         assert!(got.writable_roots.is_empty());
         assert_eq!(got.model, None);
         assert_eq!(got.effort, None);
+    }
+
+    /// A codex result with session `sid`: `answered` says whether `-o` captured
+    /// a final answer; `interrupted` whether `review interrupt` ended it.
+    fn codex_run(sid: &str, answered: bool, interrupted: bool) -> provider::ProviderResult {
+        provider::ProviderResult {
+            provider: "codex".into(),
+            output: Ok(format!("text of {sid}")),
+            session_id: Some(sid.into()),
+            digest: Some(provider::Digest {
+                exit_code: Some(i32::from(!answered)),
+                signal: None,
+                captured: answered,
+                recovered_from_transcript: false,
+                turns: 1,
+                usage: provider::Usage::default(),
+                log_lines: Vec::new(),
+                transcript: None,
+                incident_path: None,
+                terminated_by_review: None,
+                quiet_secs: None,
+                last_rollout_event: None,
+                turn_error: None,
+                interrupted,
+            }),
+            completed_epoch: 0,
+            sandbox: None,
+            writable_roots: Vec::new(),
+            model: None,
+            effort: None,
+            served: provider::Served::default(),
+            grok_trust: None,
+        }
+    }
+
+    #[test]
+    fn a_codex_death_is_auto_resumed() {
+        assert_eq!(
+            after_run("codex", &codex_run("s", false, false)),
+            AfterRun::AutoResume("s".into())
+        );
+    }
+
+    #[test]
+    fn an_interrupted_run_is_not_auto_resumed() {
+        assert_eq!(
+            after_run("codex", &codex_run("s", false, true)),
+            AfterRun::Interrupted
+        );
+    }
+
+    #[test]
+    fn an_answered_run_is_reported() {
+        assert_eq!(
+            after_run("codex", &codex_run("s", true, false)),
+            AfterRun::Report
+        );
+    }
+
+    #[test]
+    fn an_interrupted_auto_resume_is_the_run_reported() {
+        // Reporting the first run's death instead would hide the resume
+        // command, and its row must come first so the resume is the latest.
+        let outcome = after_auto_resume(
+            codex_run("first", false, false),
+            codex_run("second", false, true),
+        );
+        assert_eq!(
+            outcome.result.output.as_deref().ok(),
+            Some("text of second")
+        );
+        assert!(
+            outcome
+                .also
+                .is_some_and(|r| r.output.as_deref().ok() == Some("text of first"))
+        );
+    }
+
+    #[test]
+    fn a_failed_auto_resume_keeps_the_death_as_the_result() {
+        let outcome = after_auto_resume(
+            codex_run("first", false, false),
+            codex_run("second", false, false),
+        );
+        assert_eq!(outcome.result.output.as_deref().ok(), Some("text of first"));
+    }
+
+    #[test]
+    fn a_rescuing_auto_resume_is_reported_and_labelled() {
+        let outcome = after_auto_resume(
+            codex_run("first", false, false),
+            codex_run("second", true, false),
+        );
+        let text = outcome.result.output.expect("text");
+        assert!(text.starts_with("(auto-resumed"), "got {text:?}");
+        assert!(text.ends_with("text of second"));
     }
 }

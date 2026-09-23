@@ -100,6 +100,11 @@ pub fn stale_session(provider: &str) -> Duration {
     }
 }
 
+/// How often `review interrupt` checks whether the interrupted run has been
+/// recorded. codex winds a turn down in seconds, so this only sets how promptly
+/// the resume command is printed.
+pub const INTERRUPT_POLL: Duration = Duration::from_millis(500);
+
 /// Default seconds between provider launches, to avoid rate limits. Overridable
 /// with `--stagger`; `0` disables.
 ///

@@ -163,6 +163,7 @@ async fn read_capped_stdout<R>(
     cap: usize,
     out: SharedBuf,
     sid_tx: tokio::sync::watch::Sender<Option<String>>,
+    first_output: tokio::sync::watch::Sender<bool>,
     mut scanning: bool,
 ) where
     R: tokio::io::AsyncRead + Unpin,
@@ -175,6 +176,8 @@ async fn read_capped_stdout<R>(
         match r.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                // `send_if_modified` so only the first chunk wakes the watcher.
+                first_output.send_if_modified(|seen| !std::mem::replace(seen, true));
                 if scanning {
                     partial.extend_from_slice(&chunk[..n]);
                     // Process whole lines; keep the trailing fragment.
@@ -401,6 +404,10 @@ pub struct Digest {
     /// that the cause is *known and stated*, so it must not be reported as a
     /// mystery death or retried - see `print_digest` and the auto-resume gate.
     pub turn_error: Option<String>,
+    /// The operator ended this run with `review interrupt`. Its missing answer
+    /// is therefore deliberate: no auto-resume, no incident bundle, and the
+    /// output says how to continue the session instead of reporting a death.
+    pub interrupted: bool,
 }
 
 /// Flat, serializable projection of a `Digest` for the sidecar and audit logs.
@@ -445,6 +452,9 @@ pub struct DigestSummary {
     /// with the hang class: `jq 'select(.digest.turn_error != null)'`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_error: Option<String>,
+    /// Ended by `review interrupt`: `jq 'select(.digest.interrupted)'`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
 }
 
 impl Digest {
@@ -466,6 +476,7 @@ impl Digest {
             quiet_secs: self.quiet_secs,
             last_rollout_event: self.last_rollout_event.clone(),
             turn_error: self.turn_error.clone(),
+            interrupted: self.interrupted,
         }
     }
 }
@@ -1773,6 +1784,7 @@ fn grok_no_answer_digest(reason: String, status: &std::process::ExitStatus) -> D
         quiet_secs: None,
         last_rollout_event: None,
         turn_error: Some(reason),
+        interrupted: false,
     }
 }
 
@@ -2211,6 +2223,13 @@ async fn run_codex_json(
         );
     }
 
+    // A request left over from an earlier run of this session (its `review`
+    // killed before consuming it) is not aimed at this one. A fresh run needs
+    // no such check: its session id is new.
+    if let Some(sid) = known_session_id.as_deref() {
+        let _ = crate::inflight::take_interrupt_request(sid, runtime.data_root.as_deref());
+    }
+
     let start = std::time::Instant::now();
     // (Gating transcript recovery to this run's turn is done by byte offset -
     // `rollout_baseline` above - not by a wall-clock stamp, which was too coarse
@@ -2237,6 +2256,16 @@ async fn run_codex_json(
     // Kept for after the wait, so the id survives a stdout reader that never
     // reached EOF (see where `session_id` is resolved).
     let sid_rx_final = sid_rx.clone();
+    // The group leader: what the watchdog and signal supervisor kill, and what
+    // the in-flight marker records for `review interrupt` to signal.
+    let child_pid = child.id();
+    // Flips on codex's first stdout. Until then the pid may be a node wrapper
+    // that has not yet installed the handler forwarding SIGINT to the native
+    // binary, so interrupting it could kill the wrapper and orphan codex -
+    // still holding the session's writer lock, which would make the resume
+    // `review interrupt` hands back fail. Output from codex proves the wrapper
+    // got that far, so the marker only offers the pid from then on.
+    let (first_output_tx, mut first_output_rx) = tokio::sync::watch::channel(false);
 
     // Mark the run as in flight so `review sessions` can report "turn in flight
     // since <time>" instead of showing the *previous* turn's response while this
@@ -2253,18 +2282,20 @@ async fn run_codex_json(
         let project = project_root.to_string_lossy().into_owned();
         let data_root = runtime.data_root.clone();
         async move {
-            loop {
-                let current = rx.borrow_and_update().clone();
-                if let Some(sid) = current {
-                    let _guard =
-                        crate::inflight::mark(&sid, "codex", &project, data_root.as_deref());
-                    // Hold the marker until this task is aborted.
-                    std::future::pending::<()>().await;
+            let sid = loop {
+                if let Some(sid) = rx.borrow_and_update().clone() {
+                    break sid;
                 }
                 if rx.changed().await.is_err() {
-                    break;
+                    return;
                 }
+            };
+            let mut guard = crate::inflight::mark(&sid, "codex", &project, data_root.as_deref());
+            if first_output_rx.wait_for(|seen| *seen).await.is_ok() {
+                guard.record_child_pid(child_pid);
             }
+            // Hold the marker until this task is aborted.
+            std::future::pending::<()>().await;
         }
     });
 
@@ -2283,6 +2314,7 @@ async fn run_codex_json(
         STDOUT_CAPTURE_CAP,
         std::sync::Arc::clone(&stdout_shared),
         sid_tx,
+        first_output_tx,
         scanning_for_session_id,
     ));
     let stderr_task = tokio::spawn(read_capped(
@@ -2292,7 +2324,6 @@ async fn run_codex_json(
     ));
     let write_task = tokio::spawn(write_stdin(stdin, prompt.as_bytes().to_vec()));
 
-    let child_pid = child.id();
     // Make this run's process group visible to the signal supervisor, so an
     // operator killing `review` takes codex with it instead of orphaning it.
     if let Some(pid) = child_pid {
@@ -2358,6 +2389,14 @@ async fn run_codex_json(
             }
         }
     };
+    let watched_session_id = sid_rx_final.borrow().clone();
+    // Consumed now that codex is reaped, whatever became of it: a request left
+    // behind would mark the session's *next* run as interrupted. Before the
+    // marker goes, because `read_live` discards a request with no marker beside
+    // it. Whether it *counts* waits until we know if an answer was produced.
+    let interrupt_requested = watched_session_id.as_deref().is_some_and(|sid| {
+        crate::inflight::take_interrupt_request(sid, runtime.data_root.as_deref())
+    });
     // Run is over: drop the in-flight marker (aborting the task drops its guard)
     // and stop advertising the group to the signal supervisor. Both happen
     // before the `?` below so a failed wait cannot leak either.
@@ -2365,7 +2404,6 @@ async fn run_codex_json(
     if let Some(pid) = child_pid {
         unregister_group(pid);
     }
-    let watched_session_id = sid_rx_final.borrow().clone();
     let status = status.context("failed to wait for codex")?;
 
     // The child is reaped, so the run is over regardless of what the pipes do.
@@ -2534,10 +2572,20 @@ async fn run_codex_json(
     let recovered_from_transcript = final_from_file.is_none() && recovered.is_some();
     let final_message = final_from_file.or(recovered).or(stream_message);
 
+    // A request only makes this an interrupt if the run has no answer. codex
+    // can finish on its own between `review interrupt` writing the request and
+    // its signal landing, or answer before the signal is read; calling either
+    // interrupted would report a completed run as cut short.
+    let interrupted = interrupt_requested && !captured && !recovered_from_transcript;
+    if interrupted && terminated_by_review.is_none() {
+        terminated_by_review = Some("operator interrupt (`review interrupt`)".to_string());
+    }
+
     // Dump a full forensic bundle for the same suspicious runs we post-mortem -
     // stderr (with backtraces), the raw stream, the transcript tail, the exact
     // argv, and codex's version - so the next death is over-instrumented.
-    let incident_path = if suspicious {
+    // An operator interrupt is not an incident: the missing answer is explained.
+    let incident_path = if suspicious && !interrupted {
         crate::incident::write_bundle(&crate::incident::Incident {
             provider: "codex",
             // The binary actually executed, which is not always "codex": a
@@ -2584,6 +2632,7 @@ async fn run_codex_json(
         quiet_secs,
         last_rollout_event,
         turn_error,
+        interrupted,
     };
 
     // Even when no message came back (a hard freeze before any agent_message,
@@ -2600,7 +2649,9 @@ async fn run_codex_json(
             .as_ref()
             .map(|m| format!("(codex ended the turn: {m})"));
         let base = stated.unwrap_or_else(|| {
-            if digest.exit_code == Some(0) && digest.signal.is_none() {
+            if digest.interrupted {
+                "(interrupted by the operator before a final answer)".to_string()
+            } else if digest.exit_code == Some(0) && digest.signal.is_none() {
                 "(codex produced no final message)".to_string()
             } else {
                 "(codex died without a final answer)".to_string()
@@ -2644,12 +2695,28 @@ pub fn print_result(result: &ProviderResult) {
                 print_digest(d);
             }
             println!("{text}");
+            if let (Some(sid), Some(true)) = (
+                result.session_id.as_deref(),
+                result.digest.as_ref().map(|d| d.interrupted),
+            ) {
+                println!("\n{}", resume_hint(&result.provider, sid));
+            }
         }
         Err(err) => {
             eprintln!("--- {} ---", result.provider);
             eprintln!("error: {err}");
         }
     }
+}
+
+/// How to continue an interrupted session, and by when - shared by the run's
+/// own output and `review interrupt`, so both say the same thing.
+pub fn resume_hint(provider: &str, session_id: &str) -> String {
+    let cutoff = crate::timings::stale_session(provider).as_secs() / 60;
+    format!(
+        "interrupted - continue within {cutoff}m with:\n  \
+         echo \"<message>\" | review resume {session_id}"
+    )
 }
 
 fn print_digest(d: &Digest) {

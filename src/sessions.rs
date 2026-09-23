@@ -292,8 +292,11 @@ pub fn record(
         }
     };
 
+    // One `write_all` of the whole line: `writeln!` on an unbuffered `File`
+    // issues the text and the newline as separate writes, and runs that finish
+    // together record from concurrent tasks, so their rows could interleave.
     use std::io::Write;
-    if let Err(e) = writeln!(file, "{line}") {
+    if let Err(e) = file.write_all(format!("{line}\n").as_bytes()) {
         eprintln!("warning: failed to write session entry: {e}");
     }
 }
