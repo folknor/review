@@ -14,6 +14,29 @@ where each value came from.
 Providers: claude, codex, grok, from --provider or [_defaults].providers. A
 provider that is not installed fails the run before anything launches.
 
+Profiles (-p): a profile resolves to its first definition, looking in the
+project file before the global one, and that definition wins whole. Fields are
+never merged, so a project profile that leaves out `model` does not inherit the
+global profile's `model`. `sandbox` defaults to read-only, so a profile has to
+ask for workspace-write before a run may modify files. Claude ignores `sandbox`:
+what a claude run can touch is decided by Claude Code's own permission settings.
+
+Output: each provider prints a `--- <provider> ---` block, then `session: <ID>`,
+then the response. Codex and grok runs also print a digest between the session
+line and the response:
+  exit / signal     the provider process's exit status
+  captured          true if a final answer was captured; false means the text
+                    below is an interim note, not a conclusion
+  turn failed       the reason the provider gave for ending the turn
+  terminated by review
+                    the stall watchdog killed a codex run that went silent
+  recovered         the final answer was restored from codex's transcript
+  turns / usage     turn count and token usage (input, cached, output, reasoning)
+  transcript        codex's rollout file and its last events
+  incident          a forensic bundle for the run (see `review incidents`)
+The output ends with a `runtime:` line. The exit status is 1 when no provider
+produced an answer, including runs that died, stalled or were interrupted.
+
 Examples:
   echo \"what does foo() do?\" | review -p deep          Plain prompt, 'deep' profile
   echo \"audit the auth flow\" | review -a security      With an archetype
@@ -25,6 +48,38 @@ Examples:
   echo \"follow up\" | review resume <ID>                Continue a session
   review interrupt <ID>                                Stop a codex run mid-turn
   review config                                        Effective configuration";
+
+// The cutoffs are restated from `timings::stale_session` because clap needs a
+// `&'static str`; a test keeps the two in step.
+const RESUME_AFTER_HELP: &str = "\
+The session must come from a run on this host: its provider is read from the
+record that run left (`review sessions` lists them), and an ID with no record
+is refused. There is no --provider, -a or -p. Stdin is sent as-is, with no
+archetype prime, and the session keeps the sandbox, model and effort it was
+started with.
+
+Resuming only pays off while the provider's prompt cache is warm, so a session
+last touched more than 27 minutes ago (codex) or 55 minutes ago (claude, grok)
+is refused. When that happens, start a fresh run and restate the context the
+new session needs.
+
+The exit status is 1 if the turn produced no answer.";
+
+const INTERRUPT_AFTER_HELP: &str = "\
+Only works on codex runs, which cannot be sent a message mid-turn. This ends
+the turn, waits for the run to record its session, and prints the
+`review resume` command. The interrupted run exits 1, like any run that
+produced no answer.";
+
+const CONFIG_AFTER_HELP: &str = "\
+This is the authoritative view of what a run in this directory will use. It
+merges the project's .review.toml with the global config, so reading
+.review.toml alone gives an incomplete and often wrong answer: profiles and
+archetypes may live in the global file, and legacy host tables may shadow them.
+Lists the files consulted, the default providers and whether each is installed
+on this host, archetypes, groups, and profiles, each with its source and any
+definition it shadows. Env vars are listed by name only, never by value.
+Outside a project it shows the global layer alone.";
 
 #[derive(Parser)]
 #[command(
@@ -48,7 +103,8 @@ pub struct Cli {
     pub archetype: Option<String>,
 
     /// Named profile (model/effort/sandbox/env), resolved per launched provider
-    /// from [<provider>.<profile>]
+    /// from [<provider>.<profile>]. The first definition found wins whole;
+    /// sandbox defaults to read-only and claude ignores it (see below)
     #[arg(short = 'p', long, value_name = "NAME")]
     pub profile: Option<String>,
 
@@ -87,6 +143,7 @@ impl Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Continue a session from an earlier run, sending stdin as the next turn
+    #[command(after_help = RESUME_AFTER_HELP)]
     Resume {
         /// Session ID, as printed above the earlier run's response
         #[arg(value_name = "ID")]
@@ -98,6 +155,7 @@ pub enum Command {
     },
 
     /// Interrupt a codex run in flight, then print how to resume its session
+    #[command(after_help = INTERRUPT_AFTER_HELP)]
     Interrupt {
         /// Session ID of the run, as listed by `review sessions`
         #[arg(value_name = "ID")]
@@ -105,6 +163,7 @@ pub enum Command {
     },
 
     /// Show the effective configuration and where each value came from
+    #[command(after_help = CONFIG_AFTER_HELP)]
     Config,
 
     /// List recent sessions, or show one session's artifacts by ID
@@ -152,6 +211,22 @@ mod tests {
     #[test]
     fn the_command_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn resume_help_states_the_current_stale_cutoffs() {
+        for (provider, label) in [("codex", "(codex)"), ("claude", "(claude, grok)")] {
+            let mins = crate::timings::stale_session(provider).as_secs() / 60;
+            let needle = format!("{mins} minutes ago {label}");
+            assert!(
+                RESUME_AFTER_HELP.replace('\n', " ").contains(&needle),
+                "resume help should say {needle:?}"
+            );
+        }
+        assert_eq!(
+            crate::timings::stale_session("grok"),
+            crate::timings::stale_session("claude")
+        );
     }
 
     #[test]
