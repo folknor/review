@@ -63,6 +63,7 @@ pub fn sandbox_for(provider: &str, sandbox: &str) -> String {
 /// "Reserved words" table in CLAUDE.md.
 pub const RESERVED_NAMES: &[&str] = &[
     "all",
+    "message",
     "resume",
     "interrupt",
     "config",

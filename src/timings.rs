@@ -78,6 +78,18 @@ pub const SIGKILL_ESCALATION: Duration = Duration::from_secs(10);
 /// to shut down cleanly once the operator has asked us to stop.
 pub const SIGTERM_WINDOW: Duration = Duration::from_millis(250);
 
+/// How long a signalled `review` waits for its codex runs to end their turns and
+/// be recorded before falling back to killing them.
+///
+/// A signal is usually an orchestrating agent stopping its background task,
+/// not an operator abandoning the work, so the session is kept resumable: each
+/// turn is ended the way `review interrupt` ends one. codex winds a turn down in
+/// seconds; this only bounds a codex that will not. A second signal skips it.
+pub const GRACEFUL_STOP: Duration = Duration::from_secs(15);
+
+/// How often the signal supervisor checks whether those runs are recorded.
+pub const GRACEFUL_STOP_POLL: Duration = Duration::from_millis(100);
+
 /// How long since a session was last touched before `review resume` refuses to
 /// resume it, for providers without a cutoff of their own.
 ///

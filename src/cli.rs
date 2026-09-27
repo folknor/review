@@ -4,7 +4,12 @@ const AFTER_HELP: &str = "\
 Instructions come on stdin. With no archetype they are sent unchanged; with
 -a, the archetype's priming prompt is prepended. Every run starts a fresh
 session on each provider, and the session ID is printed above the response so
-you can follow up with `review resume <ID>` while the cache is warm.
+you can follow up with `review message <ID>` while the cache is warm.
+
+Steering a running agent: `echo \"<new info>\" | review message <ID>`. It ends
+the codex turn in flight and continues the session with your message. Do not
+stop or kill the `review` process to interrupt an agent - use `review message`,
+or `review interrupt <ID>` to stop without a message.
 
 Settings resolve from the command line, then the project's .review.toml, then
 the global config ($XDG_CONFIG_HOME/review/config.toml, else
@@ -45,20 +50,25 @@ Examples:
   echo \"everything\" | review -a all                    Every configured archetype
   echo \"just claude\" | review --provider claude        Only one provider
   echo \"check\" | review -a bugs --dry-run              Preview the prompt
-  echo \"follow up\" | review resume <ID>                Continue a session
+  echo \"follow up\" | review message <ID>               Message a session, running or not
   review interrupt <ID>                                Stop a codex run mid-turn
   review config                                        Effective configuration";
 
 // The cutoffs are restated from `timings::stale_session` because clap needs a
 // `&'static str`; a test keeps the two in step.
-const RESUME_AFTER_HELP: &str = "\
+const MESSAGE_AFTER_HELP: &str = "\
+If a codex turn is in flight, it is interrupted first (as `review interrupt`
+does) - the turn is cut off and whatever it had not finished is lost - and the
+message then continues the session. A claude or grok turn in flight cannot be
+interrupted; the message is refused until it ends.
+
 The session must come from a run on this host: its provider is read from the
 record that run left (`review sessions` lists them), and an ID with no record
 is refused. There is no --provider, -a or -p. Stdin is sent as-is, with no
 archetype prime, and the session keeps the sandbox, model and effort it was
 started with.
 
-Resuming only pays off while the provider's prompt cache is warm, so a session
+Continuing only pays off while the provider's prompt cache is warm, so a session
 last touched more than 27 minutes ago (codex) or 55 minutes ago (claude, grok)
 is refused. When that happens, start a fresh run and restate the context the
 new session needs.
@@ -66,10 +76,14 @@ new session needs.
 The exit status is 1 if the turn produced no answer.";
 
 const INTERRUPT_AFTER_HELP: &str = "\
-Only works on codex runs, which cannot be sent a message mid-turn. This ends
-the turn, waits for the run to record its session, and prints the
-`review resume` command. The interrupted run exits 1, like any run that
-produced no answer.";
+Only works on codex runs. This ends the turn, waits for the run to record its
+session, and prints the `review message` command that continues it. The
+interrupted run exits 1, like any run that produced no answer. To stop a turn
+and send new information in one step, use `review message` instead.
+
+Signalling the `review` process (Ctrl-C, SIGTERM, a stopped background task)
+ends its codex turns the same way and records them before exiting; a second
+signal kills them outright. SIGKILL loses the session.";
 
 const CONFIG_AFTER_HELP: &str = "\
 This is the authoritative view of what a run in this directory will use. It
@@ -142,8 +156,21 @@ impl Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Continue a session from an earlier run, sending stdin as the next turn
-    #[command(after_help = RESUME_AFTER_HELP)]
+    /// Send stdin to a session, interrupting its codex turn if one is running
+    #[command(after_help = MESSAGE_AFTER_HELP)]
+    Message {
+        /// Session ID, as printed above the earlier run's response
+        #[arg(value_name = "ID")]
+        id: String,
+
+        /// Print what would be sent instead of sending it (interrupts nothing)
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Migration: the old name of `message`, for an idle session. Still
+    /// accepted, with a warning.
+    #[command(hide = true)]
     Resume {
         /// Session ID, as printed above the earlier run's response
         #[arg(value_name = "ID")]
@@ -214,13 +241,13 @@ mod tests {
     }
 
     #[test]
-    fn resume_help_states_the_current_stale_cutoffs() {
+    fn message_help_states_the_current_stale_cutoffs() {
         for (provider, label) in [("codex", "(codex)"), ("claude", "(claude, grok)")] {
             let mins = crate::timings::stale_session(provider).as_secs() / 60;
             let needle = format!("{mins} minutes ago {label}");
             assert!(
-                RESUME_AFTER_HELP.replace('\n', " ").contains(&needle),
-                "resume help should say {needle:?}"
+                MESSAGE_AFTER_HELP.replace('\n', " ").contains(&needle),
+                "message help should say {needle:?}"
             );
         }
         assert_eq!(
@@ -245,6 +272,17 @@ mod tests {
         assert!(cli.command.is_none());
         assert!(cli.archetype.is_none());
         assert!(cli.legacy_archetype.is_none());
+    }
+
+    #[test]
+    fn message_takes_its_own_dry_run() {
+        match parsed(&["message", "abc", "--dry-run"]).command {
+            Some(Command::Message { id, dry_run }) => {
+                assert_eq!(id, "abc");
+                assert!(dry_run);
+            }
+            _ => panic!("expected message"),
+        }
     }
 
     #[test]

@@ -283,6 +283,9 @@ fn after_auto_resume(
 /// it, so a run must not stay unresumable until its slowest sibling finishes.
 /// The other invocation goes first, so the reported one is the session's latest.
 async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -> TaskOutcome {
+    // Held until the rows below are written, so a signalled `review` does not
+    // exit with this session unrecorded (see `provider::install_signal_supervisor`).
+    let _unrecorded = provider::Unrecorded::for_provider(&launch.provider);
     if !launch.delay.is_zero() {
         tokio::time::sleep(launch.delay).await;
     }
@@ -294,7 +297,7 @@ async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -> TaskOutco
             also: None,
         },
         AfterRun::Interrupted => {
-            eprintln!("{prov} run interrupted by `review interrupt` - not auto-resuming");
+            eprintln!("{prov} run interrupted - not auto-resuming");
             TaskOutcome {
                 result: first,
                 also: None,
@@ -316,6 +319,16 @@ async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -> TaskOutco
     };
     for run in outcome.also.iter().chain(std::iter::once(&outcome.result)) {
         ctx.record(run);
+    }
+    // A signalled `review` exits once every codex run is recorded, before the
+    // results are printed, so say here how to continue this one.
+    if provider::stop_requested()
+        && let (Some(sid), Some(true)) = (
+            outcome.result.session_id.as_deref(),
+            outcome.result.digest.as_ref().map(|d| d.interrupted),
+        )
+    {
+        eprintln!("{}", provider::resume_hint(prov, sid));
     }
     outcome
 }
@@ -373,8 +386,14 @@ async fn main() -> Result<()> {
         return config_cmd::run();
     }
 
+    if let Some(cli::Command::Message { id, dry_run }) = &cli.command {
+        return run_message(id, *dry_run, started).await;
+    }
+
+    // Migration: `review resume` is `review message` on an idle session.
     if let Some(cli::Command::Resume { id, dry_run }) = &cli.command {
-        return run_session_resume(id, *dry_run, started).await;
+        eprintln!("warning: `review resume <ID>` is now `review message <ID>`");
+        return run_session_resume(id, *dry_run, started, None).await;
     }
 
     if let Some(cli::Command::Interrupt { id }) = &cli.command {
@@ -396,14 +415,14 @@ async fn main() -> Result<()> {
     // Everything that rode along with it is ignored rather than refused, so a
     // procedure written against the old form keeps working until it is updated.
     if let Some(ref session_id) = cli.session {
-        eprintln!("warning: `--session <ID>` is now `review resume <ID>`");
+        eprintln!("warning: `--session <ID>` is now `review message <ID>`");
         if cli.profile.is_some() || cli.provider.is_some() {
             eprintln!(
                 "warning: --profile/--provider are ignored on a resume - the session \
                  keeps its own provider and settings"
             );
         }
-        return run_session_resume(session_id, cli.dry_run, started).await;
+        return run_session_resume(session_id, cli.dry_run, started, None).await;
     }
 
     let archetype_arg =
@@ -826,6 +845,39 @@ struct InheritedSettings {
     effort: Option<String>,
 }
 
+/// `review message <id>`: deliver stdin to a session whatever it is doing. A
+/// codex turn in flight is ended first, exactly as `review interrupt` ends it,
+/// and the message then continues the session as a resume.
+///
+/// The verb exists for its name. Steering a running agent used to be
+/// `review interrupt` followed by `review resume`, and told to "interrupt the
+/// agent", an orchestrating Claude reached for its own task-stop tool instead -
+/// killing `review` rather than the turn, which left a fresh session with no
+/// record to resume. "Message the agent" has no such rival.
+async fn run_message(session_id: &str, dry_run: bool, started: std::time::Instant) -> Result<()> {
+    // Read before interrupting anything: a missing message must not cost the
+    // turn in flight.
+    let instructions = input::read_stdin()?;
+    if !dry_run && let Some(marker) = inflight::live_marker(session_id, None) {
+        if marker.provider != "codex" {
+            bail!(
+                "session {session_id} has a {} turn in flight, which cannot be interrupted\n  \
+                 send the message once it has finished",
+                marker.provider
+            );
+        }
+        eprintln!("session {session_id} has a turn in flight; interrupting it first");
+        let outcome = interrupt_cmd::interrupt(session_id, None, sessions::read_all).await?;
+        if !outcome.interrupted {
+            eprintln!(
+                "the turn finished before the interrupt took effect - its answer is in \
+                 `review sessions {session_id}`"
+            );
+        }
+    }
+    run_session_resume(session_id, dry_run, started, Some(instructions)).await
+}
+
 /// `review resume <id>`: continue a specific provider session and send raw
 /// stdin. No prime and no profile - the session already has its grounding from
 /// the run that created it, and its provider, permissions, model and effort
@@ -835,6 +887,7 @@ async fn run_session_resume(
     session_id: &str,
     dry_run: bool,
     started: std::time::Instant,
+    instructions: Option<String>,
 ) -> Result<()> {
     // Looked up once and reused by the cache-age gate and inheritance below.
     let record = resume_record(session_id, sessions::latest_for_session(session_id))?;
@@ -842,7 +895,10 @@ async fn run_session_resume(
     eprintln!("provider: {provider_name} (from the session record)");
     let archetype = record.archetype.as_str();
 
-    let stdin_instructions = input::read_stdin()?;
+    let stdin_instructions = match instructions {
+        Some(text) => text,
+        None => input::read_stdin()?,
+    };
     // Loaded once, and a config that exists but does not parse is an error
     // rather than treated as absent: it decides whether this resume's rows go
     // to the private log, and a silent fallback would file a private project's
@@ -909,6 +965,8 @@ async fn run_session_resume(
     // before calling `invoke` would leave a critical section guarding nothing,
     // letting every queued resume through to spawn simultaneously - the rate
     // limiting the lock exists to provide.
+    // Held to the end, past the sidecar row: see `run_launch`.
+    let _unrecorded = provider::Unrecorded::for_provider(provider_name);
     let lock_path = std::env::temp_dir().join("review.lock");
     let lock_file = lock::open_lock_file(&lock_path)?;
     lock::acquire_blocking(&lock_file)?;

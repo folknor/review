@@ -188,8 +188,20 @@ fn write_text(
         )?,
         None => writeln!(out, "stall_timeout_secs: unset (built-in default)")?,
     }
+
+    // Printed on every call because everyone runs `review config` before using
+    // the tool, and an orchestrating agent told to "interrupt the agent" will
+    // otherwise stop its own background task - killing `review`, not the turn.
+    writeln!(out)?;
+    writeln!(out, "{STEERING}")?;
     Ok(())
 }
+
+const STEERING: &str = "\
+steering a running agent:
+  echo \"<new info>\" | review message <ID>   ends a codex turn in flight, then sends the message
+  review interrupt <ID>                     ends the turn without a message
+  Do not stop or kill the `review` process to interrupt an agent.";
 
 fn write_profile(
     out: &mut String,
@@ -431,6 +443,16 @@ model = \"opus\"
         assert!(text.contains("project:   none"), "{text}");
         assert!(text.contains("deep  (global [codex.deep])"), "{text}");
         assert!(text.contains("model fresh-model"), "{text}");
+    }
+
+    #[test]
+    fn steering_advice_is_always_shown() {
+        let t = text(true);
+        assert!(t.contains("review message <ID>"), "{t}");
+        assert!(
+            t.contains("Do not stop or kill the `review` process"),
+            "{t}"
+        );
     }
 
     #[test]

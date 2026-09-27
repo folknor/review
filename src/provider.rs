@@ -233,8 +233,46 @@ fn unregister_group(pid: u32) {
     }
 }
 
-/// Install the one process-wide handler for `SIGINT`/`SIGTERM`: kill every live
-/// codex process group, then exit.
+/// Set once by the signal supervisor: codex runs end their turn the way `review
+/// interrupt` ends one, and nothing new launches. See `install_signal_supervisor`.
+static STOP: std::sync::OnceLock<tokio::sync::watch::Sender<bool>> = std::sync::OnceLock::new();
+
+fn stop_channel() -> &'static tokio::sync::watch::Sender<bool> {
+    STOP.get_or_init(|| tokio::sync::watch::channel(false).0)
+}
+
+/// Whether `review` has been signalled to stop.
+pub fn stop_requested() -> bool {
+    *stop_channel().borrow()
+}
+
+/// codex runs not yet recorded in the sidecar - what a signalled `review` waits
+/// for before it exits. See `Unrecorded`.
+static UNRECORDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Held by a caller from before it invokes codex until after it has recorded the
+/// result, so the signal supervisor does not exit between codex being reaped and
+/// the sidecar row that makes the session resumable being written.
+pub struct Unrecorded(());
+
+impl Unrecorded {
+    /// A guard for a run of `provider`; only codex runs are waited for, since
+    /// only codex turns can be ended in a way that leaves them resumable.
+    pub fn for_provider(provider: &str) -> Option<Self> {
+        (provider == "codex").then(|| {
+            UNRECORDED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Self(())
+        })
+    }
+}
+
+impl Drop for Unrecorded {
+    fn drop(&mut self) {
+        UNRECORDED.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Install the one process-wide handler for `SIGINT`/`SIGTERM`.
 ///
 /// This is deliberately a single global supervisor rather than a `select!` arm
 /// inside each run. Tokio's signal registration is process-wide and permanent -
@@ -244,15 +282,23 @@ fn unregister_group(pid: u32) {
 /// `review` quietly ignoring every `SIGTERM` after its first codex invocation,
 /// i.e. *harder* to kill than before - the opposite of the intent.
 ///
-/// Exiting here means we forfeit the digest and incident bundle for the
-/// interrupted run. That is the right trade: the operator asked us to stop, and
-/// the rollout transcript is on disk regardless, so `review sessions <id>` can
-/// still show what codex produced.
+/// With codex runs in flight the first signal is a graceful stop: each run ends
+/// its turn as `review interrupt` would, records its session, and only then does
+/// `review` exit. The signal is most often an orchestrating agent stopping the
+/// background task it launched `review` as - asked to "interrupt the agent",
+/// Claude reaches for its own task-stop tool, not for `review interrupt` - and
+/// the old kill-and-exit left a fresh session with no sidecar row, so it could
+/// never be resumed. A second signal, or `GRACEFUL_STOP` passing, falls through
+/// to the kill below, which forfeits the digest and the row; the rollout
+/// transcript is on disk regardless, for `review sessions <id>`.
+///
+/// `SIGKILL` cannot be caught, so a stop that sends only that still loses the
+/// row, and orphans codex.
 pub fn install_signal_supervisor() {
     let mut sigterm =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
     tokio::spawn(async move {
-        let name = match sigterm.as_mut() {
+        let mut next_signal = async || match sigterm.as_mut() {
             Some(term) => {
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => "SIGINT",
@@ -267,6 +313,29 @@ pub fn install_signal_supervisor() {
                 "SIGINT"
             }
         };
+        let name = next_signal().await;
+        let exit_code = if name == "SIGINT" { 130 } else { 143 };
+        let unrecorded = || UNRECORDED.load(std::sync::atomic::Ordering::SeqCst);
+        if unrecorded() > 0 {
+            eprintln!(
+                "\n{name}: ending {} codex turn(s) so their sessions stay resumable \
+                 (signal again to kill instead)",
+                unrecorded()
+            );
+            stop_channel().send_replace(true);
+            let graceful = async {
+                while unrecorded() > 0 {
+                    tokio::time::sleep(crate::timings::GRACEFUL_STOP_POLL).await;
+                }
+            };
+            tokio::select! {
+                () = graceful => std::process::exit(exit_code),
+                () = tokio::time::sleep(crate::timings::GRACEFUL_STOP) => {
+                    eprintln!("codex did not end its turn in time; killing it");
+                }
+                _ = next_signal() => {}
+            }
+        }
         // Snapshot and release the lock before signalling; never hold it across
         // the kills.
         let pids: Vec<u32> = CODEX_GROUPS
@@ -304,7 +373,7 @@ pub fn install_signal_supervisor() {
             }
         }
         // 128 + signal number, the conventional shell encoding.
-        std::process::exit(if name == "SIGINT" { 130 } else { 143 });
+        std::process::exit(exit_code);
     });
 }
 
@@ -582,6 +651,10 @@ pub struct CodexRuntime {
     /// this the suite wrote stub incident bundles into the operator's real
     /// `~/.local/share/review/incidents`.
     pub data_root: Option<std::path::PathBuf>,
+    /// Flips when `review` is signalled to stop (see `install_signal_supervisor`).
+    /// The process-wide channel in production; tests pass their own so a stop
+    /// cannot leak into the rest of the suite.
+    pub stop: tokio::sync::watch::Receiver<bool>,
 }
 
 impl CodexRuntime {
@@ -605,6 +678,7 @@ impl Default for CodexRuntime {
             drain_grace: crate::timings::DRAIN_GRACE,
             sigkill_escalation: crate::timings::SIGKILL_ESCALATION,
             data_root: None,
+            stop: stop_channel().subscribe(),
         }
     }
 }
@@ -2234,6 +2308,12 @@ async fn run_codex_json(
     // (Gating transcript recovery to this run's turn is done by byte offset -
     // `rollout_baseline` above - not by a wall-clock stamp, which was too coarse
     // to separate a resume from an answer written in the same second.)
+    // A run still waiting on the lock or its stagger when `review` was told to
+    // stop would otherwise start a turn nobody will see the end of.
+    if *runtime.stop.borrow() {
+        let _ = std::fs::remove_file(last_msg_path);
+        anyhow::bail!("not launched: review was signalled to stop");
+    }
     let mut child = cmd.spawn().context("failed to spawn codex")?;
     // Launch has happened: the caller may release the global lock. Dropping the
     // sender instead (on the `?` above) tells it the same thing.
@@ -2266,6 +2346,8 @@ async fn run_codex_json(
     // `review interrupt` hands back fail. Output from codex proves the wrapper
     // got that far, so the marker only offers the pid from then on.
     let (first_output_tx, mut first_output_rx) = tokio::sync::watch::channel(false);
+    // The same safety question for a signal-driven stop, which asks it later.
+    let first_output_seen = first_output_rx.clone();
 
     // Mark the run as in flight so `review sessions` can report "turn in flight
     // since <time>" instead of showing the *previous* turn's response while this
@@ -2335,6 +2417,10 @@ async fn run_codex_json(
     // incident bundle.
     let mut quiet_secs: Option<u64> = None;
     let mut last_rollout_event: Option<String> = None;
+    // Set when `review` itself was signalled and ended this turn in response
+    // (see `install_signal_supervisor`); counts as an interrupt request.
+    let mut stopped_by_signal = false;
+    let mut stop_rx = runtime.stop.clone();
 
     // Wait for codex, but stay interruptible.
     //
@@ -2386,6 +2472,27 @@ async fn run_codex_json(
                         terminate_group(pid, runtime.sigkill_escalation);
                     }
                 }
+
+                // `review` was signalled: end the turn as `review interrupt`
+                // would - SIGINT to the leader alone - so codex frees the
+                // session and we get to record it. Before codex's first output
+                // the leader may be a node wrapper that would die on SIGINT and
+                // orphan codex, so then the group is killed instead.
+                // (An `Err` - no sender left, so no stop can ever come - does
+                // not match, and select disables the arm.)
+                Ok(_) = stop_rx.wait_for(|stop| *stop), if !stopped_by_signal => {
+                    stopped_by_signal = true;
+                    if let Some(pid) = child_pid {
+                        if *first_output_seen.borrow() {
+                            if let Ok(pid) = i32::try_from(pid) {
+                                // SAFETY: our own child, not yet reaped.
+                                unsafe { libc::kill(pid, libc::SIGINT) };
+                            }
+                        } else {
+                            terminate_group(pid, runtime.sigkill_escalation);
+                        }
+                    }
+                }
             }
         }
     };
@@ -2396,7 +2503,7 @@ async fn run_codex_json(
     // it. Whether it *counts* waits until we know if an answer was produced.
     let interrupt_requested = watched_session_id.as_deref().is_some_and(|sid| {
         crate::inflight::take_interrupt_request(sid, runtime.data_root.as_deref())
-    });
+    }) || stopped_by_signal;
     // Run is over: drop the in-flight marker (aborting the task drops its guard)
     // and stop advertising the group to the signal supervisor. Both happen
     // before the `?` below so a failed wait cannot leak either.
@@ -2578,7 +2685,11 @@ async fn run_codex_json(
     // interrupted would report a completed run as cut short.
     let interrupted = interrupt_requested && !captured && !recovered_from_transcript;
     if interrupted && terminated_by_review.is_none() {
-        terminated_by_review = Some("operator interrupt (`review interrupt`)".to_string());
+        terminated_by_review = Some(if stopped_by_signal {
+            "review was signalled to stop".to_string()
+        } else {
+            "operator interrupt (`review interrupt`)".to_string()
+        });
     }
 
     // Dump a full forensic bundle for the same suspicious runs we post-mortem -
@@ -2715,7 +2826,7 @@ pub fn resume_hint(provider: &str, session_id: &str) -> String {
     let cutoff = crate::timings::stale_session(provider).as_secs() / 60;
     format!(
         "interrupted - continue within {cutoff}m with:\n  \
-         echo \"<message>\" | review resume {session_id}"
+         echo \"<message>\" | review message {session_id}"
     )
 }
 

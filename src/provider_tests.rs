@@ -212,6 +212,8 @@ fn fast_runtime(scratch: &Scratch) -> CodexRuntime {
         // cooperative child still gets a real chance to honour SIGTERM first.
         sigkill_escalation: std::time::Duration::from_millis(400),
         data_root: Some(scratch.data_root()),
+        // Never flips; a test of the signal path passes its own.
+        stop: tokio::sync::watch::channel(false).1,
     }
 }
 
@@ -862,6 +864,64 @@ async fn an_operator_interrupt_is_not_reported_as_a_death() {
     assert!(
         !crate::inflight::take_interrupt_request(STUB_SESSION, Some(&scratch.data_root())),
         "the run consumed the request"
+    );
+}
+
+/// A signalled `review` (an orchestrator stopping its background task) ends the
+/// turn the way `review interrupt` does instead of killing codex: the run comes
+/// back interrupted, with its session id, so it can be recorded and continued.
+#[tokio::test]
+async fn a_stop_signal_ends_the_turn_as_an_interrupt() {
+    let scratch = Scratch::new();
+    let stub = interruptible_stub(&scratch, "");
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut runtime = fast_runtime(&scratch);
+    runtime.timings.stall_grace = None;
+    runtime.stop = stop_rx;
+    let data_root = scratch.data_root();
+
+    let stopper = async {
+        // As in production, the SIGINT path is only taken once codex has
+        // spoken; before that the group is killed instead.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::inflight::live_marker(STUB_SESSION, Some(&data_root))
+            .and_then(|m| m.child_pid)
+            .is_none()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "codex's pid never offered"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        stop_tx.send_replace(true);
+    };
+    let (run, ()) = tokio::join!(run_stub_with(&scratch, &stub, &runtime), stopper);
+    let run = run.expect("run completes");
+    let digest = run.digest.expect("digest");
+
+    assert!(digest.interrupted, "the digest must record the interrupt");
+    assert_eq!(
+        digest.exit_code,
+        Some(1),
+        "codex answered SIGINT, not a kill"
+    );
+    assert!(
+        digest
+            .terminated_by_review
+            .as_deref()
+            .is_some_and(|why| why.contains("signalled")),
+        "got {:?}",
+        digest.terminated_by_review
+    );
+    assert_eq!(run.session_id.as_deref(), Some(STUB_SESSION));
+    assert!(scratch.incident_dirs().is_empty());
+
+    // Once stopped, nothing new launches.
+    let refused = run_stub_with(&scratch, &stub, &runtime).await;
+    assert!(
+        refused.is_err_and(|e| e.to_string().contains("signalled to stop")),
+        "a launch after the stop must be refused"
     );
 }
 
