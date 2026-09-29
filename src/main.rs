@@ -170,7 +170,7 @@ struct Launch {
     config: Vec<String>,
     prompt: String,
     root: std::path::PathBuf,
-    runtime: provider::CodexRuntime,
+    runtime: provider::ProviderRuntime,
     delay: std::time::Duration,
 }
 
@@ -609,7 +609,7 @@ async fn main() -> Result<()> {
     // Codex run settings from project config: today just the stall timeout,
     // which is tunable (and disableable) because it rests on an empirical codex
     // property rather than a documented contract.
-    let codex_runtime = provider::CodexRuntime::from_config(cfg.stall_timeout_secs());
+    let provider_runtime = provider::ProviderRuntime::from_config(cfg.stall_timeout_secs());
 
     // Spawn all providers with staggered launches to avoid rate limits
     let stagger = std::time::Duration::from_secs(cli.stagger);
@@ -652,7 +652,7 @@ async fn main() -> Result<()> {
                 config,
                 prompt: assembled.clone(),
                 root: project_root.clone(),
-                runtime: codex_runtime.clone(),
+                runtime: provider_runtime.clone(),
                 delay: stagger * launch_count,
             };
             let ctx = std::sync::Arc::new(RecordCtx {
@@ -924,7 +924,7 @@ async fn run_session_resume(
     // A resume bypasses the config for prompt/profile purposes, but the
     // stall timeout is a safety setting rather than a prompt input, so it is
     // still honoured.
-    let codex_runtime = provider::CodexRuntime::from_config(cfg.stall_timeout_secs());
+    let provider_runtime = provider::ProviderRuntime::from_config(cfg.stall_timeout_secs());
 
     // Cache-age gate. The sidecar tells us how long it's been since the session
     // last ended; past the provider's cutoff (`timings::stale_session`: 27 min
@@ -1000,7 +1000,7 @@ async fn run_session_resume(
         &project_root,
         false,
         Some(launched_tx),
-        &codex_runtime,
+        &provider_runtime,
     );
     tokio::pin!(invoke);
 
@@ -1277,24 +1277,8 @@ fn print_digest_summary(d: &provider::DigestSummary) {
     if let Some(ref msg) = d.turn_error {
         println!("turn failed: {msg}");
     }
-    if d.recovered_from_transcript {
-        println!("recovered: final answer restored from transcript");
-    } else if d.interrupted {
-        // The recorded reason, not an assumed one: a signalled `review` ends its
-        // turns the same way `review interrupt` does, and saying the operator
-        // ran the verb would misdescribe how the turn ended.
-        let how = d
-            .terminated_by_review
-            .as_deref()
-            .unwrap_or("operator interrupt (`review interrupt`)");
-        println!("note: interrupted - {how}");
-    } else if d.turn_error.is_some() {
-        // Explained above - don't also guess "died mid-turn" at it.
-        println!("note: no conclusion was produced");
-    } else if !d.captured && (d.exit_code != Some(0) || d.signal.is_some()) {
-        // No real final answer obtained and the process failed: a mid-turn
-        // death. task_complete alone doesn't refute this - it fires on aborts.
-        println!("note: no final answer captured - run likely died mid-turn");
+    if let Some(line) = digest_summary_note(d) {
+        println!("{line}");
     }
     if let Some(false) = d.task_complete {
         println!("task_complete: false");
@@ -1309,6 +1293,36 @@ fn print_digest_summary(d: &provider::DigestSummary) {
     );
     if let Some(ref path) = d.incident_path {
         println!("incident: {path}");
+    }
+}
+
+/// The one line `print_digest_summary` adds to say how the run ended, if any.
+/// Pure so each case is tested.
+fn digest_summary_note(d: &provider::DigestSummary) -> Option<String> {
+    if d.recovered_from_transcript {
+        Some("recovered: final answer restored from transcript".to_string())
+    } else if d.interrupted {
+        // The recorded reason, not an assumed one: a signalled `review` ends its
+        // turns the same way `review interrupt` does, and saying the operator
+        // ran the verb would misdescribe how the turn ended.
+        let how = d
+            .terminated_by_review
+            .as_deref()
+            .unwrap_or("operator interrupt (`review interrupt`)");
+        Some(format!("note: interrupted - {how}"))
+    } else if d.turn_error.is_some() && !d.captured {
+        // Explained by `turn failed:` - don't also guess "died mid-turn" at
+        // it. Gated on the missing answer: a grok or claude answer followed by
+        // a non-zero exit is recorded as captured *with* a `turn_error`, and
+        // "no conclusion" would contradict the answer printed below. The live
+        // `print_digest` has the same gate.
+        Some("note: no conclusion was produced".to_string())
+    } else if !d.captured && (d.exit_code != Some(0) || d.signal.is_some()) {
+        // No real final answer obtained and the process failed: a mid-turn
+        // death. task_complete alone doesn't refute this - it fires on aborts.
+        Some("note: no final answer captured - run likely died mid-turn".to_string())
+    } else {
+        None
     }
 }
 
@@ -1444,6 +1458,51 @@ fn first_line_truncated(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn summary(v: serde_json::Value) -> provider::DigestSummary {
+        serde_json::from_value(v).expect("summary parses")
+    }
+
+    #[test]
+    fn an_answer_with_a_non_zero_exit_is_not_called_inconclusive() {
+        // What grok and claude record for an answer from a process that then
+        // exited non-zero: captured, with a turn_error saying so.
+        let d = summary(serde_json::json!({
+            "exit_code": 1, "captured": true, "turns": 1,
+            "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "turn_error": "claude exited non-zero after producing an answer",
+        }));
+        assert_eq!(digest_summary_note(&d), None);
+    }
+
+    #[test]
+    fn a_stated_failure_without_an_answer_is_called_inconclusive() {
+        let d = summary(serde_json::json!({
+            "exit_code": 1, "captured": false, "turns": 1,
+            "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
+            "reasoning_output_tokens": 0,
+            "turn_error": "claude reported an error (API status 404)",
+        }));
+        assert_eq!(
+            digest_summary_note(&d).as_deref(),
+            Some("note: no conclusion was produced")
+        );
+    }
+
+    #[test]
+    fn an_interrupt_note_names_how_the_run_was_stopped() {
+        let d = summary(serde_json::json!({
+            "exit_code": 0, "captured": false, "turns": 1,
+            "input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0,
+            "reasoning_output_tokens": 0, "interrupted": true,
+            "terminated_by_review": "review was signalled to stop",
+        }));
+        assert_eq!(
+            digest_summary_note(&d).as_deref(),
+            Some("note: interrupted - review was signalled to stop")
+        );
+    }
 
     fn minimal_row(provider: &str) -> sessions::SessionRecord {
         record(serde_json::json!({

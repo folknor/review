@@ -103,11 +103,20 @@ pub fn pid_alive(pid: u32) -> bool {
 
 /// Removes its marker file on drop, so the marker's lifetime is exactly the
 /// run's - including on early returns and panics.
+///
+/// Only while the file is still this run's. Two `review` processes can run the
+/// same session at once - two `review message` calls to an idle claude session
+/// both launch, claude having no session lock of its own - and they share one
+/// marker path. The second overwrites the first's marker; the first to finish
+/// used to delete it regardless, leaving the still-running second invisible to
+/// `review sessions` and `review interrupt`.
 pub struct Guard(Option<(PathBuf, Marker)>);
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        if let Some((path, _)) = self.0.take() {
+        if let Some((path, marker)) = self.0.take()
+            && still_ours(&path, &marker)
+        {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -115,15 +124,29 @@ impl Drop for Guard {
 
 impl Guard {
     /// Offer the provider's pid to `review interrupt`, once it is safe to
-    /// signal (see `run_codex_json`). Best-effort like the rest of the marker.
+    /// signal (see `run_codex_json`). Best-effort like the rest of the marker,
+    /// and skipped if another run has since taken the marker over (see `Guard`).
     pub fn record_child_pid(&mut self, child_pid: Option<u32>) {
-        if let Some((path, marker)) = self.0.as_mut() {
+        if let Some((path, marker)) = self.0.as_mut()
+            && still_ours(path, marker)
+        {
             marker.child_pid = child_pid;
             if let Err(e) = write_marker(path, marker) {
                 eprintln!("warning: failed to update inflight marker: {e}");
             }
         }
     }
+}
+
+/// Whether the marker at `path` is the one `ours` describes: same owning
+/// `review` and same launch. A missing or unreadable file is not ours to touch.
+fn still_ours(path: &Path, ours: &Marker) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<Marker>(&content).ok())
+        .is_some_and(|on_disk| {
+            on_disk.pid == ours.pid && on_disk.started_epoch == ours.started_epoch
+        })
 }
 
 /// Write a marker via a rename, so a concurrent reader never sees it
@@ -301,6 +324,34 @@ mod tests {
             !take_interrupt_request(sid, Some(&root)),
             "and consumed, so a later run of the session is not marked interrupted"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_run_does_not_delete_a_marker_another_run_has_taken_over() {
+        let root = scratch_root();
+        let sid = "019fefb0-227c-7c83-a398-380011b8e66b";
+        let first = mark(sid, "claude", "/p", Some(&root));
+        // A second `review` of the same session writes the same path.
+        let path = dir(Some(&root)).expect("dir").join(format!("{sid}.json"));
+        let second = Marker {
+            session_id: sid.to_string(),
+            provider: "claude".to_string(),
+            project: "/p".to_string(),
+            started_epoch: 1,
+            pid: std::process::id() + 1,
+            child_pid: None,
+        };
+        write_marker(&path, &second).expect("second marker");
+        drop(first);
+        assert!(
+            path.exists(),
+            "the first run to finish must leave the second's marker in place"
+        );
+        // A marker that is still ours is removed as before.
+        std::fs::remove_file(&path).expect("clear");
+        drop(mark(sid, "claude", "/p", Some(&root)));
+        assert!(!path.exists(), "our own marker goes when the run does");
         let _ = std::fs::remove_dir_all(&root);
     }
 

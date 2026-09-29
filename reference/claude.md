@@ -1,7 +1,7 @@
 # Claude
 
-How `review` drives Claude Code. Claude needs the least provider-specific
-handling of the three; the cross-provider pieces are in
+How `review` drives Claude Code: its invocation and environment, how a run's
+outcome is read, and how a run is stopped. The cross-provider pieces are in
 [sandbox.md](sandbox.md).
 
 ## Invocation
@@ -26,13 +26,25 @@ is all `review` reads.
 
 The stream ends in one result object per run, whatever the outcome, and its
 `is_error` says whether `result` is an answer (a run in which claude woke the
-model for a background subagent carries one per turn; the last is the answer). That is the grok
-arrangement ([grok.md](grok.md#turns-classify-themselves)), and `run_claude`
-handles it the same way: no result object at all is an `Err` (nothing ran);
-`is_error: false` is the answer; anything else is `Ok` carrying a digest whose
-`turn_error` names what claude reported, and keeps the session ID. A result
-object missing `is_error` counts as a failure, so a claude that stopped
-reporting it fails loudly rather than passing every run off as answered.
+model for a background subagent carries one per turn; the last is the answer).
+That is the grok arrangement ([grok.md](grok.md#turns-classify-themselves)), and
+`run_claude` handles it the same way: `is_error: false` is the answer; anything
+else is `Ok` carrying a digest whose `turn_error` names what claude reported,
+and keeps the session ID. A result object missing `is_error` counts as a
+failure, so a claude that stopped reporting it fails loudly rather than passing
+every run off as answered.
+
+No result object at all splits on whether claude printed its first event, the
+`init` that carries the session ID. Before it, nothing ran and there is no
+session: an `Err`. After it, the session exists - its transcript is on disk -
+so a claude killed from outside or crashed mid-turn is `Ok` with a death digest
+(no `turn_error`, since claude stated no reason) and keeps the ID, as codex's
+deaths do. The error text for a missing result is claude's stderr, or else the
+stream's last line, truncated: the whole stream is every event of the run.
+
+The stream is buffered up to 64 MiB from the start and, past that, the last
+8 MiB or more, because the result is the *last* line: keeping only the head
+would lose the answer of any run that outgrew the cap.
 
 Two details from Claude Code 2.1.284 decide the shape. `subtype` is no guide:
 an unknown `--model` came back `subtype: "success"`, `is_error: true`,
@@ -121,10 +133,26 @@ first event (a `SIGINT` before its handler is installed would kill it with
 nothing printed); `review interrupt` leaves a request beside the marker and
 signals that pid alone; and a signalled `review` sends it `SIGINT` too, waiting
 for the run to record its session before exiting. A run that had produced no
-first event is killed with its group instead. An interrupted run keeps its
-session ID even if claude printed no result, is flagged `interrupted` rather
-than carrying claude's complaint about the abort as a `turn_error`, and is not
-retried. If claude answers before the signal lands, the answer stands.
+first event is killed with its group instead, and reported as never started,
+with no session ID: claude cannot have written one, and recording it would
+print a resume command that fails. A run that has not spawned yet when `review`
+is told to stop - still waiting on the lock or its stagger - is not launched at
+all. An interrupted run keeps its session ID even if claude printed no result,
+is flagged `interrupted` rather than carrying claude's complaint about the abort
+as a `turn_error`, and is not retried. If claude answers before the signal
+lands, the answer stands. Before a resume launches, any interrupt request left
+for its session by an earlier `review` that died before consuming it is
+cleared, so it cannot mark this run interrupted.
+
+Two runs of one session can be in flight at once - claude has no session lock,
+so two `review message` calls to an idle session both launch - and they share
+one marker path. A run removes or updates the marker only while it is still the
+one it wrote, so the first to finish no longer deletes the second's.
+
+`src/provider_tests.rs` drives the real `run_claude` against a stub claude
+(`ProviderRuntime::claude_command`) for each of these: the interrupt, an answer
+beating it, a stop after and before the first event, a refused launch after a
+stop, a death after starting, and a stale request before a resume.
 
 Verified end to end through `review`: a `SIGTERM` to `review` mid-command ended
 the turn in 0.2s, recorded it, printed the `review message` command and left

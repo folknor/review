@@ -137,7 +137,10 @@ pub fn final_answer_text(payload: &serde_json::Value) -> Option<String> {
                 .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("output_text"))
                 .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
                 .collect();
-            Some(text)
+            // A final-phase message with no text is not an answer: counting it
+            // would let the watchdog call a run that said nothing Stranded
+            // and kill it as finished.
+            (!text.is_empty()).then_some(text)
         }
         _ => None,
     }
@@ -384,8 +387,9 @@ mod tests {
 
     // codex 0.157.0's shape, taken from a real rollout: no `agent_message`
     // event, the answer is an assistant `message` response item (preceded by an
-    // `item_completed` event carrying the same text, which is not read). A
-    // commentary-phase assistant message earlier in the turn must not count.
+    // `item_completed` event carrying the same text, which is not read - so
+    // here it carries different text, to show it). A commentary-phase assistant
+    // message earlier in the turn must not count.
     #[test]
     fn recovers_final_answer_from_an_assistant_message() {
         let run = concat!(
@@ -395,7 +399,7 @@ mod tests {
             "\n",
             r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reading the fixtures now."}],"phase":"commentary"}}"#,
             "\n",
-            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"Text","text":"No problems."}],"phase":"final_answer"}}}"#,
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"Text","text":"NOT READ"}],"phase":"final_answer"}}}"#,
             "\n",
             r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"No problems."}],"phase":"final_answer"}}"#,
             "\n",
@@ -404,6 +408,15 @@ mod tests {
         let s = parse(run);
         assert!(s.task_complete);
         assert_eq!(s.final_answer.as_deref(), Some("No problems."));
+    }
+
+    #[test]
+    fn an_empty_final_answer_message_is_not_an_answer() {
+        let payload = serde_json::json!({
+            "type": "message", "role": "assistant", "phase": "final_answer",
+            "content": [{"type": "reasoning_text", "text": "thinking"}],
+        });
+        assert_eq!(final_answer_text(&payload), None);
     }
 
     #[test]

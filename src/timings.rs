@@ -8,7 +8,7 @@
 //! system's patience was to grep for `Duration`.
 //!
 //! Collecting them does not change how they are *used*: `watchdog::Timings` and
-//! `provider::CodexRuntime` are still the injection points, and tests still
+//! `provider::ProviderRuntime` are still the injection points, and tests still
 //! override them freely (see `provider_tests`, which drives 3-minute and
 //! 10-second behaviours in milliseconds). What lives here is only the default
 //! each of those structs starts from.

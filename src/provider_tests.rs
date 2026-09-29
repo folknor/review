@@ -15,7 +15,7 @@
 //!
 //! # How it stays fast
 //!
-//! `CodexRuntime` makes the binary, the watchdog timings, the drain grace and
+//! `ProviderRuntime` makes the binary, the watchdog timings, the drain grace and
 //! the `SIGKILL` escalation delay injectable, so a hang that takes 3 minutes to
 //! detect and 10 seconds to escalate in production resolves in under a second
 //! here. Nothing about the code path itself changes.
@@ -25,7 +25,7 @@
 //! Scratch files live under `target/test-scratch/<uuid>/` (per the project rule
 //! that data lives in the repo rather than `/tmp`) and are removed on success.
 //!
-//! `CodexRuntime::data_root` is also redirected there, and that is load-bearing
+//! `ProviderRuntime::data_root` is also redirected there, and that is load-bearing
 //! rather than tidiness: `CODEX_HOME` only redirects the *child*, so `review`'s
 //! own data paths still resolved from the test process's real
 //! `HOME`/`XDG_DATA_HOME`. Before the override existed, running this suite
@@ -191,12 +191,14 @@ printf '%s\n' '{{"type":"event_msg","payload":{{"type":"task_started"}}}}' >> "$
 /// Fast timings: the whole watchdog cycle completes in well under a second,
 /// while preserving the ordering the production values encode (poll interval
 /// comfortably shorter than the quiet grace).
-fn fast_runtime(scratch: &Scratch) -> CodexRuntime {
-    CodexRuntime {
+fn fast_runtime(scratch: &Scratch) -> ProviderRuntime {
+    ProviderRuntime {
         // Execute the stable system shell, not the fixture file another test
         // thread may still have open for writing. The script path is argv[0]
         // from the shell's perspective; see `run_stub_with`.
-        binary: "/bin/sh".to_string(),
+        codex_binary: "/bin/sh".to_string(),
+        // Replaced by `claude_runtime` for the claude tests.
+        claude_command: vec!["claude-not-stubbed".to_string()],
         timings: crate::watchdog::Timings {
             poll_interval: std::time::Duration::from_millis(50),
             quiet_grace: std::time::Duration::from_millis(250),
@@ -229,7 +231,7 @@ async fn run_stub(scratch: &Scratch, script: String) -> Result<RunOutput> {
 async fn run_stub_with(
     scratch: &Scratch,
     script: &str,
-    runtime: &CodexRuntime,
+    runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
     let out_file = new_output_file().expect("create -o file");
     let mut env = BTreeMap::new();
@@ -946,6 +948,390 @@ async fn a_run_that_already_answered_is_not_marked_interrupted() {
 }
 
 // ---------------------------------------------------------------------------
+// claude runner, against a stub `claude`
+//
+// The same process behaviours as codex - signals, process groups, the in-flight
+// marker, interrupt requests - driven through the real `run_claude`. The stub
+// speaks claude's `stream-json`: an `init` event, then a `result`.
+// ---------------------------------------------------------------------------
+
+/// Shell fragment every claude stub starts with. Records its pid, environment
+/// and arguments under `$STUB_DIR`, learns the session id from its argv as
+/// claude does (`--session-id` fresh, `--resume` otherwise), and drains the
+/// prompt. Prints nothing: each stub decides when claude "starts".
+const CLAUDE_STUB_PREAMBLE: &str = r#"
+printf '%s\n' "$$" > "$STUB_DIR/pid"
+env > "$STUB_DIR/env"
+printf '%s\n' "$*" > "$STUB_DIR/args"
+SID=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--session-id" ] || [ "$prev" = "--resume" ]; then SID="$a"; fi
+  prev="$a"
+done
+cat > /dev/null
+"#;
+
+/// Shell line printing claude's first event, which carries the session id.
+const CLAUDE_STUB_INIT: &str =
+    r#"printf '%s\n' "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"$SID\"}""#;
+
+/// Shell line printing a result event for this session.
+fn claude_stub_result(is_error: bool, extra: &str) -> String {
+    format!(
+        r#"printf '%s\n' "{{\"type\":\"result\",\"is_error\":{is_error},\"session_id\":\"$SID\",\"num_turns\":1{extra}}}""#
+    )
+}
+
+/// Shell fragment: on SIGINT, end the turn as claude does - print an aborted
+/// result and exit 0 - then wait for it.
+fn claude_stub_await_sigint() -> String {
+    format!(
+        r#"trap '{result}; exit 0' INT
+while :; do sleep 0.05; done"#,
+        result = claude_stub_result(
+            true,
+            r#",\"subtype\":\"error_during_execution\",\"terminal_reason\":\"aborted_tools\""#
+        )
+    )
+}
+
+/// Run `body` as claude through the real `run_claude`: a fresh run, or a resume
+/// of `resume`.
+async fn run_claude_stub(
+    scratch: &Scratch,
+    body: &str,
+    runtime: &ProviderRuntime,
+    resume: Option<&str>,
+) -> Result<RunOutput> {
+    let script = scratch.write_stub(&format!("{CLAUDE_STUB_PREAMBLE}\n{body}"));
+    let mut runtime = runtime.clone();
+    runtime.claude_command = vec!["/bin/sh".to_string(), script];
+    let mut env = BTreeMap::new();
+    env.insert(
+        "STUB_DIR".to_string(),
+        scratch.root.to_string_lossy().into_owned(),
+    );
+    run_claude(
+        resume.unwrap_or(""),
+        None,
+        None,
+        Some(&env),
+        "review this",
+        &scratch.project(),
+        resume.is_none(),
+        None,
+        &runtime,
+    )
+    .await
+}
+
+/// The session id of the one claude run in flight under `scratch`, once its
+/// pid is offered for signalling - which is what `review interrupt` waits for.
+async fn claude_signalable(scratch: &Scratch) -> String {
+    let data_root = scratch.data_root();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(m) = crate::inflight::read_live(Some(&data_root))
+            .into_iter()
+            .find(|m| m.provider == "claude" && m.child_pid.is_some())
+        {
+            return m.session_id;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "claude's pid never offered"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// Run `body` as the owner and `review interrupt` against it from "another
+/// process", appending the owner's sidecar row when its run returns, as the
+/// fan-out task does.
+async fn claude_interrupt_stub(
+    scratch: &Scratch,
+    body: &str,
+) -> (RunOutput, Result<crate::interrupt_cmd::Outcome>) {
+    let runtime = fast_runtime(scratch);
+    let data_root = scratch.data_root();
+    let rows = std::sync::Mutex::new(Vec::<crate::sessions::SessionRecord>::new());
+    let owner = async {
+        let run = run_claude_stub(scratch, body, &runtime, None)
+            .await
+            .expect("run completes");
+        let row = serde_json::json!({
+            "timestamp": "t", "epoch_secs": 1, "project": "/p", "hostname": "h",
+            "audit_id": "a", "provider": "claude", "archetype": "bare",
+            "session_id": run.session_id.clone().expect("session id"),
+            "operator_prompt": "", "assembled_prompt": "", "review_version": "0",
+            "digest": run.digest.as_ref().map(Digest::summary),
+        });
+        rows.lock()
+            .expect("rows")
+            .push(serde_json::from_value(row).expect("row parses"));
+        run
+    };
+    let interrupter = async {
+        let sid = claude_signalable(scratch).await;
+        crate::interrupt_cmd::interrupt(&sid, Some(&data_root), || {
+            rows.lock().expect("rows").clone()
+        })
+        .await
+    };
+    tokio::join!(owner, interrupter)
+}
+
+#[tokio::test]
+async fn a_claude_run_launches_with_background_off_and_reports_its_answer() {
+    let scratch = Scratch::new();
+    let body = format!(
+        "{CLAUDE_STUB_INIT}\n{}",
+        claude_stub_result(false, r#",\"result\":\"THE ANSWER\""#)
+    );
+    let run = run_claude_stub(&scratch, &body, &fast_runtime(&scratch), None)
+        .await
+        .expect("run completes");
+    assert_eq!(run.text, "THE ANSWER");
+    assert!(run.digest.is_none(), "a clean answer carries no digest");
+    let args = std::fs::read_to_string(scratch.root.join("args")).expect("args");
+    let sid = run.session_id.expect("a fresh run reports its session");
+    assert!(
+        args.contains(&format!("--session-id {sid}")),
+        "the id recorded is the one claude was given: {args}"
+    );
+    assert!(
+        args.contains("--output-format stream-json --verbose"),
+        "{args}"
+    );
+    let env = std::fs::read_to_string(scratch.root.join("env")).expect("env");
+    for var in [
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1",
+        "BASH_DEFAULT_TIMEOUT_MS=1200000",
+        "BASH_MAX_TIMEOUT_MS=1200000",
+    ] {
+        assert!(env.lines().any(|l| l == var), "{var} must reach claude");
+    }
+    assert!(
+        crate::inflight::read_live(Some(&scratch.data_root())).is_empty(),
+        "the in-flight marker goes when the run does"
+    );
+}
+
+#[tokio::test]
+async fn review_interrupt_ends_a_claude_turn_and_keeps_its_session() {
+    let scratch = Scratch::new();
+    let body = format!("{CLAUDE_STUB_INIT}\n{}", claude_stub_await_sigint());
+    let (run, outcome) = claude_interrupt_stub(&scratch, &body).await;
+    let outcome = outcome.expect("the verb succeeds");
+    assert!(outcome.interrupted, "the verb reports the interrupt");
+    assert_eq!(outcome.provider, "claude");
+    let digest = run.digest.expect("digest");
+    assert!(digest.interrupted);
+    assert!(
+        digest.turn_error.is_none(),
+        "claude's complaint about the abort is not a stated failure"
+    );
+    assert_eq!(digest.exit_code, Some(0), "claude answered SIGINT itself");
+    assert!(
+        digest
+            .terminated_by_review
+            .as_deref()
+            .is_some_and(|why| why.contains("operator interrupt")),
+        "got {:?}",
+        digest.terminated_by_review
+    );
+    assert!(run.text.contains("interrupted"), "got {:?}", run.text);
+    let sid = run.session_id.expect("the session survives the interrupt");
+    assert!(
+        !crate::inflight::take_interrupt_request(&sid, Some(&scratch.data_root())),
+        "the run consumed the request"
+    );
+}
+
+#[tokio::test]
+async fn a_claude_answer_that_beats_the_interrupt_stands() {
+    let scratch = Scratch::new();
+    let body = format!(
+        "{CLAUDE_STUB_INIT}\n{}\ntrap 'exit 0' INT\nwhile :; do sleep 0.05; done",
+        claude_stub_result(false, r#",\"result\":\"THE ANSWER\""#)
+    );
+    let (run, outcome) = claude_interrupt_stub(&scratch, &body).await;
+    assert_eq!(run.text, "THE ANSWER");
+    assert!(run.digest.is_none_or(|d| !d.interrupted));
+    assert!(
+        !outcome.expect("the verb succeeds").interrupted,
+        "the verb says the run ended first"
+    );
+}
+
+#[tokio::test]
+async fn a_stop_signal_ends_a_started_claude_turn_as_an_interrupt() {
+    let scratch = Scratch::new();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut runtime = fast_runtime(&scratch);
+    runtime.stop = stop_rx;
+    let body = format!("{CLAUDE_STUB_INIT}\n{}", claude_stub_await_sigint());
+    let stopper = async {
+        claude_signalable(&scratch).await;
+        stop_tx.send_replace(true);
+    };
+    let (run, ()) = tokio::join!(run_claude_stub(&scratch, &body, &runtime, None), stopper);
+    let run = run.expect("run completes");
+    let digest = run.digest.expect("digest");
+    assert!(digest.interrupted);
+    assert_eq!(digest.exit_code, Some(0), "SIGINT, not a group kill");
+    assert!(
+        digest
+            .terminated_by_review
+            .as_deref()
+            .is_some_and(|why| why.contains("signalled"))
+    );
+    assert!(run.session_id.is_some());
+
+    // Once stopped, nothing new launches - a claude run waiting on its
+    // stagger or the lock must not start only to be killed.
+    let refused = run_claude_stub(&scratch, &body, &runtime, None).await;
+    assert!(
+        refused.is_err_and(|e| e.to_string().contains("not launched")),
+        "a launch after the stop must be refused"
+    );
+}
+
+#[tokio::test]
+async fn a_claude_stopped_before_its_first_event_names_no_session() {
+    // Killed before claude could have written a session: recording one would
+    // print a resume command for a session that does not exist.
+    let scratch = Scratch::new();
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let mut runtime = fast_runtime(&scratch);
+    runtime.stop = stop_rx;
+    let data_root = scratch.data_root();
+    let stopper = async {
+        // The marker goes up at spawn; claude never speaks, so no pid is offered.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::inflight::read_live(Some(&data_root)).is_empty() {
+            assert!(std::time::Instant::now() < deadline, "no marker");
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        stop_tx.send_replace(true);
+    };
+    let body = "while :; do sleep 0.05; done";
+    let (run, ()) = tokio::join!(run_claude_stub(&scratch, body, &runtime, None), stopper);
+    let Err(err) = run else {
+        panic!("a run stopped before it started has no session to report");
+    };
+    assert!(err.to_string().contains("not started"), "{err}");
+    assert!(crate::inflight::read_live(Some(&data_root)).is_empty());
+}
+
+#[tokio::test]
+async fn a_claude_that_dies_after_starting_keeps_its_session() {
+    // Killed from outside or crashed after its first event: no result, but the
+    // session exists and is the turn most worth resuming.
+    let scratch = Scratch::new();
+    let body = format!("{CLAUDE_STUB_INIT}\nexit 3");
+    let run = run_claude_stub(&scratch, &body, &fast_runtime(&scratch), None)
+        .await
+        .expect("a death after starting is not a launch failure");
+    let digest = run.digest.expect("digest");
+    assert!(!digest.captured);
+    assert!(!digest.interrupted);
+    assert!(
+        digest.turn_error.is_none(),
+        "claude stated no reason, so this is a death, not a stated failure"
+    );
+    assert_eq!(digest.exit_code, Some(3));
+    assert!(run.session_id.is_some(), "the session id is kept");
+    assert!(run.text.contains("without a result"), "got {:?}", run.text);
+}
+
+#[tokio::test]
+async fn a_stale_interrupt_request_does_not_mark_a_claude_resume_interrupted() {
+    // Left by a `review` killed before it consumed it. A resume that then fails
+    // for its own reason must report that reason, not an interrupt.
+    let scratch = Scratch::new();
+    let sid = "0c1a0000-0000-4000-8000-000000000001";
+    std::fs::create_dir_all(scratch.data_root().join("review/inflight")).expect("dir");
+    crate::inflight::request_interrupt(sid, Some(&scratch.data_root())).expect("request");
+    let body = format!(
+        "{CLAUDE_STUB_INIT}\n{}\nexit 1",
+        claude_stub_result(true, r#",\"result\":\"rate limited\""#)
+    );
+    let run = run_claude_stub(&scratch, &body, &fast_runtime(&scratch), Some(sid))
+        .await
+        .expect("run completes");
+    let digest = run.digest.expect("digest");
+    assert!(!digest.interrupted, "the request was not aimed at this run");
+    assert!(
+        digest
+            .turn_error
+            .as_deref()
+            .is_some_and(|e| e.contains("rate limited")),
+        "claude's reason is kept: {:?}",
+        digest.turn_error
+    );
+}
+
+#[tokio::test]
+async fn claude_output_past_the_cap_keeps_its_final_result() {
+    // The stream ends in the result: keeping only the head would lose it.
+    let mut stream = String::new();
+    for i in 0..200 {
+        stream.push_str(&format!("{{\"type\":\"assistant\",\"n\":{i}}}\n"));
+    }
+    stream.push_str(CLAUDE_OK);
+    stream.push('\n');
+    let head = new_shared_buf();
+    let tail = new_shared_buf();
+    let (first_tx, first_rx) = tokio::sync::watch::channel(false);
+    // The keep must exceed the result line, as production's 8 MiB does; the
+    // stream is several times larger, so the tail really is trimmed.
+    let keep = 1024;
+    assert!(CLAUDE_OK.len() < keep && stream.len() > 4 * keep);
+    read_claude_stream(
+        stream.as_bytes(),
+        100,
+        keep,
+        std::sync::Arc::clone(&head),
+        std::sync::Arc::clone(&tail),
+        first_tx,
+    )
+    .await;
+    assert!(*first_rx.borrow(), "output flags the first event");
+    let head = head.lock().expect("head").clone();
+    let tail = tail.lock().expect("tail").clone();
+    assert_eq!(head.len(), 100, "the head is capped");
+    assert!(
+        tail.len() <= 2 * keep,
+        "the tail is bounded: {}",
+        tail.len()
+    );
+    let joined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&head),
+        String::from_utf8_lossy(&tail)
+    );
+    let outcome = super::interpret_claude_output(&joined, "").expect("the result survived");
+    assert!(matches!(outcome, super::ClaudeOutcome::Answered { .. }));
+}
+
+#[test]
+fn a_missing_claude_result_does_not_dump_the_stream_into_the_error() {
+    let big = "x".repeat(100_000);
+    let stdout = claude_stream(&[
+        CLAUDE_INIT,
+        &format!(r#"{{"type":"user","tool_result":"{big}"}}"#),
+    ]);
+    let err = super::interpret_claude_output(&stdout, "").expect_err("no result");
+    assert!(
+        err.to_string().len() < CLAUDE_DETAIL_MAX + 200,
+        "error is {} chars",
+        err.to_string().len()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // grok output classification
 //
 // These need no child process: grok reports the outcome of a turn in its own
@@ -1079,7 +1465,8 @@ fn claude_output_without_a_result_object_is_a_launch_failure() {
         .expect_err("no result object: nothing ran");
     assert!(err.to_string().contains("not logged in"), "{err}");
     // A stream cut off after its first event is not a result either - the
-    // shape a claude killed mid-turn leaves.
+    // shape a claude killed mid-turn leaves. (`run_claude` still keeps that
+    // run's session: see `a_claude_that_dies_after_starting_keeps_its_session`.)
     let err = super::interpret_claude_output(&claude_stream(&[CLAUDE_INIT]), "")
         .expect_err("a system event is not a result");
     assert!(err.to_string().contains("no result object"), "{err}");

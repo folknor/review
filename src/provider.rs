@@ -143,13 +143,23 @@ async fn collect_reader(
     buf.lock().map(|b| b.clone()).unwrap_or_default()
 }
 
-/// `read_capped`, also flipping `first` the moment any output arrives. For
-/// claude, whose first stream event is what makes it safe to signal - see
-/// `run_claude`.
-async fn read_capped_flagging<R>(
+/// Read claude's stream like `read_capped`, with two differences.
+///
+/// `first` flips the moment any output arrives: claude's first event is what
+/// makes it safe to signal (see `run_claude`).
+///
+/// Past `cap`, the most recent `tail_keep` to `2 * tail_keep` bytes go to
+/// `tail` instead of being dropped. The stream *ends* in the result object,
+/// the one line `review` needs, so keeping only the head - right for codex,
+/// whose answer comes from `-o` - would lose the answer and the session id of
+/// any run that outgrew the cap. Both buffers are shared rather than returned,
+/// so what was read survives the reader being aborted.
+async fn read_claude_stream<R>(
     mut r: R,
     cap: usize,
-    out: SharedBuf,
+    tail_keep: usize,
+    head: SharedBuf,
+    tail: SharedBuf,
     first: tokio::sync::watch::Sender<bool>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
@@ -161,11 +171,34 @@ async fn read_capped_flagging<R>(
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 first.send_replace(true);
-                push_capped(&out, &chunk[..n], cap);
+                let mut bytes = &chunk[..n];
+                if let Ok(mut h) = head.lock()
+                    && h.len() < cap
+                {
+                    let take = (cap - h.len()).min(bytes.len());
+                    h.extend_from_slice(&bytes[..take]);
+                    bytes = &bytes[take..];
+                }
+                if !bytes.is_empty()
+                    && let Ok(mut t) = tail.lock()
+                {
+                    t.extend_from_slice(bytes);
+                    if t.len() > 2 * tail_keep {
+                        let excess = t.len() - tail_keep;
+                        t.drain(..excess);
+                    }
+                }
             }
         }
     }
 }
+
+/// How much of claude's stream past `STDOUT_CAPTURE_CAP` is kept: enough for a
+/// result line carrying a long answer.
+const CLAUDE_TAIL_KEEP: usize = 8 << 20; // 8 MiB
+
+/// Longest explanation `interpret_claude_output` puts in an error, in chars.
+const CLAUDE_DETAIL_MAX: usize = 2000;
 
 /// Read codex's stdout to EOF exactly like `read_capped`, but additionally scan
 /// the NDJSON for the `thread.started` event and publish the session id on
@@ -655,15 +688,20 @@ struct RunOutput {
     served: Served,
 }
 
-/// Knobs on how a codex run is executed, injectable so tests can drive the real
-/// `run_codex_json` path against a stub binary in milliseconds rather than
-/// minutes. Production always uses `Default`.
+/// Knobs on how a codex or claude run is executed, injectable so tests can
+/// drive the real `run_codex_json` and `run_claude` paths against a stub in
+/// milliseconds rather than minutes. Production always uses `Default`.
 #[derive(Clone)]
-pub struct CodexRuntime {
-    /// The binary to exec. Overridden in tests by a stub that reproduces the
-    /// hang shapes (answer-then-hang, hang-with-no-answer, pipe-retaining
+pub struct ProviderRuntime {
+    /// The codex binary to exec. Overridden in tests by a stub that reproduces
+    /// the hang shapes (answer-then-hang, hang-with-no-answer, pipe-retaining
     /// descendant) deterministically.
-    pub binary: String,
+    pub codex_binary: String,
+    /// The program and leading arguments that run claude; `run_claude`
+    /// appends its own. `["claude"]` in production. A prefix rather than a
+    /// binary because tests run their stub as `/bin/sh <script>` - exec'ing a
+    /// freshly written script races `ETXTBSY` (see `provider_tests`).
+    pub claude_command: Vec<String>,
     /// Watchdog polling/patience.
     pub timings: crate::watchdog::Timings,
     /// How long a pipe reader gets to finish after the child is reaped before
@@ -684,7 +722,7 @@ pub struct CodexRuntime {
     pub stop: tokio::sync::watch::Receiver<bool>,
 }
 
-impl CodexRuntime {
+impl ProviderRuntime {
     /// Build from project config. `stall_timeout_secs` comes from
     /// `[_defaults].stall_timeout_secs`: `None` keeps the built-in default,
     /// `Some(0)` disables the stall branch, anything else sets it.
@@ -697,10 +735,11 @@ impl CodexRuntime {
     }
 }
 
-impl Default for CodexRuntime {
+impl Default for ProviderRuntime {
     fn default() -> Self {
         Self {
-            binary: "codex".to_string(),
+            codex_binary: "codex".to_string(),
+            claude_command: vec!["claude".to_string()],
             timings: crate::watchdog::Timings::default(),
             drain_grace: crate::timings::DRAIN_GRACE,
             sigkill_escalation: crate::timings::SIGKILL_ESCALATION,
@@ -733,7 +772,7 @@ pub async fn invoke(
     project_root: &Path,
     oneshot: bool,
     launched: Option<LaunchSignal>,
-    runtime: &CodexRuntime,
+    runtime: &ProviderRuntime,
 ) -> ProviderResult {
     // Profiles carry `review`'s own sandbox vocabulary; each provider spells the
     // levels differently and grok hard-errors on a name it cannot resolve, so
@@ -1209,7 +1248,7 @@ async fn run_claude(
     launched: Option<LaunchSignal>,
     // Named for codex, whose runner it was written for; claude uses only the
     // stop channel, the data root and the two grace periods.
-    runtime: &CodexRuntime,
+    runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
     // In oneshot mode, generate a UUID up front and pass it via --session-id
     // so the fresh session is persistable and the operator can follow up via
@@ -1256,8 +1295,13 @@ async fn run_claude(
         args.push(e.to_string());
     }
 
-    let mut cmd = Command::new("claude");
-    cmd.args(&args)
+    let (program, leading) = runtime
+        .claude_command
+        .split_first()
+        .map_or(("claude", &[][..]), |(p, rest)| (p.as_str(), rest));
+    let mut cmd = Command::new(program);
+    cmd.args(leading)
+        .args(&args)
         .current_dir(project_root)
         // Its own process group, so the signal supervisor can take claude and
         // every shell it spawned with it when `review` is killed. Otherwise a
@@ -1293,6 +1337,20 @@ async fn run_claude(
         .env("BASH_MAX_TIMEOUT_MS", &wait_ms);
     if let Some(vars) = env {
         cmd.envs(vars);
+    }
+    // A request left over from an earlier run of this session (its `review`
+    // killed before consuming it) is not aimed at this one, and would mark a
+    // failed resume as interrupted, hiding claude's stated reason. A fresh run
+    // needs no check: its session id is new. As in `run_codex_json`.
+    if !oneshot {
+        let _ = crate::inflight::take_interrupt_request(session_id, runtime.data_root.as_deref());
+    }
+    // A run still waiting on the lock or its stagger when `review` was told to
+    // stop would otherwise launch claude only to kill it before its first event
+    // - and, a stopped run being recorded as interrupted, file a sidecar row and
+    // print a resume command for a session claude may never have written.
+    if *runtime.stop.borrow() {
+        anyhow::bail!("not launched: review was signalled to stop");
     }
     let mut child = cmd.spawn().context("failed to spawn claude")?;
     // Launch has happened: the caller may release the global lock. Dropping the
@@ -1341,11 +1399,14 @@ async fn run_claude(
     });
 
     let stdout_shared = new_shared_buf();
+    let stdout_tail = new_shared_buf();
     let stderr_shared = new_shared_buf();
-    let stdout_task = tokio::spawn(read_capped_flagging(
+    let stdout_task = tokio::spawn(read_claude_stream(
         stdout_pipe,
         STDOUT_CAPTURE_CAP,
+        CLAUDE_TAIL_KEEP,
         std::sync::Arc::clone(&stdout_shared),
+        std::sync::Arc::clone(&stdout_tail),
         first_tx,
     ));
     let stderr_task = tokio::spawn(read_capped(
@@ -1394,13 +1455,21 @@ async fn run_claude(
         unregister_group(pid);
     }
     let status = status.context("failed to wait for claude")?;
-    let stdout_buf = collect_reader(
+    let mut stdout_buf = collect_reader(
         stdout_task,
         &stdout_shared,
         runtime.drain_grace,
         "claude stdout",
     )
     .await;
+    // The tail starts mid-line; the newline makes that fragment a line of its
+    // own, which fails to parse and is skipped like any other.
+    if let Ok(tail) = stdout_tail.lock()
+        && !tail.is_empty()
+    {
+        stdout_buf.push(b'\n');
+        stdout_buf.extend_from_slice(&tail);
+    }
     let stderr_buf = collect_reader(
         stderr_task,
         &stderr_shared,
@@ -1442,21 +1511,56 @@ async fn run_claude(
         }),
         ..with_usage(no_answer_digest(String::new(), &status))
     };
+    // What an interrupted run prints in place of an answer, as codex's does.
+    let interrupted_text = |text: String| {
+        if text.trim().is_empty() {
+            "(interrupted by the operator before a final answer)".to_string()
+        } else {
+            text
+        }
+    };
+    // Whether claude printed its first event, which carries the session id:
+    // past that point the session exists (its transcript is on disk), so a run
+    // that then ends without a result still has a session worth keeping.
+    let started = *first_rx.borrow();
 
     let outcome = match interpret_claude_output(&stdout, &stderr) {
         Ok(outcome) => outcome,
-        // Signalled before claude could answer for itself: the session id is
-        // ours, and claude has written at least the prompt if it got that far.
-        Err(_) if interrupt_requested => {
+        // No result, but claude had started: interrupted before it could
+        // answer for itself, or died (killed from outside, crashed) after
+        // starting. Either way the session exists, and dropping its id - as an
+        // `Err` would, `invoke` setting none - makes the one turn most worth
+        // resuming unresumable. A death is `Ok` with a death digest, as for
+        // codex: no `turn_error`, because claude stated no reason.
+        Err(e) if started => {
+            let digest = if interrupt_requested {
+                interrupted_digest()
+            } else {
+                Digest {
+                    turn_error: None,
+                    ..with_usage(no_answer_digest(String::new(), &status))
+                }
+            };
+            let text = if interrupt_requested {
+                interrupted_text(String::new())
+            } else {
+                format!("(claude ended without a result: {e})")
+            };
             return Ok(RunOutput {
-                text: String::new(),
+                text,
                 session_id: keep_id(None),
-                digest: Some(interrupted_digest()),
+                digest: Some(digest),
                 served,
             });
         }
-        // No result object: the prompt may never have arrived, which is the
-        // more useful thing to say when it didn't.
+        // Stopped before claude's first event: the group was killed before
+        // claude could have written anything, so there is no session to name.
+        // Recording one would print a resume command that fails.
+        Err(_) if stopped_by_signal => {
+            anyhow::bail!("not started: review was signalled to stop before claude's first event");
+        }
+        // No result object and claude never started: the prompt may never
+        // have arrived, which is the more useful thing to say when it didn't.
         Err(e) => match write_res {
             Err(write_err) => return Err(write_err.context(e.to_string())),
             Ok(()) => return Err(e),
@@ -1488,16 +1592,19 @@ async fn run_claude(
             reason,
             text,
             session_id,
-        } => RunOutput {
-            text,
-            session_id: keep_id(session_id),
-            digest: Some(if interrupt_requested {
-                interrupted_digest()
+        } => {
+            let (text, digest) = if interrupt_requested {
+                (interrupted_text(text), interrupted_digest())
             } else {
-                with_usage(no_answer_digest(reason, &status))
-            }),
-            served,
-        },
+                (text, with_usage(no_answer_digest(reason, &status)))
+            };
+            RunOutput {
+                text,
+                session_id: keep_id(session_id),
+                digest: Some(digest),
+                served,
+            }
+        }
     })
 }
 
@@ -1564,12 +1671,22 @@ enum ClaudeOutcome {
 /// as a failure rather than a success: a claude that stopped reporting it
 /// should fail loudly, not pass every run off as answered.
 fn interpret_claude_output(stdout: &str, stderr: &str) -> Result<ClaudeOutcome> {
+    // Why there is no result, for the error message - which is printed and
+    // persisted in `audit.jsonl`, so it is bounded. stderr is claude's own
+    // account when it gives one. Otherwise only the last line of the stream:
+    // the whole stream is every event of the run, tool output included, up to
+    // `STDOUT_CAPTURE_CAP`.
     let detail = || {
-        if stderr.trim().is_empty() {
-            stdout.trim().to_string()
+        let source = if stderr.trim().is_empty() {
+            stdout
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("(no output)")
         } else {
-            stderr.trim().to_string()
-        }
+            stderr.trim()
+        };
+        truncate(source, CLAUDE_DETAIL_MAX)
     };
     let Some(result) =
         last_claude_result(stdout).and_then(|line| serde_json::from_str::<ClaudeResult>(line).ok())
@@ -2442,7 +2559,7 @@ async fn run_codex(
     project_root: &Path,
     oneshot: bool,
     launched: Option<LaunchSignal>,
-    runtime: &CodexRuntime,
+    runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
     let last_msg_path = new_output_file()?;
 
@@ -2635,9 +2752,9 @@ async fn run_codex_json(
     prompt: &str,
     project_root: &Path,
     launched: Option<LaunchSignal>,
-    runtime: &CodexRuntime,
+    runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
-    let mut cmd = Command::new(&runtime.binary);
+    let mut cmd = Command::new(&runtime.codex_binary);
     cmd.args(&args)
         .current_dir(project_root)
         // Make a codex panic legible: without this it exits 1 with no trace,
@@ -3113,7 +3230,7 @@ async fn run_codex_json(
             // The binary actually executed, which is not always "codex": a
             // stub overrides it. `command` in meta.json has to replay the
             // process that really ran.
-            binary: &runtime.binary,
+            binary: &runtime.codex_binary,
             session_id: session_id.as_deref(),
             argv: &args,
             prompt,
