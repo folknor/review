@@ -208,25 +208,26 @@ async fn read_capped_stdout<R>(
     }
 }
 
-/// Process groups of codex children currently running under this `review`.
+/// Process groups of codex and claude children currently running under this
+/// `review`.
 ///
-/// Needed because codex is spawned into its *own* process group (see
-/// `run_codex_json`), so a terminal `SIGINT` no longer reaches it implicitly and
-/// a `SIGTERM` aimed at `review` never did. Without explicit forwarding, killing
-/// `review` leaves codex running detached - observed in the field, where the
-/// abandoned codex kept working and editing the tree for hours after its
-/// operator thought it had been stopped.
-static CODEX_GROUPS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
+/// Needed because both are spawned into their *own* process group (see
+/// `run_codex_json`, `run_claude`), so a terminal `SIGINT` no longer reaches
+/// them implicitly and a `SIGTERM` aimed at `review` never did. Without explicit
+/// forwarding, killing `review` leaves the provider running detached - observed
+/// in the field with codex, where the abandoned run kept working and editing the
+/// tree for hours after its operator thought it had been stopped.
+static PROVIDER_GROUPS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
     std::sync::Mutex::new(None);
 
 fn register_group(pid: u32) {
-    if let Ok(mut guard) = CODEX_GROUPS.lock() {
+    if let Ok(mut guard) = PROVIDER_GROUPS.lock() {
         guard.get_or_insert_with(Default::default).insert(pid);
     }
 }
 
 fn unregister_group(pid: u32) {
-    if let Ok(mut guard) = CODEX_GROUPS.lock()
+    if let Ok(mut guard) = PROVIDER_GROUPS.lock()
         && let Some(set) = guard.as_mut()
     {
         set.remove(&pid);
@@ -338,14 +339,14 @@ pub fn install_signal_supervisor() {
         }
         // Snapshot and release the lock before signalling; never hold it across
         // the kills.
-        let pids: Vec<u32> = CODEX_GROUPS
+        let pids: Vec<u32> = PROVIDER_GROUPS
             .lock()
             .ok()
             .and_then(|g| g.as_ref().map(|s| s.iter().copied().collect()))
             .unwrap_or_default();
         if !pids.is_empty() {
             eprintln!(
-                "\n{name}: terminating {} running codex process group(s)",
+                "\n{name}: terminating {} running provider process group(s)",
                 pids.len()
             );
         }
@@ -377,8 +378,8 @@ pub fn install_signal_supervisor() {
     });
 }
 
-/// Terminate a codex child *and everything it spawned* by signalling its whole
-/// process group, escalating to `SIGKILL` after a grace period.
+/// Terminate a codex (or claude) child *and everything it spawned* by signalling
+/// its whole process group, escalating to `SIGKILL` after a grace period.
 ///
 /// The group, not the pid: codex spawns exec-server processes, unified-exec
 /// background "cells", network proxies and MCP servers, and a wedged codex is
@@ -425,8 +426,8 @@ pub struct Usage {
 }
 
 /// Structured summary of a codex run, distilled from its NDJSON stream plus the
-/// `-o`/`--output-last-message` backstop. Absent for providers that don't emit
-/// a machine-readable stream (claude `--print`).
+/// `-o`/`--output-last-message` backstop. Grok and claude produce one from their
+/// result object only when a run did not end in a clean answer.
 pub struct Digest {
     /// Process exit code (`None` if terminated by a signal).
     pub exit_code: Option<i32>,
@@ -601,8 +602,8 @@ pub struct ProviderResult {
 /// The two are different names, not two spellings of one: grok's `-m grok-4.7`
 /// is served as `grok-4.7-build`, and `-m grok-4.7-build` is refused as an
 /// unknown model id. So this is recorded but **never** inherited by a
-/// `review resume` - feeding it back to `-m` would fail the launch. Only grok
-/// reports it today; empty for every other provider.
+/// `review resume` - feeding it back to `-m` would fail the launch. Grok and
+/// claude report it, from their result objects; empty for codex.
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct Served {
     /// Every model that served a call in the run, sorted and comma-joined (one
@@ -1161,33 +1162,13 @@ async fn write_stdin(
     }
 }
 
-/// Run a provider that outputs to stdout (claude).
-/// Shared logic for stdin pipe → stdout capture.
-async fn run_with_stdout(
-    mut child: tokio::process::Child,
-    prompt: &str,
-    provider: &str,
-) -> Result<String> {
-    let stdin = child
-        .stdin
-        .take()
-        .with_context(|| format!("failed to open {provider} stdin"))?;
-    let write_result = write_stdin(stdin, prompt.as_bytes().to_vec());
-    let output = child.wait_with_output();
-
-    let (write_res, output) = tokio::join!(write_result, output);
-    let output = output.with_context(|| format!("failed to wait for {provider}"))?;
-
-    if !output.status.success() {
-        if let Err(e) = write_res {
-            anyhow::bail!("failed to write prompt: {e}");
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("{provider} exited with error: {}", stderr.trim());
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-}
+/// How long `review` lets a claude shell command run in the foreground: 20
+/// minutes, the allowance grok gets (`GROK_COMMAND_WAIT_SECS`) for the same
+/// reason - long enough for a full gate, short enough that a wedged command
+/// cannot hold a run for hours. Set as both `BASH_DEFAULT_TIMEOUT_MS` and
+/// `BASH_MAX_TIMEOUT_MS`; see `run_claude` for why the default is the one that
+/// matters.
+const CLAUDE_COMMAND_WAIT_SECS: u64 = 20 * 60;
 
 #[allow(clippy::too_many_arguments)]
 async fn run_claude(
@@ -1210,65 +1191,306 @@ async fn run_claude(
         None
     };
 
-    let mut args: Vec<&str> = if let Some(ref id) = oneshot_id {
-        vec![
-            "--session-id",
-            id,
-            "--print",
-            "--permission-mode",
-            "dontAsk",
-        ]
+    let mut args: Vec<String> = if let Some(ref id) = oneshot_id {
+        vec!["--session-id".to_string(), id.clone()]
     } else {
-        vec![
-            "--resume",
-            session_id,
-            "--print",
-            "--permission-mode",
-            "dontAsk",
-        ]
+        vec!["--resume".to_string(), session_id.to_string()]
     };
-    let model_owned;
-    if let Some(m) = model {
-        model_owned = m.to_string();
-        args.push("--model");
-        args.push(&model_owned);
+    // `json` is one result object per run, whatever the outcome, carrying
+    // `is_error` - so the turn classifies itself, as grok's does, and a failed
+    // run still names its session. Text output gave neither: a non-zero exit was
+    // all `review` saw, and it discarded the session id with it. When claude
+    // wakes the model for a background subagent's result, the object printed is
+    // the *last* turn's (its answer is the right one, but its cost, usage and
+    // turn count cover that turn alone) - which background tasks being disabled
+    // below makes moot.
+    for arg in [
+        "--print",
+        "--permission-mode",
+        "dontAsk",
+        "--output-format",
+        "json",
+    ] {
+        args.push(arg.to_string());
     }
-    let effort_owned;
+    if let Some(m) = model {
+        args.push("--model".to_string());
+        args.push(m.to_string());
+    }
     if let Some(e) = effort {
-        effort_owned = e.to_string();
-        args.push("--effort");
-        args.push(&effort_owned);
+        args.push("--effort".to_string());
+        args.push(e.to_string());
     }
 
     let mut cmd = Command::new("claude");
     cmd.args(&args)
         .current_dir(project_root)
+        // Its own process group, so the signal supervisor can take claude and
+        // every shell it spawned with it when `review` is killed. Otherwise a
+        // SIGTERM to `review` leaves claude running unsupervised, still editing
+        // the tree - the failure codex's process group was introduced for.
+        .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Keep the model's shell commands in the foreground, where their output
+    // reaches it. `--print` does not wait for a background Bash command when the
+    // model ends its turn: it *kills* it and exits 0. Probed on Claude Code
+    // 2.1.284, asked only to run a 60s command in the background and report its
+    // output, the model replied "I'll report exactly what it prints when it
+    // finishes", ended its turn, and the command was killed seconds later - a
+    // clean-looking run with no report, the loss grok's wake loop exists for.
+    // Claude's switch removes the `run_in_background` parameter altogether, so
+    // the same prompt ran the command in the foreground and reported its output.
+    // (A background *subagent* was already waited for and its result handed
+    // back in a second turn; it now just runs in the foreground too.)
+    //
+    // The cost of the switch is Bash's 2-minute default timeout, which kills a
+    // longer foreground command outright. The model can pass its own `timeout`,
+    // but under `dontAsk` a permission allowlist that names commands (like
+    // `Bash(python3 *)`) denies any call carrying one - observed - so the
+    // default is the limit that actually applies, and it is raised to
+    // `CLAUDE_COMMAND_WAIT_SECS`: a 150s command then ran to completion. The
+    // maximum is raised with it, for a model that is allowed to pass a timeout.
+    // Set before the profile env so a profile can restate any of them.
+    let wait_ms = (CLAUDE_COMMAND_WAIT_SECS * 1000).to_string();
+    cmd.env("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1")
+        .env("BASH_DEFAULT_TIMEOUT_MS", &wait_ms)
+        .env("BASH_MAX_TIMEOUT_MS", &wait_ms);
     if let Some(vars) = env {
         cmd.envs(vars);
     }
-    let child = cmd.spawn().context("failed to spawn claude")?;
+    let mut child = cmd.spawn().context("failed to spawn claude")?;
     // Launch has happened: the caller may release the global lock. Dropping the
     // sender instead (on the `?` above) tells it the same thing.
     if let Some(signal) = launched {
         let _ = signal.send(());
     }
+    let stdin = child.stdin.take().context("failed to open claude stdin")?;
+    // Registered only after the last `?` that could return early, and
+    // unregistered before the next, so the supervisor never holds a stale pid.
+    let pid = child.id();
+    if let Some(pid) = pid {
+        register_group(pid);
+    }
+    let (write_res, output) = tokio::join!(
+        write_stdin(stdin, prompt.as_bytes().to_vec()),
+        child.wait_with_output()
+    );
+    if let Some(pid) = pid {
+        unregister_group(pid);
+    }
+    let output = output.context("failed to wait for claude")?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
-    let text = run_with_stdout(child, prompt, "claude").await?;
-    Ok(RunOutput {
-        text,
-        session_id: oneshot_id,
-        digest: None,
-        served: Served::default(),
+    // Only a fresh run reports a session id, as for grok: the caller passed a
+    // resume's id in and records it already. Claude's echoed id is preferred to
+    // the one we generated, so a claude that reassigned it could not orphan the
+    // session.
+    let keep_id = |echoed: Option<String>| if oneshot { echoed.or(oneshot_id) } else { None };
+    let served = result_served(&stdout);
+    let (turns, usage) = claude_usage(&stdout);
+    let with_usage = |digest: Digest| Digest {
+        turns,
+        usage: usage.clone(),
+        ..digest
+    };
+
+    let outcome = match interpret_claude_output(&stdout, &stderr) {
+        Ok(outcome) => outcome,
+        // No result object: the prompt may never have arrived, which is the
+        // more useful thing to say when it didn't.
+        Err(e) => match write_res {
+            Err(write_err) => return Err(write_err.context(e.to_string())),
+            Ok(()) => return Err(e),
+        },
+    };
+    Ok(match outcome {
+        ClaudeOutcome::Answered { text, session_id } => RunOutput {
+            text,
+            session_id: keep_id(session_id),
+            served,
+            // As for grok: a real answer from a process that exited non-zero is
+            // still an answer, but the status is the only sign something went
+            // wrong after the turn, so it is kept. `captured: true` keeps it out
+            // of `died_without_answer`.
+            digest: (!output.status.success()).then(|| {
+                with_usage(Digest {
+                    captured: true,
+                    ..no_answer_digest(
+                        "claude exited non-zero after producing an answer".to_string(),
+                        &output.status,
+                    )
+                })
+            }),
+        },
+        ClaudeOutcome::NoAnswer {
+            reason,
+            text,
+            session_id,
+        } => RunOutput {
+            text,
+            session_id: keep_id(session_id),
+            digest: Some(with_usage(no_answer_digest(reason, &output.status))),
+            served,
+        },
     })
+}
+
+/// Claude's `--output-format json` result object: one per run, whatever the
+/// outcome. Only the fields that decide the outcome are modelled; usage and
+/// what served the run are read separately (`claude_usage`, `result_served`).
+#[derive(serde::Deserialize)]
+struct ClaudeResult {
+    /// `"result"`. Checked so that some other JSON on stdout is not mistaken
+    /// for a result - every other field here is optional.
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    /// `"success"` even for an API error (a model claude could not find
+    /// reported `subtype: "success"`, `is_error: true`) - so `is_error`, not
+    /// this, decides. Named in the reason when it says something else.
+    #[serde(default)]
+    subtype: Option<String>,
+    #[serde(default)]
+    is_error: Option<bool>,
+    #[serde(default)]
+    result: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    /// `"completed"` on a normal turn, `"api_error"` on the unknown model.
+    #[serde(default)]
+    terminal_reason: Option<String>,
+    #[serde(default)]
+    api_error_status: Option<u32>,
+}
+
+/// What a finished claude run amounts to. An `Err` alongside these means no
+/// result object came back at all.
+#[derive(Debug)]
+enum ClaudeOutcome {
+    Answered {
+        text: String,
+        session_id: Option<String>,
+    },
+    /// Claude produced a result object and flagged it an error. The session
+    /// exists (its transcript is on disk even for a launch the API refused), so
+    /// this is `Ok` with the id kept, for the reasons `no_answer_digest` gives.
+    NoAnswer {
+        reason: String,
+        text: String,
+        session_id: Option<String>,
+    },
+}
+
+/// Decide whether a finished claude run produced an answer, from its streams
+/// alone. Pure, so each shape is tested without a claude binary.
+///
+/// Only `is_error: false` is an answer. A result missing the flag is treated
+/// as a failure rather than a success: a claude that stopped reporting it
+/// should fail loudly, not pass every run off as answered.
+fn interpret_claude_output(stdout: &str, stderr: &str) -> Result<ClaudeOutcome> {
+    let detail = || {
+        if stderr.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            stderr.trim().to_string()
+        }
+    };
+    let result = match serde_json::from_str::<ClaudeResult>(stdout.trim()) {
+        Ok(r) if r.kind.as_deref() == Some("result") => r,
+        _ => anyhow::bail!("claude produced no result object: {}", detail()),
+    };
+    let text = result.result.unwrap_or_default();
+    if result.is_error == Some(false) {
+        return Ok(ClaudeOutcome::Answered {
+            text,
+            session_id: result.session_id,
+        });
+    }
+    let mut facts: Vec<String> = Vec::new();
+    if result.is_error.is_none() {
+        facts.push("no is_error flag".to_string());
+    }
+    if let Some(s) = result.subtype.as_deref().filter(|s| *s != "success") {
+        facts.push(format!("subtype: {s}"));
+    }
+    if let Some(t) = result
+        .terminal_reason
+        .as_deref()
+        .filter(|t| *t != "completed")
+    {
+        facts.push(format!("terminal_reason: {t}"));
+    }
+    if let Some(status) = result.api_error_status {
+        facts.push(format!("API status {status}"));
+    }
+    let mut reason = "claude reported an error".to_string();
+    if !facts.is_empty() {
+        reason.push_str(&format!(" ({})", facts.join(", ")));
+    }
+    // On an error the result text is claude's own explanation (the unknown
+    // model: "There's an issue with the selected model ..."), which is the
+    // thing worth persisting in the greppable `turn_error`.
+    if let Some(line) = text.lines().find(|l| !l.trim().is_empty()) {
+        reason.push_str(&format!(": {}", line.trim()));
+    }
+    Ok(ClaudeOutcome::NoAnswer {
+        reason,
+        text,
+        session_id: result.session_id,
+    })
+}
+
+/// Turn count and token usage from claude's result object, mapped onto the
+/// codex-shaped `Usage`: codex's `input_tokens` includes the cached part, while
+/// claude reports uncached input, cache writes and cache reads separately, so
+/// all three are summed and the reads are the cached share. Thinking tokens
+/// (inside `output_tokens`, as codex's reasoning tokens are) fill the reasoning
+/// field. Record-only: a result without these fields records zeros.
+fn claude_usage(stdout: &str) -> (u32, Usage) {
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct Details {
+        thinking_tokens: u64,
+    }
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct RawUsage {
+        input_tokens: u64,
+        cache_creation_input_tokens: u64,
+        cache_read_input_tokens: u64,
+        output_tokens: u64,
+        output_tokens_details: Option<Details>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Raw {
+        #[serde(default)]
+        usage: RawUsage,
+        #[serde(default)]
+        num_turns: u32,
+    }
+    let Ok(raw) = serde_json::from_str::<Raw>(stdout.trim()) else {
+        return (0, Usage::default());
+    };
+    let u = raw.usage;
+    (
+        raw.num_turns,
+        Usage {
+            input_tokens: u.input_tokens
+                + u.cache_creation_input_tokens
+                + u.cache_read_input_tokens,
+            cached_input_tokens: u.cache_read_input_tokens,
+            output_tokens: u.output_tokens,
+            reasoning_output_tokens: u.output_tokens_details.map_or(0, |d| d.thinking_tokens),
+        },
+    )
 }
 
 /// Grok's headless result object (`--output-format json`). One JSON object on
 /// stdout per run, whatever the outcome; the fields we don't use (usage,
 /// requestId, thought) are ignored rather than modelled. The served model and
-/// cost are read separately, by `grok_served`.
+/// cost are read separately, by `result_served`.
 #[derive(serde::Deserialize)]
 struct GrokResult {
     #[serde(default)]
@@ -1524,7 +1746,7 @@ fn wake_failure_digest(reason: String, last: Option<&Digest>) -> Digest {
         signal: None,
         turns,
         usage,
-        ..grok_no_answer_digest(reason, &std::process::ExitStatus::default())
+        ..no_answer_digest(reason, &std::process::ExitStatus::default())
     }
 }
 
@@ -1686,7 +1908,7 @@ async fn run_grok_turn(
     // Where to look for the event log if grok does not echo an id.
     let lookup_id = oneshot_id.clone().unwrap_or_else(|| session_id.to_string());
     let keep_id = |echoed: Option<String>| if oneshot { echoed.or(oneshot_id) } else { None };
-    let served = grok_served(&stdout);
+    let served = result_served(&stdout);
     let (turns, usage) = grok_usage(&stdout);
     let with_usage = |digest: Digest| Digest {
         turns,
@@ -1707,7 +1929,7 @@ async fn run_grok_turn(
             digest: (!output.status.success()).then(|| {
                 with_usage(Digest {
                     captured: true,
-                    ..grok_no_answer_digest(
+                    ..no_answer_digest(
                         "grok exited non-zero after producing an answer".to_string(),
                         &output.status,
                     )
@@ -1732,7 +1954,7 @@ async fn run_grok_turn(
             RunOutput {
                 text,
                 session_id: keep_id(session_id),
-                digest: Some(with_usage(grok_no_answer_digest(reason, &output.status))),
+                digest: Some(with_usage(no_answer_digest(reason, &output.status))),
                 served,
             }
         }
@@ -1758,7 +1980,7 @@ fn explain_grok_no_answer(reason: String, cause: Option<&str>, untrusted: Option
 /// Turn count and token usage from grok's result object, mapped onto the
 /// codex-shaped `Usage`: codex's `input_tokens` includes the cached part, so
 /// grok's separately-reported cache reads are added back in. Record-only, like
-/// `grok_served`: a result without these fields records zeros.
+/// `result_served`: a result without these fields records zeros.
 fn grok_usage(stdout: &str) -> (u32, Usage) {
     #[derive(serde::Deserialize, Default)]
     #[serde(default)]
@@ -1790,11 +2012,13 @@ fn grok_usage(stdout: &str) -> (u32, Usage) {
     )
 }
 
-/// Pull what served the run out of grok's result object. Parsed separately
-/// from `interpret_grok_output` because it is record-only: nothing about
-/// whether the run answered depends on it, and a result lacking these fields
-/// is still a valid result - it just records nothing here.
-fn grok_served(stdout: &str) -> Served {
+/// Pull what served the run out of a grok or claude result object - both name
+/// the fields `modelUsage` (keyed by model) and `total_cost_usd`. Parsed
+/// separately from `interpret_grok_output` / `interpret_claude_output` because
+/// it is record-only: nothing about whether the run answered depends on it, and
+/// a result lacking these fields is still a valid result - it just records
+/// nothing here.
+fn result_served(stdout: &str) -> Served {
     #[derive(serde::Deserialize)]
     struct Raw {
         #[serde(rename = "modelUsage", default)]
@@ -1819,8 +2043,10 @@ struct GrokAnswer {
     session_id: Option<String>,
 }
 
-/// A grok turn that ran but produced no answer, expressed the same way codex's
-/// deaths are: `Ok` carrying a digest, never `Err`.
+/// A grok or claude turn that ran but produced no answer, expressed the same way
+/// codex's deaths are: `Ok` carrying a digest, never `Err`. Written for grok;
+/// claude reports its turns the same way (a result object that says whether it
+/// is an error), so everything below applies to it unchanged.
 ///
 /// The distinction that matters is between *never reaching the provider* (a
 /// spawn failure, an unknown model, a session that does not exist - nothing ran,
@@ -1839,7 +2065,7 @@ struct GrokAnswer {
 /// first, persists flat, and never invites a retry. The remaining fields
 /// describe a run with no captured answer, which is what happened; the
 /// codex-specific forensics stay `None` because grok has no rollout.
-fn grok_no_answer_digest(reason: String, status: &std::process::ExitStatus) -> Digest {
+fn no_answer_digest(reason: String, status: &std::process::ExitStatus) -> Digest {
     Digest {
         // The *observed* status, not an assumed one. Hardcoding `1` here made
         // the digest assert something it had never looked at - and the exit

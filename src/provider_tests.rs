@@ -993,15 +993,131 @@ fn grok_served_model_and_cost_are_read_from_model_usage() {
       "modelUsage": { "grok-4.7-build": { "modelCalls": 1, "costUSD": 0.02397 } }
     }"#;
     assert_eq!(
-        super::grok_served(out),
+        super::result_served(out),
         super::Served {
             model: Some("grok-4.7-build".to_string()),
             cost_usd: Some(0.02397),
         }
     );
     // Absent fields and non-JSON record nothing rather than failing the run.
-    assert_eq!(super::grok_served(GROK_OK), super::Served::default());
-    assert_eq!(super::grok_served("not json"), super::Served::default());
+    assert_eq!(super::result_served(GROK_OK), super::Served::default());
+    assert_eq!(super::result_served("not json"), super::Served::default());
+}
+
+/// A clean claude result object, trimmed from a real Claude Code 2.1.284
+/// `--output-format json` run.
+const CLAUDE_OK: &str = r#"{
+  "type": "result",
+  "subtype": "success",
+  "is_error": false,
+  "result": "LAUNCHED",
+  "session_id": "2f8b2c2f-d939-4823-a615-7ebd6637f958",
+  "num_turns": 2,
+  "terminal_reason": "completed",
+  "api_error_status": null,
+  "total_cost_usd": 0.21126,
+  "usage": {
+    "input_tokens": 4,
+    "cache_creation_input_tokens": 25470,
+    "cache_read_input_tokens": 22520,
+    "output_tokens": 149,
+    "output_tokens_details": { "thinking_tokens": 0 }
+  },
+  "modelUsage": { "claude-opus-5-5": { "costUSD": 0.21126 } }
+}"#;
+
+#[test]
+fn claude_clean_result_is_an_answer() {
+    let outcome = super::interpret_claude_output(CLAUDE_OK, "").expect("a result object");
+    let super::ClaudeOutcome::Answered { text, session_id } = outcome else {
+        panic!("is_error false is an answer");
+    };
+    assert_eq!(text, "LAUNCHED");
+    assert_eq!(
+        session_id.as_deref(),
+        Some("2f8b2c2f-d939-4823-a615-7ebd6637f958")
+    );
+}
+
+#[test]
+fn claude_api_error_is_a_stated_failure_that_keeps_its_session() {
+    // Real output for `--model no-such-model-xyz`: exit 1, and a result object
+    // that still says `subtype: "success"` - only `is_error` gives it away. The
+    // session exists on disk, so the id must survive; text mode discarded it.
+    let unknown_model = r#"{
+      "type": "result",
+      "subtype": "success",
+      "is_error": true,
+      "result": "There's an issue with the selected model (no-such-model-xyz). It may not exist or you may not have access to it. Run --model to pick a different model.",
+      "session_id": "ff2d6c14-1b45-481f-85a2-24e367d9e6ad",
+      "num_turns": 1,
+      "terminal_reason": "api_error",
+      "api_error_status": 404,
+      "total_cost_usd": 0
+    }"#;
+    let outcome = super::interpret_claude_output(
+        unknown_model,
+        r#"[claude-code:unrecognized_model] {"model":"no-such-model-xyz"}"#,
+    )
+    .expect("an error result is still a result, not a launch failure");
+    let super::ClaudeOutcome::NoAnswer {
+        reason, session_id, ..
+    } = outcome
+    else {
+        panic!("is_error true is not an answer, whatever the subtype says");
+    };
+    assert!(reason.contains("api_error"), "{reason}");
+    assert!(reason.contains("404"), "{reason}");
+    assert!(
+        reason.contains("issue with the selected model"),
+        "claude's own explanation is persisted: {reason}"
+    );
+    assert_eq!(
+        session_id.as_deref(),
+        Some("ff2d6c14-1b45-481f-85a2-24e367d9e6ad")
+    );
+}
+
+#[test]
+fn claude_result_without_is_error_fails_closed() {
+    // A claude that stopped reporting the flag must not pass every run off as
+    // answered.
+    let unflagged = r#"{"type": "result", "result": "maybe", "session_id": "s"}"#;
+    let outcome = super::interpret_claude_output(unflagged, "").expect("a result object");
+    let super::ClaudeOutcome::NoAnswer { reason, .. } = outcome else {
+        panic!("a result with no is_error is not trusted as an answer");
+    };
+    assert!(reason.contains("no is_error flag"), "{reason}");
+}
+
+#[test]
+fn claude_output_without_a_result_object_is_a_launch_failure() {
+    let err = super::interpret_claude_output("", "Error: not logged in")
+        .expect_err("no result object: nothing ran");
+    assert!(err.to_string().contains("not logged in"), "{err}");
+    // Well-formed JSON of another type is not a result either.
+    let err = super::interpret_claude_output(r#"{"type": "system", "subtype": "init"}"#, "")
+        .expect_err("a system event is not a result");
+    assert!(err.to_string().contains("no result object"), "{err}");
+}
+
+#[test]
+fn claude_usage_and_served_are_read_from_the_result() {
+    let (turns, usage) = super::claude_usage(CLAUDE_OK);
+    assert_eq!(turns, 2);
+    // Uncached input, cache writes and cache reads together, as codex counts
+    // input; the reads are the cached share.
+    assert_eq!(usage.input_tokens, 4 + 25470 + 22520);
+    assert_eq!(usage.cached_input_tokens, 22520);
+    assert_eq!(usage.output_tokens, 149);
+    assert_eq!(
+        super::result_served(CLAUDE_OK),
+        super::Served {
+            model: Some("claude-opus-5-5".to_string()),
+            cost_usd: Some(0.21126),
+        }
+    );
+    assert_eq!(super::claude_usage("not json").0, 0);
 }
 
 #[test]
@@ -1044,7 +1160,7 @@ fn grok_cancelled_turn_is_not_an_answer() {
 
     // It must still read as a failure everywhere that matters: exit code,
     // greppable digest, and no auto-resume (a stated reason is not a wedge).
-    let digest = super::grok_no_answer_digest(reason, &exited(1));
+    let digest = super::no_answer_digest(reason, &exited(1));
     assert_eq!(
         digest.exit_code,
         Some(1),
