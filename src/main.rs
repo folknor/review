@@ -846,8 +846,8 @@ struct InheritedSettings {
 }
 
 /// `review message <id>`: deliver stdin to a session whatever it is doing. A
-/// codex turn in flight is ended first, exactly as `review interrupt` ends it,
-/// and the message then continues the session as a resume.
+/// codex or claude turn in flight is ended first, exactly as `review interrupt`
+/// ends it, and the message then continues the session as a resume.
 ///
 /// The verb exists for its name. Steering a running agent used to be
 /// `review interrupt` followed by `review resume`, and told to "interrupt the
@@ -859,7 +859,7 @@ async fn run_message(session_id: &str, dry_run: bool, started: std::time::Instan
     // turn in flight.
     let instructions = input::read_stdin()?;
     if !dry_run && let Some(marker) = inflight::live_marker(session_id, None) {
-        if marker.provider != "codex" {
+        if !interrupt_cmd::interruptible(&marker.provider) {
             bail!(
                 "session {session_id} has a {} turn in flight, which cannot be interrupted\n  \
                  send the message once it has finished",
@@ -1280,7 +1280,14 @@ fn print_digest_summary(d: &provider::DigestSummary) {
     if d.recovered_from_transcript {
         println!("recovered: final answer restored from transcript");
     } else if d.interrupted {
-        println!("note: interrupted by the operator (`review interrupt`)");
+        // The recorded reason, not an assumed one: a signalled `review` ends its
+        // turns the same way `review interrupt` does, and saying the operator
+        // ran the verb would misdescribe how the turn ended.
+        let how = d
+            .terminated_by_review
+            .as_deref()
+            .unwrap_or("operator interrupt (`review interrupt`)");
+        println!("note: interrupted - {how}");
     } else if d.turn_error.is_some() {
         // Explained above - don't also guess "died mid-turn" at it.
         println!("note: no conclusion was produced");

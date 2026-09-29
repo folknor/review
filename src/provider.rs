@@ -134,13 +134,37 @@ async fn collect_reader(
     if tokio::time::timeout(grace, &mut handle).await.is_err() {
         handle.abort();
         eprintln!(
-            "warning: codex {what} was still open {}s after the process was reaped \
+            "warning: {what} was still open {}s after the process was reaped \
              (something inherited the pipe); using the {} bytes captured so far",
             grace.as_secs(),
             buf.lock().map(|b| b.len()).unwrap_or(0)
         );
     }
     buf.lock().map(|b| b.clone()).unwrap_or_default()
+}
+
+/// `read_capped`, also flipping `first` the moment any output arrives. For
+/// claude, whose first stream event is what makes it safe to signal - see
+/// `run_claude`.
+async fn read_capped_flagging<R>(
+    mut r: R,
+    cap: usize,
+    out: SharedBuf,
+    first: tokio::sync::watch::Sender<bool>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut chunk = [0u8; 16384];
+    loop {
+        match r.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                first.send_replace(true);
+                push_capped(&out, &chunk[..n], cap);
+            }
+        }
+    }
 }
 
 /// Read codex's stdout to EOF exactly like `read_capped`, but additionally scan
@@ -247,20 +271,22 @@ pub fn stop_requested() -> bool {
     *stop_channel().borrow()
 }
 
-/// codex runs not yet recorded in the sidecar - what a signalled `review` waits
-/// for before it exits. See `Unrecorded`.
+/// codex and claude runs not yet recorded in the sidecar - what a signalled
+/// `review` waits for before it exits. See `Unrecorded`.
 static UNRECORDED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Held by a caller from before it invokes codex until after it has recorded the
-/// result, so the signal supervisor does not exit between codex being reaped and
-/// the sidecar row that makes the session resumable being written.
+/// Held by a caller from before it invokes the provider until after it has
+/// recorded the result, so the signal supervisor does not exit between the
+/// provider being reaped and the sidecar row that makes the session resumable
+/// being written.
 pub struct Unrecorded(());
 
 impl Unrecorded {
-    /// A guard for a run of `provider`; only codex runs are waited for, since
-    /// only codex turns can be ended in a way that leaves them resumable.
+    /// A guard for a run of `provider`; only codex and claude runs are waited
+    /// for, since only their turns can be ended in a way that leaves them
+    /// resumable (both answer `SIGINT` by closing the turn).
     pub fn for_provider(provider: &str) -> Option<Self> {
-        (provider == "codex").then(|| {
+        matches!(provider, "codex" | "claude").then(|| {
             UNRECORDED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Self(())
         })
@@ -283,7 +309,7 @@ impl Drop for Unrecorded {
 /// `review` quietly ignoring every `SIGTERM` after its first codex invocation,
 /// i.e. *harder* to kill than before - the opposite of the intent.
 ///
-/// With codex runs in flight the first signal is a graceful stop: each run ends
+/// With codex or claude runs in flight the first signal is a graceful stop: each run ends
 /// its turn as `review interrupt` would, records its session, and only then does
 /// `review` exit. The signal is most often an orchestrating agent stopping the
 /// background task it launched `review` as - asked to "interrupt the agent",
@@ -319,7 +345,7 @@ pub fn install_signal_supervisor() {
         let unrecorded = || UNRECORDED.load(std::sync::atomic::Ordering::SeqCst);
         if unrecorded() > 0 {
             eprintln!(
-                "\n{name}: ending {} codex turn(s) so their sessions stay resumable \
+                "\n{name}: ending {} turn(s) so their sessions stay resumable \
                  (signal again to kill instead)",
                 unrecorded()
             );
@@ -332,7 +358,7 @@ pub fn install_signal_supervisor() {
             tokio::select! {
                 () = graceful => std::process::exit(exit_code),
                 () = tokio::time::sleep(crate::timings::GRACEFUL_STOP) => {
-                    eprintln!("codex did not end its turn in time; killing it");
+                    eprintln!("a turn did not end in time; killing what is left");
                 }
                 _ = next_signal() => {}
             }
@@ -864,6 +890,7 @@ pub async fn invoke(
                     project_root,
                     oneshot,
                     launched,
+                    runtime,
                 )
                 .await
             }
@@ -1180,6 +1207,9 @@ async fn run_claude(
     project_root: &Path,
     oneshot: bool,
     launched: Option<LaunchSignal>,
+    // Named for codex, whose runner it was written for; claude uses only the
+    // stop channel, the data root and the two grace periods.
+    runtime: &CodexRuntime,
 ) -> Result<RunOutput> {
     // In oneshot mode, generate a UUID up front and pass it via --session-id
     // so the fresh session is persistable and the operator can follow up via
@@ -1196,20 +1226,24 @@ async fn run_claude(
     } else {
         vec!["--resume".to_string(), session_id.to_string()]
     };
-    // `json` is one result object per run, whatever the outcome, carrying
-    // `is_error` - so the turn classifies itself, as grok's does, and a failed
-    // run still names its session. Text output gave neither: a non-zero exit was
-    // all `review` saw, and it discarded the session id with it. When claude
-    // wakes the model for a background subagent's result, the object printed is
-    // the *last* turn's (its answer is the right one, but its cost, usage and
-    // turn count cover that turn alone) - which background tasks being disabled
-    // below makes moot.
+    // The stream ends in one result object per run, whatever the outcome,
+    // carrying `is_error` - so the turn classifies itself, as grok's does, and a
+    // failed run still names its session. Text output gave neither: a non-zero
+    // exit was all `review` saw, and it discarded the session id with it.
+    //
+    // `stream-json` rather than `json` (which prints only that object) for its
+    // first event: an `init` within half a second of launch, which is what
+    // makes claude safe to signal (see the wait loop below). `--verbose` is
+    // required with it under `--print`. When claude wakes the model for a
+    // background subagent's result, the stream carries a result per turn and the
+    // last is the answer - moot while background tasks are disabled below.
     for arg in [
         "--print",
         "--permission-mode",
         "dontAsk",
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
     ] {
         args.push(arg.to_string());
     }
@@ -1267,38 +1301,160 @@ async fn run_claude(
         let _ = signal.send(());
     }
     let stdin = child.stdin.take().context("failed to open claude stdin")?;
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .context("failed to open claude stdout")?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .context("failed to open claude stderr")?;
     // Registered only after the last `?` that could return early, and
     // unregistered before the next, so the supervisor never holds a stale pid.
     let pid = child.id();
     if let Some(pid) = pid {
         register_group(pid);
     }
-    let (write_res, output) = tokio::join!(
-        write_stdin(stdin, prompt.as_bytes().to_vec()),
-        child.wait_with_output()
-    );
+
+    // Known before the run starts - generated for a fresh run, passed in for a
+    // resume - so the in-flight marker goes up at once, unlike codex's.
+    let marker_sid = oneshot_id.clone().unwrap_or_else(|| session_id.to_string());
+    let (first_tx, first_rx) = tokio::sync::watch::channel(false);
+    // Marks the run in flight for `review sessions` and `review interrupt`,
+    // offering claude's pid for a signal only once claude has printed its first
+    // event. A SIGINT before claude installs its handler takes the default
+    // action and kills it with nothing printed; after, it ends the turn with a
+    // result object (see the wait loop). The task holds the marker until it is
+    // aborted, which deletes it.
+    let marker_task = tokio::spawn({
+        let project = project_root.to_string_lossy().into_owned();
+        let data_root = runtime.data_root.clone();
+        let mut first_rx = first_rx.clone();
+        let sid = marker_sid.clone();
+        async move {
+            let mut guard = crate::inflight::mark(&sid, "claude", &project, data_root.as_deref());
+            if first_rx.wait_for(|seen| *seen).await.is_ok() {
+                guard.record_child_pid(pid);
+            }
+            std::future::pending::<()>().await;
+        }
+    });
+
+    let stdout_shared = new_shared_buf();
+    let stderr_shared = new_shared_buf();
+    let stdout_task = tokio::spawn(read_capped_flagging(
+        stdout_pipe,
+        STDOUT_CAPTURE_CAP,
+        std::sync::Arc::clone(&stdout_shared),
+        first_tx,
+    ));
+    let stderr_task = tokio::spawn(read_capped(
+        stderr_pipe,
+        STDERR_CAPTURE_CAP,
+        std::sync::Arc::clone(&stderr_shared),
+    ));
+    let write_task = tokio::spawn(write_stdin(stdin, prompt.as_bytes().to_vec()));
+
+    // Wait for claude, but end the turn if `review` is signalled to stop.
+    // Probed on Claude Code 2.1.284 mid-command: a SIGINT to claude ends the
+    // turn at once, kills the running command, and still prints a result object
+    // (`is_error: true`, `terminal_reason: "aborted_tools"`) naming the session,
+    // which then resumes normally. A SIGTERM also leaves a resumable session but
+    // prints nothing, so there would be no result to record. Before claude's
+    // first event it may not have a handler yet, so then the group is killed
+    // instead, as codex's is.
+    let mut stop_rx = runtime.stop.clone();
+    let mut stopped_by_signal = false;
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status,
+            Ok(_) = stop_rx.wait_for(|stop| *stop), if !stopped_by_signal => {
+                stopped_by_signal = true;
+                if let Some(pid) = pid {
+                    if *first_rx.borrow() {
+                        if let Ok(pid) = i32::try_from(pid) {
+                            // SAFETY: our own child, not yet reaped.
+                            unsafe { libc::kill(pid, libc::SIGINT) };
+                        }
+                    } else {
+                        terminate_group(pid, runtime.sigkill_escalation);
+                    }
+                }
+            }
+        }
+    };
+    // Consumed whatever became of the run, before the marker goes (`read_live`
+    // discards a request with no marker beside it): left behind, it would mark
+    // the session's next run as interrupted.
+    let interrupt_requested =
+        crate::inflight::take_interrupt_request(&marker_sid, runtime.data_root.as_deref())
+            || stopped_by_signal;
+    marker_task.abort();
     if let Some(pid) = pid {
         unregister_group(pid);
     }
-    let output = output.context("failed to wait for claude")?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let status = status.context("failed to wait for claude")?;
+    let stdout_buf = collect_reader(
+        stdout_task,
+        &stdout_shared,
+        runtime.drain_grace,
+        "claude stdout",
+    )
+    .await;
+    let stderr_buf = collect_reader(
+        stderr_task,
+        &stderr_shared,
+        runtime.drain_grace,
+        "claude stderr",
+    )
+    .await;
+    let write_res = match write_task.await {
+        Ok(r) => r,
+        Err(e) => Err(anyhow::anyhow!("stdin write task panicked: {e}")),
+    };
+    let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
 
     // Only a fresh run reports a session id, as for grok: the caller passed a
     // resume's id in and records it already. Claude's echoed id is preferred to
     // the one we generated, so a claude that reassigned it could not orphan the
     // session.
     let keep_id = |echoed: Option<String>| if oneshot { echoed.or(oneshot_id) } else { None };
-    let served = result_served(&stdout);
-    let (turns, usage) = claude_usage(&stdout);
+    let result_line = last_claude_result(&stdout).unwrap_or_default();
+    let served = result_served(result_line);
+    let (turns, usage) = claude_usage(result_line);
     let with_usage = |digest: Digest| Digest {
         turns,
         usage: usage.clone(),
         ..digest
     };
+    // What an interrupted run's digest says instead of claude's own complaint
+    // about it: the missing answer is explained, so no `turn_error`, and the
+    // run is flagged so it is neither retried nor reported as a failure of
+    // claude's.
+    let interrupted_digest = || Digest {
+        turn_error: None,
+        interrupted: true,
+        terminated_by_review: Some(if stopped_by_signal {
+            "review was signalled to stop".to_string()
+        } else {
+            "operator interrupt (`review interrupt`)".to_string()
+        }),
+        ..with_usage(no_answer_digest(String::new(), &status))
+    };
 
     let outcome = match interpret_claude_output(&stdout, &stderr) {
         Ok(outcome) => outcome,
+        // Signalled before claude could answer for itself: the session id is
+        // ours, and claude has written at least the prompt if it got that far.
+        Err(_) if interrupt_requested => {
+            return Ok(RunOutput {
+                text: String::new(),
+                session_id: keep_id(None),
+                digest: Some(interrupted_digest()),
+                served,
+            });
+        }
         // No result object: the prompt may never have arrived, which is the
         // more useful thing to say when it didn't.
         Err(e) => match write_res {
@@ -1307,6 +1463,9 @@ async fn run_claude(
         },
     };
     Ok(match outcome {
+        // An answer wins over an interrupt request: claude can finish between
+        // the request and the signal, and calling that interrupted would report
+        // a completed run as cut short.
         ClaudeOutcome::Answered { text, session_id } => RunOutput {
             text,
             session_id: keep_id(session_id),
@@ -1315,12 +1474,12 @@ async fn run_claude(
             // still an answer, but the status is the only sign something went
             // wrong after the turn, so it is kept. `captured: true` keeps it out
             // of `died_without_answer`.
-            digest: (!output.status.success()).then(|| {
+            digest: (!status.success()).then(|| {
                 with_usage(Digest {
                     captured: true,
                     ..no_answer_digest(
                         "claude exited non-zero after producing an answer".to_string(),
-                        &output.status,
+                        &status,
                     )
                 })
             }),
@@ -1332,14 +1491,29 @@ async fn run_claude(
         } => RunOutput {
             text,
             session_id: keep_id(session_id),
-            digest: Some(with_usage(no_answer_digest(reason, &output.status))),
+            digest: Some(if interrupt_requested {
+                interrupted_digest()
+            } else {
+                with_usage(no_answer_digest(reason, &status))
+            }),
             served,
         },
     })
 }
 
-/// Claude's `--output-format json` result object: one per run, whatever the
-/// outcome. Only the fields that decide the outcome are modelled; usage and
+/// The last result object in claude's `stream-json` output, as its own line.
+/// Every event is one line; a run ends with a `result`, and a run in which
+/// claude woke the model for a background subagent carries one per turn, the
+/// last being the answer.
+fn last_claude_result(stdout: &str) -> Option<&str> {
+    stdout.lines().rev().find(|line| {
+        serde_json::from_str::<ClaudeResult>(line)
+            .is_ok_and(|r| r.kind.as_deref() == Some("result"))
+    })
+}
+
+/// The result object that ends claude's `--output-format stream-json` output:
+/// one per run, whatever the outcome. Only the fields that decide the outcome are modelled; usage and
 /// what served the run are read separately (`claude_usage`, `result_served`).
 #[derive(serde::Deserialize)]
 struct ClaudeResult {
@@ -1397,9 +1571,10 @@ fn interpret_claude_output(stdout: &str, stderr: &str) -> Result<ClaudeOutcome> 
             stderr.trim().to_string()
         }
     };
-    let result = match serde_json::from_str::<ClaudeResult>(stdout.trim()) {
-        Ok(r) if r.kind.as_deref() == Some("result") => r,
-        _ => anyhow::bail!("claude produced no result object: {}", detail()),
+    let Some(result) =
+        last_claude_result(stdout).and_then(|line| serde_json::from_str::<ClaudeResult>(line).ok())
+    else {
+        anyhow::bail!("claude produced no result object: {}", detail());
     };
     let text = result.result.unwrap_or_default();
     if result.is_error == Some(false) {
@@ -2749,10 +2924,20 @@ async fn run_codex_json(
     // `Stdio::inherit` on the exec path - `codex-rs/core/src/spawn.rs` gives
     // children null/piped stdio - so this is defence in depth rather than a
     // known live path.)
-    let stdout_buf =
-        collect_reader(stdout_task, &stdout_shared, runtime.drain_grace, "stdout").await;
-    let stderr_buf =
-        collect_reader(stderr_task, &stderr_shared, runtime.drain_grace, "stderr").await;
+    let stdout_buf = collect_reader(
+        stdout_task,
+        &stdout_shared,
+        runtime.drain_grace,
+        "codex stdout",
+    )
+    .await;
+    let stderr_buf = collect_reader(
+        stderr_task,
+        &stderr_shared,
+        runtime.drain_grace,
+        "codex stderr",
+    )
+    .await;
     let write_res = match write_task.await {
         Ok(r) => r,
         Err(e) => Err(anyhow::anyhow!("stdin write task panicked: {e}")),
@@ -3094,10 +3279,13 @@ fn print_digest(d: &Digest) {
             // Already explained by `turn failed:` above. Saying "died without a
             // final answer" underneath a stated cause is the bug this branch
             // exists to avoid: it reframes an answered question as a mystery.
-            println!("note: no conclusion was produced; the text below is interim");
+            // "Not an answer" rather than "interim": for codex and grok the text
+            // is interim commentary, but for claude it is the error message
+            // itself.
+            println!("note: no conclusion was produced; the text below is not an answer");
         } else if d.terminated_by_review.is_some() {
             println!(
-                "note: review terminated the run; the text below is whatever codex \
+                "note: review terminated the run; the text below is whatever it \
                  had produced by then"
             );
         } else if d.exit_code != Some(0) || d.signal.is_some() {

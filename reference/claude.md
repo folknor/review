@@ -7,24 +7,26 @@ handling of the three; the cross-provider pieces are in
 ## Invocation
 
 A fresh run is `claude --session-id <generated UUID> --print --permission-mode
-dontAsk --output-format json`; a `review resume` is the same with `--resume <id>`
-in place of `--session-id`. Profile settings: `model` as `--model`, `effort` as
-`--effort`, `env`. The prompt is piped via stdin. The session ID is generated up
-front, so it is known before the run starts.
+dontAsk --output-format stream-json --verbose`; a `review resume` is the same
+with `--resume <id>` in place of `--session-id`. Profile settings: `model` as
+`--model`, `effort` as `--effort`, `env`. The prompt is piped via stdin. The
+session ID is generated up front, so it is known before the run starts, and the
+run's in-flight marker goes up at launch.
 
 `--permission-mode dontAsk` uses pre-approved permissions and rejects
 interactive prompts, which a headless run could never answer.
 
-claude runs in its own process group, registered with the signal supervisor
-like codex's, so a `review` that is signalled takes claude and every shell it
-started with it instead of leaving them running detached. Unlike codex, a claude
-run gets no graceful stop: the group is killed, and no sidecar row is written
-for a fresh run that had not finished.
+`stream-json` (which needs `--verbose` under `--print`) rather than `json` for
+one reason: its first event, an `init` within half a second of launch, is the
+sign that claude can be signalled safely (see [Stopping a run](#stopping-a-run)).
+`json` prints nothing until the end. Both end in the same result object, which
+is all `review` reads.
 
 ## Turns classify themselves
 
-`--output-format json` prints one result object per run, whatever the outcome,
-and its `is_error` says whether `result` is an answer. That is the grok
+The stream ends in one result object per run, whatever the outcome, and its
+`is_error` says whether `result` is an answer (a run in which claude woke the
+model for a background subagent carries one per turn; the last is the answer). That is the grok
 arrangement ([grok.md](grok.md#turns-classify-themselves)), and `run_claude`
 handles it the same way: no result object at all is an `Err` (nothing ran);
 `is_error: false` is the answer; anything else is `Ok` carrying a digest whose
@@ -58,7 +60,7 @@ The result object says nothing about it - `is_error: false`,
 report: the loss grok's wake loop exists for
 ([grok.md](grok.md#background-commands)). A background *subagent* is handled
 differently: claude waits for it and wakes the model with its result in a
-second turn, and the single json result is that last turn's.
+second turn, whose result object is the last in the stream.
 
 Claude, unlike grok, has a switch that removes the failure rather than
 detecting it: `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` takes the
@@ -98,5 +100,34 @@ claude.
 
 A `review resume` carries the model and effort recorded for the session
 (`--model`/`--effort`), as every provider's does - see
-[sandbox.md](sandbox.md#what-a-resume-inherits). `review interrupt` and
-`review message`'s interrupt are codex-only.
+[sandbox.md](sandbox.md#what-a-resume-inherits).
+
+## Stopping a run
+
+**A claude turn ends cleanly on `SIGINT`, so `review interrupt`, `review
+message` and a signalled `review` treat it as they treat codex's.** Probed on
+Claude Code 2.1.284 with a command running mid-turn: `SIGINT` to the claude
+process ended the turn at once, killed the command, exited 0, and still printed
+a result object - `is_error: true`, `subtype: "error_during_execution"`,
+`terminal_reason: "aborted_tools"`, the session ID - and the session resumed
+normally, the model seeing its command as rejected. `SIGTERM` also left a
+resumable session but printed nothing (exit 143), so nothing could be recorded
+from it; that is why the graceful path sends `SIGINT`.
+
+The mechanics are codex's ([codex.md](codex.md#interrupting-a-run)), minus the
+node wrapper: claude runs in its own process group, registered with the signal
+supervisor; its in-flight marker names claude's pid once claude has printed its
+first event (a `SIGINT` before its handler is installed would kill it with
+nothing printed); `review interrupt` leaves a request beside the marker and
+signals that pid alone; and a signalled `review` sends it `SIGINT` too, waiting
+for the run to record its session before exiting. A run that had produced no
+first event is killed with its group instead. An interrupted run keeps its
+session ID even if claude printed no result, is flagged `interrupted` rather
+than carrying claude's complaint about the abort as a `turn_error`, and is not
+retried. If claude answers before the signal lands, the answer stands.
+
+Verified end to end through `review`: a `SIGTERM` to `review` mid-command ended
+the turn in 0.2s, recorded it, printed the `review message` command and left
+nothing running; `review interrupt <ID>` from a second process did the same;
+and `review message <ID>` interrupted the turn and resumed it with the new
+message, which the model answered.

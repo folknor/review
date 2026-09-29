@@ -199,7 +199,7 @@ fn write_text(
 
 const STEERING: &str = "\
 steering a running agent:
-  echo \"<new info>\" | review message <ID>   ends a codex turn in flight, then sends the message
+  echo \"<new info>\" | review message <ID>   ends a codex or claude turn in flight, then sends the message
   review interrupt <ID>                     ends the turn without a message
   Do not stop or kill the `review` process to interrupt an agent.";
 

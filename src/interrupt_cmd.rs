@@ -1,4 +1,5 @@
-//! `review interrupt <ID>`: stop a codex run mid-turn and hand back its session.
+//! `review interrupt <ID>`: stop a codex or claude run mid-turn and hand back
+//! its session.
 //!
 //! # Why a verb
 //!
@@ -9,19 +10,24 @@
 //! finding codex's pid, and then losing the race with our own auto-resume,
 //! which reads an interrupted turn as a mid-turn death and resumes straight past
 //! it. This verb does the whole thing and ends by printing the resume command.
+//! A `claude --print` turn is no more reachable, and ends the same way on
+//! `SIGINT` (see `reference/claude.md`), so it takes the same path.
 //!
 //! # How
 //!
-//! 1. The run's in-flight marker names codex's pid, the leader of the process
-//!    group `review` spawned it into - offered only once codex has produced
-//!    output, so it is never a node wrapper too young to forward the signal.
+//! 1. The run's in-flight marker names the provider's pid, the leader of the
+//!    process group `review` spawned it into - offered only once the provider
+//!    has produced output, so it is never a process too young to handle the
+//!    signal (for codex, a node wrapper that would die on it).
 //! 2. An interrupt request is written beside the marker *before* the signal, so
 //!    the owning `review` can tell this apart from a death once codex exits.
-//! 3. `SIGINT` goes to that pid alone - on an npm install the node wrapper,
-//!    which forwards it to the native binary once. Signalling the whole group
-//!    would hand the native binary a second copy. codex answers `SIGINT` with a
-//!    `turn/interrupt`, so the turn ends cleanly and the session lock is freed.
-//! 4. We wait for the owner to consume the request (codex has been reaped),
+//! 3. `SIGINT` goes to that pid alone - on a codex npm install the node
+//!    wrapper, which forwards it to the native binary once. Signalling the
+//!    whole group would hand the native binary a second copy. codex answers
+//!    `SIGINT` with a `turn/interrupt`, so the turn ends cleanly and the session
+//!    lock is freed; claude ends the turn, kills its running command and prints
+//!    its result.
+//! 4. We wait for the owner to consume the request (the provider has been reaped),
 //!    then for its sidecar row, because that row is what `review resume` needs.
 //!    Printing the resume command any earlier would hand the operator a command
 //!    that fails.
@@ -36,9 +42,12 @@ pub async fn run(session_id: &str) -> Result<()> {
     println!("session: {session_id}");
     println!("project: {}", outcome.project);
     if outcome.interrupted {
-        println!("{}", crate::provider::resume_hint("codex", session_id));
+        println!(
+            "{}",
+            crate::provider::resume_hint(&outcome.provider, session_id)
+        );
     } else {
-        // codex finished before the signal took effect; its answer is in the
+        // The run finished before the signal took effect; its answer is in the
         // owner's output.
         println!(
             "the run ended before the interrupt took effect - see its output, or \
@@ -53,6 +62,7 @@ pub async fn run(session_id: &str) -> Result<()> {
 pub(crate) struct Outcome {
     pub interrupted: bool,
     pub project: String,
+    pub provider: String,
 }
 
 /// The verb, minus printing. `data_root` and `rows` (every sidecar row, oldest
@@ -68,30 +78,31 @@ pub(crate) async fn interrupt(
              `review sessions --all` lists the ones that are"
         );
     };
-    if marker.provider != "codex" {
+    let provider = marker.provider.as_str();
+    if !interruptible(provider) {
         bail!(
-            "session {session_id} is a {} run; only codex runs can be interrupted",
-            marker.provider
+            "session {session_id} is a {provider} run; only codex and claude runs can be \
+             interrupted"
         );
     }
     let Some(child_pid) = marker.child_pid else {
         bail!(
-            "session {session_id} cannot be interrupted yet: codex has produced no output, \
-             or the run was launched by an older `review` (pid {}) that does not record \
-             codex's pid",
+            "session {session_id} cannot be interrupted yet: {provider} has produced no \
+             output, or the run was launched by an older `review` (pid {}) that does not \
+             record {provider}'s pid",
             marker.pid
         );
     };
     let Ok(pid) = i32::try_from(child_pid) else {
-        bail!("codex pid {child_pid} is out of range");
+        bail!("{provider} pid {child_pid} is out of range");
     };
-    // codex may have exited since the marker was read, and its pid been reused.
-    // What `review` spawned leads its own process group and is the owner's
-    // child; anything else at that pid is not ours to signal.
+    // The provider may have exited since the marker was read, and its pid been
+    // reused. What `review` spawned leads its own process group and is the
+    // owner's child; anything else at that pid is not ours to signal.
     // SAFETY: `getpgid` only reads the process table.
     let leads_group = unsafe { libc::getpgid(pid) } == pid;
     if !leads_group || parent_pid(pid) != Some(marker.pid) {
-        bail!("codex (pid {child_pid}) has already exited; the run is finishing on its own");
+        bail!("{provider} (pid {child_pid}) has already exited; the run is finishing on its own");
     }
 
     let count = |rows: &[SessionRecord]| rows.iter().filter(|r| r.session_id == session_id).count();
@@ -104,13 +115,15 @@ pub(crate) async fn interrupt(
         // out; then there is a run to report on after all.
         if crate::inflight::interrupt_pending(session_id, data_root) {
             let _ = crate::inflight::take_interrupt_request(session_id, data_root);
-            bail!("failed to signal codex (pid {child_pid}): {err}");
+            bail!("failed to signal {provider} (pid {child_pid}): {err}");
         }
     } else {
-        eprintln!("interrupt sent to codex (pid {child_pid}); waiting for the run to wind down");
+        eprintln!(
+            "interrupt sent to {provider} (pid {child_pid}); waiting for the run to wind down"
+        );
     }
 
-    // The owner consumes the request once codex is reaped, so its absence says
+    // The owner consumes the request once the provider is reaped, so its absence says
     // the turn is over - without guessing from sidecar timestamps, which are
     // whole seconds and can tie with the session's previous row.
     while crate::inflight::interrupt_pending(session_id, data_root) {
@@ -119,8 +132,8 @@ pub(crate) async fn interrupt(
             // later resume of this session as interrupted.
             let _ = crate::inflight::take_interrupt_request(session_id, data_root);
             bail!(
-                "the owning review (pid {}) exited before codex did; session {session_id} \
-                 was not recorded, so it cannot be resumed through review",
+                "the owning review (pid {}) exited before {provider} did; session \
+                 {session_id} was not recorded, so it cannot be resumed through review",
                 marker.pid
             );
         }
@@ -145,6 +158,7 @@ pub(crate) async fn interrupt(
             return Ok(Outcome {
                 interrupted: true,
                 project: row.project.clone(),
+                provider: provider.to_string(),
             });
         }
         if let Some(row) = new.last() {
@@ -152,6 +166,7 @@ pub(crate) async fn interrupt(
                 return Ok(Outcome {
                     interrupted: false,
                     project: row.project.clone(),
+                    provider: provider.to_string(),
                 });
             }
             looked_again = true;
@@ -164,6 +179,13 @@ pub(crate) async fn interrupt(
         }
         tokio::time::sleep(crate::timings::INTERRUPT_POLL).await;
     }
+}
+
+/// Whether a run of `provider` can be ended mid-turn and resumed: both codex and
+/// claude close the turn on `SIGINT` and leave a resumable session. Grok has no
+/// such lever. Shared with `review message`, so the two cannot disagree.
+pub(crate) fn interruptible(provider: &str) -> bool {
+    matches!(provider, "codex" | "claude")
 }
 
 /// `pid`'s parent, from `/proc/<pid>/stat`. `comm` may contain spaces and

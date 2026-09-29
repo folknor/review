@@ -7,7 +7,7 @@ session on each provider, and the session ID is printed above the response so
 you can follow up with `review message <ID>` while the cache is warm.
 
 Steering a running agent: `echo \"<new info>\" | review message <ID>`. It ends
-the codex turn in flight and continues the session with your message. Do not
+the codex or claude turn in flight and continues the session with your message. Do not
 stop or kill the `review` process to interrupt an agent - use `review message`,
 or `review interrupt <ID>` to stop without a message.
 
@@ -51,15 +51,15 @@ Examples:
   echo \"just claude\" | review --provider claude        Only one provider
   echo \"check\" | review -a bugs --dry-run              Preview the prompt
   echo \"follow up\" | review message <ID>               Message a session, running or not
-  review interrupt <ID>                                Stop a codex run mid-turn
+  review interrupt <ID>                                Stop a codex or claude run mid-turn
   review config                                        Effective configuration";
 
 // The cutoffs are restated from `timings::stale_session` because clap needs a
 // `&'static str`; a test keeps the two in step.
 const MESSAGE_AFTER_HELP: &str = "\
-If a codex turn is in flight, it is interrupted first (as `review interrupt`
-does) - the turn is cut off and whatever it had not finished is lost - and the
-message then continues the session. A claude or grok turn in flight cannot be
+If a codex or claude turn is in flight, it is interrupted first (as `review
+interrupt` does) - the turn is cut off and whatever it had not finished is lost -
+and the message then continues the session. A grok turn in flight cannot be
 interrupted; the message is refused until it ends.
 
 The session must come from a run on this host: its provider is read from the
@@ -76,14 +76,14 @@ new session needs.
 The exit status is 1 if the turn produced no answer.";
 
 const INTERRUPT_AFTER_HELP: &str = "\
-Only works on codex runs. This ends the turn, waits for the run to record its
-session, and prints the `review message` command that continues it. The
-interrupted run exits 1, like any run that produced no answer. To stop a turn
-and send new information in one step, use `review message` instead.
+Works on codex and claude runs, not grok. This ends the turn, waits for the run
+to record its session, and prints the `review message` command that continues
+it. The interrupted run exits 1, like any run that produced no answer. To stop a
+turn and send new information in one step, use `review message` instead.
 
 Signalling the `review` process (Ctrl-C, SIGTERM, a stopped background task)
-ends its codex turns the same way and records them before exiting; a second
-signal kills them outright. SIGKILL loses the session.";
+ends its codex and claude turns the same way and records them before exiting; a
+second signal kills them outright. SIGKILL loses the session.";
 
 const CONFIG_AFTER_HELP: &str = "\
 This is the authoritative view of what a run in this directory will use. It
@@ -156,7 +156,7 @@ impl Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Send stdin to a session, interrupting its codex turn if one is running
+    /// Send stdin to a session, interrupting its codex or claude turn if one is running
     #[command(after_help = MESSAGE_AFTER_HELP)]
     Message {
         /// Session ID, as printed above the earlier run's response
@@ -181,7 +181,7 @@ pub enum Command {
         dry_run: bool,
     },
 
-    /// Interrupt a codex run in flight, then print how to resume its session
+    /// Interrupt a codex or claude run in flight, then print how to resume its session
     #[command(after_help = INTERRUPT_AFTER_HELP)]
     Interrupt {
         /// Session ID of the run, as listed by `review sessions`

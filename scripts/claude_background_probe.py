@@ -19,7 +19,11 @@ Output lands in target/claude-probes/<probe>[-<tag>]/:
   transcript.jsonl  a copy of claude's on-disk session transcript, if found
 
 Usage: claude_background_probe.py <probe> [--format=text|json|stream-json]
-           [--tag=T] [KEY=VALUE ...] [extra claude args...]
+           [--tag=T] [--signal=INT|TERM] [KEY=VALUE ...] [extra claude args...]
+
+--signal sends that signal to the claude process (not its group) once the
+probe's command is running, the way `review interrupt` and a signalled `review`
+do; resume the printed session afterwards to check it survived.
 
 --format picks claude's --output-format (default stream-json, which adds
 --verbose). KEY=VALUE pairs are set in claude's environment - `review` sets
@@ -46,6 +50,12 @@ What each probe showed on Claude Code 2.1.284, defaults unless stated:
   bad-model           (pass --model no-such-model-xyz) exit 1 with a result
                       object: is_error true, subtype "success", the session id,
                       and a transcript on disk.
+  mid-command         --signal=INT: exit 0 within 0.1s, the command killed, a
+                      result object with is_error true, subtype
+                      "error_during_execution", terminal_reason "aborted_tools"
+                      and the session id; the session resumed normally.
+                      --signal=TERM: exit 143, the command killed, nothing on
+                      stdout; the session still resumed.
 """
 
 import glob
@@ -105,7 +115,38 @@ PROBES = {
     # A launch failure, given an unknown --model: exit code, and does the output
     # still name a session?
     "bad-model": "Reply with exactly: HELLO",
+    # A foreground command long enough to signal claude in the middle of; use
+    # with --signal.
+    "mid-command": (
+        PREAMBLE
+        + "Run this command and report the exact text it printed:\n\n"
+        + PY_SLEEP.format(secs=90, marker="PROBE-S-DONE")
+    ),
 }
+
+# The marker each probe's command prints, which is also how its running
+# command is found in the process table.
+MARKERS = {
+    "bg-bash-natural": "PROBE-C-DONE",
+    "bg-bash-walkaway": "PROBE-A-DONE",
+    "bg-agent-walkaway": "PROBE-B-DONE",
+    "long-foreground": "PROBE-D-DONE",
+    "mid-command": "PROBE-S-DONE",
+}
+
+
+def signal_when_running(proc, marker, sig, log):
+    """Send `sig` to claude alone once the probe's command appears."""
+    import signal as signal_mod
+
+    start = time.monotonic()
+    while proc.poll() is None:
+        if any(marker in line for line in leftover_markers()):
+            proc.send_signal(getattr(signal_mod, f"SIG{sig}"))
+            log.append(f"SIG{sig} sent {time.monotonic() - start:.1f}s after launch")
+            return
+        time.sleep(0.5)
+    log.append(f"claude exited before the command started; SIG{sig} not sent")
 
 
 def find_transcript(session_id):
@@ -125,12 +166,15 @@ def main():
     name = sys.argv[1]
     fmt = "stream-json"
     tag = None
+    sig = None
     env = dict(os.environ)
     overrides = []
     extra = []
     for arg in sys.argv[2:]:
         if arg.startswith("--format="):
             fmt = arg.split("=", 1)[1]
+        elif arg.startswith("--signal="):
+            sig = arg.split("=", 1)[1]
         elif arg.startswith("--tag="):
             tag = arg.split("=", 1)[1]
         elif "=" in arg and not arg.startswith("-"):
@@ -167,6 +211,16 @@ def main():
     proc.stdin.write(PROBES[name])
     proc.stdin.close()
 
+    signal_log = []
+    if sig:
+        import threading
+
+        threading.Thread(
+            target=signal_when_running,
+            args=(proc, MARKERS[name], sig, signal_log),
+            daemon=True,
+        ).start()
+
     with open(os.path.join(out_dir, "events.jsonl"), "w") as events:
         for line in proc.stdout:
             events.write(f"{time.monotonic() - start:8.2f} {line}")
@@ -191,6 +245,7 @@ def main():
         f"session_id: {session_id}",
         f"args: {json.dumps(args)}",
         f"env overrides: {overrides}",
+        f"signal: {'; '.join(signal_log) or 'none'}",
         f"exit_code: {code}",
         f"wall_secs: {wall:.1f}",
         f"marker processes alive at exit: {at_exit or 'none'}",

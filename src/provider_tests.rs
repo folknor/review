@@ -1004,31 +1004,21 @@ fn grok_served_model_and_cost_are_read_from_model_usage() {
     assert_eq!(super::result_served("not json"), super::Served::default());
 }
 
-/// A clean claude result object, trimmed from a real Claude Code 2.1.284
-/// `--output-format json` run.
-const CLAUDE_OK: &str = r#"{
-  "type": "result",
-  "subtype": "success",
-  "is_error": false,
-  "result": "LAUNCHED",
-  "session_id": "2f8b2c2f-d939-4823-a615-7ebd6637f958",
-  "num_turns": 2,
-  "terminal_reason": "completed",
-  "api_error_status": null,
-  "total_cost_usd": 0.21126,
-  "usage": {
-    "input_tokens": 4,
-    "cache_creation_input_tokens": 25470,
-    "cache_read_input_tokens": 22520,
-    "output_tokens": 149,
-    "output_tokens_details": { "thinking_tokens": 0 }
-  },
-  "modelUsage": { "claude-opus-5-5": { "costUSD": 0.21126 } }
-}"#;
+/// claude's first `stream-json` event, trimmed.
+const CLAUDE_INIT: &str = r#"{"type":"system","subtype":"init","session_id":"2f8b2c2f-d939-4823-a615-7ebd6637f958","model":"claude-opus-5-5"}"#;
+
+/// A clean claude result event, trimmed from a real Claude Code 2.1.284 run.
+const CLAUDE_OK: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"LAUNCHED","session_id":"2f8b2c2f-d939-4823-a615-7ebd6637f958","num_turns":2,"terminal_reason":"completed","api_error_status":null,"total_cost_usd":0.21126,"usage":{"input_tokens":4,"cache_creation_input_tokens":25470,"cache_read_input_tokens":22520,"output_tokens":149,"output_tokens_details":{"thinking_tokens":0}},"modelUsage":{"claude-opus-5-5":{"costUSD":0.21126}}}"#;
+
+/// `events` as claude's stream: one event per line.
+fn claude_stream(events: &[&str]) -> String {
+    events.join("\n") + "\n"
+}
 
 #[test]
 fn claude_clean_result_is_an_answer() {
-    let outcome = super::interpret_claude_output(CLAUDE_OK, "").expect("a result object");
+    let stdout = claude_stream(&[CLAUDE_INIT, CLAUDE_OK]);
+    let outcome = super::interpret_claude_output(&stdout, "").expect("a result object");
     let super::ClaudeOutcome::Answered { text, session_id } = outcome else {
         panic!("is_error false is an answer");
     };
@@ -1044,19 +1034,12 @@ fn claude_api_error_is_a_stated_failure_that_keeps_its_session() {
     // Real output for `--model no-such-model-xyz`: exit 1, and a result object
     // that still says `subtype: "success"` - only `is_error` gives it away. The
     // session exists on disk, so the id must survive; text mode discarded it.
-    let unknown_model = r#"{
-      "type": "result",
-      "subtype": "success",
-      "is_error": true,
-      "result": "There's an issue with the selected model (no-such-model-xyz). It may not exist or you may not have access to it. Run --model to pick a different model.",
-      "session_id": "ff2d6c14-1b45-481f-85a2-24e367d9e6ad",
-      "num_turns": 1,
-      "terminal_reason": "api_error",
-      "api_error_status": 404,
-      "total_cost_usd": 0
-    }"#;
+    let unknown_model = claude_stream(&[
+        CLAUDE_INIT,
+        r#"{"type":"result","subtype":"success","is_error":true,"result":"There's an issue with the selected model (no-such-model-xyz). It may not exist or you may not have access to it. Run --model to pick a different model.","session_id":"ff2d6c14-1b45-481f-85a2-24e367d9e6ad","num_turns":1,"terminal_reason":"api_error","api_error_status":404,"total_cost_usd":0}"#,
+    ]);
     let outcome = super::interpret_claude_output(
-        unknown_model,
+        &unknown_model,
         r#"[claude-code:unrecognized_model] {"model":"no-such-model-xyz"}"#,
     )
     .expect("an error result is still a result, not a launch failure");
@@ -1095,10 +1078,49 @@ fn claude_output_without_a_result_object_is_a_launch_failure() {
     let err = super::interpret_claude_output("", "Error: not logged in")
         .expect_err("no result object: nothing ran");
     assert!(err.to_string().contains("not logged in"), "{err}");
-    // Well-formed JSON of another type is not a result either.
-    let err = super::interpret_claude_output(r#"{"type": "system", "subtype": "init"}"#, "")
+    // A stream cut off after its first event is not a result either - the
+    // shape a claude killed mid-turn leaves.
+    let err = super::interpret_claude_output(&claude_stream(&[CLAUDE_INIT]), "")
         .expect_err("a system event is not a result");
     assert!(err.to_string().contains("no result object"), "{err}");
+}
+
+#[test]
+fn claude_interrupted_turn_is_not_an_answer() {
+    // Real shape of a SIGINT mid-command: exit 0, and a result that says
+    // `error_during_execution` / `aborted_tools` with no `result` text at all.
+    // Only `is_error` stops it reading as an empty answer.
+    let stdout = claude_stream(&[
+        CLAUDE_INIT,
+        r#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"4397a6d5-4943-4b52-a0b6-d20c75078bd9","num_turns":3,"terminal_reason":"aborted_tools","stop_reason":"tool_use"}"#,
+    ]);
+    let outcome = super::interpret_claude_output(&stdout, "").expect("a result object");
+    let super::ClaudeOutcome::NoAnswer {
+        reason, session_id, ..
+    } = outcome
+    else {
+        panic!("an aborted turn is not an answer");
+    };
+    assert!(reason.contains("aborted_tools"), "{reason}");
+    assert_eq!(
+        session_id.as_deref(),
+        Some("4397a6d5-4943-4b52-a0b6-d20c75078bd9")
+    );
+}
+
+#[test]
+fn claude_last_result_in_the_stream_is_the_answer() {
+    // A background subagent's result is handed back in a second turn, and the
+    // stream then carries one result per turn: the first is the model's
+    // "launched" note, the last its answer.
+    let first = CLAUDE_OK;
+    let last = r#"{"type":"result","subtype":"success","is_error":false,"result":"PROBE-B-DONE","session_id":"2f8b2c2f-d939-4823-a615-7ebd6637f958","num_turns":1}"#;
+    let stdout = claude_stream(&[CLAUDE_INIT, first, CLAUDE_INIT, last]);
+    let outcome = super::interpret_claude_output(&stdout, "").expect("a result object");
+    let super::ClaudeOutcome::Answered { text, .. } = outcome else {
+        panic!("the last result is an answer");
+    };
+    assert_eq!(text, "PROBE-B-DONE");
 }
 
 #[test]
