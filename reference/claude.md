@@ -149,9 +149,9 @@ session used to both launch, running two turns on one session at once. `review
 message` now holds a per-session launch lock from before it checks for a turn in
 flight until its run has launched, and a run's marker is written before its
 spawn, so the second message waits, then finds the first in flight and
-interrupts it. Should two runs of one session still meet (the fan-out's own
-auto-resume is not serialised this way), a run removes or updates the shared
-marker only while it is still the one it wrote.
+interrupts it. As a second line of defence, a run removes or updates the shared
+marker only while it is still the one it wrote, so two runs of one session could
+not hide each other even if they met.
 
 `src/provider_tests.rs` drives the real `run_claude` against a stub claude
 (`ProviderRuntime::claude_command`) for each of these: the interrupt, an answer

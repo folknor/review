@@ -317,6 +317,15 @@ async fn run_launch(launch: Launch, ctx: std::sync::Arc<RecordCtx>) -> TaskOutco
             after_auto_resume(first, second)
         }
     };
+    // Both runs are recorded only now, after any auto-resume - and that order
+    // is what keeps a `review message` from launching beside the auto-resume.
+    // Between the first run ending and the auto-resume spawning, the session
+    // has no in-flight marker; it has no sidecar row either, so a message
+    // arriving then is refused ("no record") instead of launching. Recording
+    // the first run before auto-resuming would give it a row with no marker,
+    // and the message would start a second turn on the session. A message
+    // arriving while the auto-resume runs finds its marker (written before its
+    // spawn) and interrupts it, as for any run.
     for run in outcome.also.iter().chain(std::iter::once(&outcome.result)) {
         ctx.record(run);
     }
