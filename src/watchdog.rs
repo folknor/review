@@ -161,14 +161,10 @@ fn has_final_answer(bytes: &[u8]) -> bool {
         let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        let payload = event.get("payload");
-        if payload.and_then(|p| p.get("type")).and_then(|t| t.as_str()) != Some("agent_message") {
-            continue;
-        }
-        if payload
-            .and_then(|p| p.get("phase"))
-            .and_then(|p| p.as_str())
-            == Some("final_answer")
+        if event
+            .get("payload")
+            .and_then(crate::transcript::final_answer_text)
+            .is_some()
         {
             return true;
         }
@@ -344,6 +340,16 @@ mod tests {
     #[test]
     fn detects_a_final_answer_from_this_run() {
         let rollout = format!("{TASK_STARTED}\n{FINAL_ANSWER}\n");
+        assert!(scan(&rollout, 0));
+    }
+
+    // codex 0.157.0 writes no `agent_message` event; the phase-tagged answer is
+    // an assistant `message` response item. A stranded 0.157.0 run must still be
+    // recognised as answered.
+    #[test]
+    fn detects_a_final_answer_as_an_assistant_message() {
+        let answer = r#"{"timestamp":"2026-09-29T06:28:09.406Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Done."}],"phase":"final_answer"}}"#;
+        let rollout = format!("{TASK_STARTED}\n{answer}\n");
         assert!(scan(&rollout, 0));
     }
 

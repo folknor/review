@@ -106,6 +106,43 @@ pub fn slice_from_offset(bytes: &[u8], from_offset: Option<u64>) -> &[u8] {
     }
 }
 
+/// The text of a rollout event's payload if it is the turn's real report, i.e.
+/// a `phase: "final_answer"` agent message. codex tags interim progress notes
+/// `phase: "commentary"`, which never count. Shared with `watchdog` so the two
+/// readers cannot disagree about what an answer looks like.
+///
+/// Two shapes, because codex changed which one carries the phase:
+/// - an `event_msg` payload of type `agent_message`, text in `message` (the
+///   shape written up to at least codex 0.147.0);
+/// - a `response_item` payload of type `message` with `role: "assistant"`,
+///   text in the `output_text` items of `content` (codex 0.157.0, which no
+///   longer writes an `agent_message` event at all).
+///
+/// Missing the second made every clean 0.157.0 turn look like a death to
+/// `review sessions <id>` and left the stall watchdog blind to the answer.
+pub fn final_answer_text(payload: &serde_json::Value) -> Option<String> {
+    if payload.get("phase").and_then(|p| p.as_str()) != Some("final_answer") {
+        return None;
+    }
+    match payload.get("type").and_then(|t| t.as_str()) {
+        Some("agent_message") => payload
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map(str::to_string),
+        Some("message") if payload.get("role").and_then(|r| r.as_str()) == Some("assistant") => {
+            let text: String = payload
+                .get("content")
+                .and_then(|c| c.as_array())?
+                .iter()
+                .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("output_text"))
+                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                .collect();
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
 /// Parse transcript NDJSON content into a summary. Split from file IO so the
 /// event handling can be unit-tested directly. Scoping to a single run's events
 /// is the caller's job, via `slice_from_offset`.
@@ -195,6 +232,9 @@ fn parse(content: &str) -> TranscriptSummary {
                 if role != Some("developer") {
                     turn_produced_content = true;
                 }
+                if let Some(text) = payload.and_then(final_answer_text) {
+                    cur.final_answer = Some(text);
+                }
             }
             Some("task_complete") => {
                 turn_produced_content = true;
@@ -204,19 +244,11 @@ fn parse(content: &str) -> TranscriptSummary {
                 turn_produced_content = true;
                 cur.stream_error = true;
             }
-            // codex phase-tags agent messages: interim notes are "commentary",
-            // the real report is "final_answer". Keep only the latter.
+            // The older shape of the turn's report; see `final_answer_text`.
             Some("agent_message") => {
                 turn_produced_content = true;
-                let is_final = payload
-                    .and_then(|p| p.get("phase"))
-                    .and_then(|p| p.as_str())
-                    == Some("final_answer");
-                if is_final {
-                    cur.final_answer = payload
-                        .and_then(|p| p.get("message"))
-                        .and_then(|m| m.as_str())
-                        .map(str::to_string);
+                if let Some(text) = payload.and_then(final_answer_text) {
+                    cur.final_answer = Some(text);
                 }
             }
             Some(pt) if pt.ends_with("_call") => {
@@ -348,6 +380,42 @@ mod tests {
             s.final_answer.as_deref(),
             Some("All checks passed. No files changed.")
         );
+    }
+
+    // codex 0.157.0's shape, taken from a real rollout: no `agent_message`
+    // event, the answer is an assistant `message` response item (preceded by an
+    // `item_completed` event carrying the same text, which is not read). A
+    // commentary-phase assistant message earlier in the turn must not count.
+    #[test]
+    fn recovers_final_answer_from_an_assistant_message() {
+        let run = concat!(
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Review this."}]}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reading the fixtures now."}],"phase":"commentary"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","content":[{"type":"Text","text":"No problems."}],"phase":"final_answer"}}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"No problems."}],"phase":"final_answer"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"No problems."}}"#,
+        );
+        let s = parse(run);
+        assert!(s.task_complete);
+        assert_eq!(s.final_answer.as_deref(), Some("No problems."));
+    }
+
+    #[test]
+    fn commentary_assistant_message_is_not_a_final_answer() {
+        let run = concat!(
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Reading the fixtures now."}],"phase":"commentary"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":null}}"#,
+        );
+        assert!(parse(run).final_answer.is_none());
     }
 
     // A run that ended on a tool with only commentary - no final answer exists.
