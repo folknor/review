@@ -145,8 +145,9 @@ async fn collect_reader(
 
 /// Read claude's stream like `read_capped`, with two differences.
 ///
-/// `first` flips the moment any output arrives: claude's first event is what
-/// makes it safe to signal (see `run_claude`).
+/// `first` flips once claude's `init` event has arrived: that event is what
+/// makes it safe to signal, and what shows its session exists (see
+/// `run_claude`).
 ///
 /// Past `cap`, the most recent `tail_keep` to `2 * tail_keep` bytes go to
 /// `tail` instead of being dropped. The stream *ends* in the result object,
@@ -166,11 +167,35 @@ async fn read_claude_stream<R>(
 {
     use tokio::io::AsyncReadExt;
     let mut chunk = [0u8; 16384];
+    // Lines read so far while looking for claude's `init` event; `None` once
+    // it has been seen. Only that event counts as claude having started: it
+    // carries the session id, so from then on the session exists. A stray byte
+    // or diagnostic before it proves nothing, and treating one as a start
+    // would keep the id of a session claude never wrote.
+    let mut scanning: Option<Vec<u8>> = Some(Vec::new());
     loop {
         match r.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                first.send_replace(true);
+                if let Some(pending) = scanning.as_mut() {
+                    pending.extend_from_slice(&chunk[..n]);
+                    let mut found = false;
+                    while let Some(end) = pending.iter().position(|&b| b == b'\n') {
+                        let line: Vec<u8> = pending.drain(..=end).collect();
+                        if is_claude_init(&line) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if found {
+                        first.send_replace(true);
+                        scanning = None;
+                    } else if pending.len() > CLAUDE_INIT_SCAN_MAX {
+                        // One unterminated line this long is not an init
+                        // event; stop holding it.
+                        pending.clear();
+                    }
+                }
                 let mut bytes = &chunk[..n];
                 if let Ok(mut h) = head.lock()
                     && h.len() < cap
@@ -192,6 +217,18 @@ async fn read_claude_stream<R>(
         }
     }
 }
+
+/// Whether `line` is claude's `init` event: `{"type":"system","subtype":"init",...}`.
+fn is_claude_init(line: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(line).is_ok_and(|v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("system")
+            && v.get("subtype").and_then(|s| s.as_str()) == Some("init")
+    })
+}
+
+/// Longest unterminated line `read_claude_stream` holds while looking for the
+/// `init` event, which is a few KiB.
+const CLAUDE_INIT_SCAN_MAX: usize = 1 << 20; // 1 MiB
 
 /// How much of claude's stream past `STDOUT_CAPTURE_CAP` is kept: enough for a
 /// result line carrying a long answer.
@@ -945,6 +982,7 @@ pub async fn invoke(
                     project_root,
                     oneshot,
                     launched,
+                    runtime.data_root.as_deref(),
                 )
                 .await
             }
@@ -1352,6 +1390,20 @@ async fn run_claude(
     if *runtime.stop.borrow() {
         anyhow::bail!("not launched: review was signalled to stop");
     }
+    // The session id is known before the run starts - generated for a fresh
+    // run, passed in for a resume - so the in-flight marker goes up before the
+    // spawn. That ordering is load-bearing: `review message` releases its
+    // session launch lock when the launch signal below fires, and a second
+    // message must then find this marker, or it launches beside this run
+    // instead of interrupting it. Dropped (removing the marker) on any early
+    // return below.
+    let marker_sid = oneshot_id.clone().unwrap_or_else(|| session_id.to_string());
+    let marker = crate::inflight::mark(
+        &marker_sid,
+        "claude",
+        &project_root.to_string_lossy(),
+        runtime.data_root.as_deref(),
+    );
     let mut child = cmd.spawn().context("failed to spawn claude")?;
     // Launch has happened: the caller may release the global lock. Dropping the
     // sender instead (on the `?` above) tells it the same thing.
@@ -1374,23 +1426,16 @@ async fn run_claude(
         register_group(pid);
     }
 
-    // Known before the run starts - generated for a fresh run, passed in for a
-    // resume - so the in-flight marker goes up at once, unlike codex's.
-    let marker_sid = oneshot_id.clone().unwrap_or_else(|| session_id.to_string());
     let (first_tx, first_rx) = tokio::sync::watch::channel(false);
-    // Marks the run in flight for `review sessions` and `review interrupt`,
-    // offering claude's pid for a signal only once claude has printed its first
-    // event. A SIGINT before claude installs its handler takes the default
-    // action and kills it with nothing printed; after, it ends the turn with a
-    // result object (see the wait loop). The task holds the marker until it is
-    // aborted, which deletes it.
+    // Offers claude's pid on the marker for `review interrupt` only once claude
+    // has printed its first event. A SIGINT before claude installs its handler
+    // takes the default action and kills it with nothing printed; after, it
+    // ends the turn with a result object (see the wait loop). The task holds
+    // the marker until it is aborted, which deletes it.
     let marker_task = tokio::spawn({
-        let project = project_root.to_string_lossy().into_owned();
-        let data_root = runtime.data_root.clone();
         let mut first_rx = first_rx.clone();
-        let sid = marker_sid.clone();
+        let mut guard = marker;
         async move {
-            let mut guard = crate::inflight::mark(&sid, "claude", &project, data_root.as_deref());
             if first_rx.wait_for(|seen| *seen).await.is_ok() {
                 guard.record_child_pid(pid);
             }
@@ -1450,7 +1495,11 @@ async fn run_claude(
     let interrupt_requested =
         crate::inflight::take_interrupt_request(&marker_sid, runtime.data_root.as_deref())
             || stopped_by_signal;
+    // Awaited after the abort, which only requests cancellation: the marker
+    // guard must be gone before this run returns, not whenever the runtime
+    // next polls the task.
     marker_task.abort();
+    let _ = marker_task.await;
     if let Some(pid) = pid {
         unregister_group(pid);
     }
@@ -1887,7 +1936,19 @@ async fn run_grok(
     project_root: &Path,
     oneshot: bool,
     launched: Option<LaunchSignal>,
+    data_root: Option<&Path>,
 ) -> Result<RunOutput> {
+    // In flight for the whole run, wake turns included. Never offered a pid:
+    // grok has no clean way to end a turn, so `review interrupt` refuses it.
+    // What the marker buys is `review message` seeing the turn in flight and
+    // refusing, as its help says, instead of launching a second turn on the
+    // session beside this one - and `review sessions` showing it. A resume
+    // marks before its launch (the order `review message`'s launch lock
+    // relies on); a fresh run as soon as its id is known, which is before
+    // anyone could have it to message.
+    let project = project_root.to_string_lossy().into_owned();
+    let mut _marker =
+        (!oneshot).then(|| crate::inflight::mark(session_id, "grok", &project, data_root));
     let (mut first, first_turns, first_usage) = run_grok_turn(
         session_id,
         model,
@@ -1907,6 +1968,9 @@ async fn run_grok(
         .session_id
         .clone()
         .unwrap_or_else(|| session_id.to_string());
+    if _marker.is_none() {
+        _marker = Some(crate::inflight::mark(&sid, "grok", &project, data_root));
+    }
     // Fail closed: without grok's home the results cannot be checked, and an
     // unchecked run must not pass as one whose results were seen.
     let grok = match crate::grok_home::Grok::resolve(env) {
@@ -2832,6 +2896,21 @@ async fn run_codex_json(
         let _ = std::fs::remove_file(last_msg_path);
         anyhow::bail!("not launched: review was signalled to stop");
     }
+    // A resume knows its session id, so its in-flight marker goes up before the
+    // spawn: `review message` releases its session launch lock when the launch
+    // signal below fires, and a second message must then find this marker to
+    // interrupt the run rather than launch beside it. A fresh run's marker waits
+    // for the id in the marker task below; nobody can message a session whose
+    // id has not been printed. Dropped (removing the marker) on any early
+    // return.
+    let early_marker = known_session_id.as_deref().map(|sid| {
+        crate::inflight::mark(
+            sid,
+            "codex",
+            &project_root.to_string_lossy(),
+            runtime.data_root.as_deref(),
+        )
+    });
     let mut child = cmd.spawn().context("failed to spawn codex")?;
     // Launch has happened: the caller may release the global lock. Dropping the
     // sender instead (on the `?` above) tells it the same thing.
@@ -2882,15 +2961,20 @@ async fn run_codex_json(
         let project = project_root.to_string_lossy().into_owned();
         let data_root = runtime.data_root.clone();
         async move {
-            let sid = loop {
-                if let Some(sid) = rx.borrow_and_update().clone() {
-                    break sid;
-                }
-                if rx.changed().await.is_err() {
-                    return;
+            let mut guard = match early_marker {
+                Some(guard) => guard,
+                None => {
+                    let sid = loop {
+                        if let Some(sid) = rx.borrow_and_update().clone() {
+                            break sid;
+                        }
+                        if rx.changed().await.is_err() {
+                            return;
+                        }
+                    };
+                    crate::inflight::mark(&sid, "codex", &project, data_root.as_deref())
                 }
             };
-            let mut guard = crate::inflight::mark(&sid, "codex", &project, data_root.as_deref());
             if first_output_rx.wait_for(|seen| *seen).await.is_ok() {
                 guard.record_child_pid(child_pid);
             }
@@ -3022,10 +3106,13 @@ async fn run_codex_json(
     let interrupt_requested = watched_session_id.as_deref().is_some_and(|sid| {
         crate::inflight::take_interrupt_request(sid, runtime.data_root.as_deref())
     }) || stopped_by_signal;
-    // Run is over: drop the in-flight marker (aborting the task drops its guard)
-    // and stop advertising the group to the signal supervisor. Both happen
-    // before the `?` below so a failed wait cannot leak either.
+    // Run is over: drop the in-flight marker and stop advertising the group to
+    // the signal supervisor. Both happen before the `?` below so a failed wait
+    // cannot leak either. `abort` only requests cancellation - the guard drops
+    // when the runtime next polls the task - so the handle is awaited, or the
+    // marker could outlive the run that returned.
     marker_task.abort();
+    let _ = marker_task.await;
     if let Some(pid) = child_pid {
         unregister_group(pid);
     }

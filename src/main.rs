@@ -390,10 +390,12 @@ async fn main() -> Result<()> {
         return run_message(id, *dry_run, started).await;
     }
 
-    // Migration: `review resume` is `review message` on an idle session.
+    // Migration: `review resume` is `review message`, and runs as it - so it
+    // interrupts a turn in flight and takes the session's launch lock, rather
+    // than launching a second turn beside a running one.
     if let Some(cli::Command::Resume { id, dry_run }) = &cli.command {
         eprintln!("warning: `review resume <ID>` is now `review message <ID>`");
-        return run_session_resume(id, *dry_run, started, None).await;
+        return run_message(id, *dry_run, started).await;
     }
 
     if let Some(cli::Command::Interrupt { id }) = &cli.command {
@@ -422,7 +424,7 @@ async fn main() -> Result<()> {
                  keeps its own provider and settings"
             );
         }
-        return run_session_resume(session_id, cli.dry_run, started, None).await;
+        return run_message(session_id, cli.dry_run, started).await;
     }
 
     let archetype_arg =
@@ -858,6 +860,19 @@ async fn run_message(session_id: &str, dry_run: bool, started: std::time::Instan
     // Read before interrupting anything: a missing message must not cost the
     // turn in flight.
     let instructions = input::read_stdin()?;
+    // Held from before the in-flight check until this message's run has
+    // launched (see `inflight::LaunchLock`): a second message to the session
+    // waits here, then finds this one's turn in flight and interrupts it,
+    // instead of both launching on one idle session. Blocking, so off the
+    // async runtime.
+    let launch_lock = if dry_run {
+        None
+    } else {
+        let sid = session_id.to_string();
+        tokio::task::spawn_blocking(move || inflight::lock_session_launch(&sid, None))
+            .await
+            .map_err(|e| anyhow::anyhow!("launch lock task failed: {e}"))??
+    };
     if !dry_run && let Some(marker) = inflight::live_marker(session_id, None) {
         if !interrupt_cmd::interruptible(&marker.provider) {
             bail!(
@@ -875,7 +890,14 @@ async fn run_message(session_id: &str, dry_run: bool, started: std::time::Instan
             );
         }
     }
-    run_session_resume(session_id, dry_run, started, Some(instructions)).await
+    run_session_resume(
+        session_id,
+        dry_run,
+        started,
+        Some(instructions),
+        launch_lock,
+    )
+    .await
 }
 
 /// `review resume <id>`: continue a specific provider session and send raw
@@ -888,6 +910,9 @@ async fn run_session_resume(
     dry_run: bool,
     started: std::time::Instant,
     instructions: Option<String>,
+    // `review message`'s per-session lock, released with the global lock once
+    // the run has launched (see `run_message`).
+    launch_lock: Option<inflight::LaunchLock>,
 ) -> Result<()> {
     // Looked up once and reused by the cache-age gate and inheritance below.
     let record = resume_record(session_id, sessions::latest_for_session(session_id))?;
@@ -1008,13 +1033,18 @@ async fn run_session_resume(
     // resolves (as an error) if the sender is dropped without sending, i.e. the
     // spawn failed - which is equally a reason to stop holding the lock. The
     // `invoke` arm covers a provider that returns before signalling at all.
+    // The session's launch lock goes at the same moment: once the provider has
+    // spawned, its in-flight marker exists, so a later message to this session
+    // sees the turn in flight.
     let result = tokio::select! {
         result = &mut invoke => {
             drop(lock_file);
+            drop(launch_lock);
             result
         }
         _ = launched_rx => {
             drop(lock_file);
+            drop(launch_lock);
             invoke.await
         }
     };
@@ -1367,6 +1397,27 @@ fn run_sessions(all: bool, limit: usize) -> Result<()> {
             }
             println!();
         }
+    }
+
+    // Messages queued behind the global lock: no marker yet, so without this
+    // they appear nowhere until they launch. A queued message only holds a
+    // session id; its project comes from the session's own record.
+    for sid in inflight::pending_launches(None) {
+        if live.iter().any(|m| m.session_id == sid) {
+            continue;
+        }
+        let project = sessions::latest_for_session(&sid).map(|r| r.project);
+        if let Some(ref proj) = project_filter
+            && project.as_ref() != Some(proj)
+        {
+            continue;
+        }
+        println!("[queued] message waiting to launch");
+        println!("       session: {sid}");
+        if all && let Some(p) = project {
+            println!("       project: {p}");
+        }
+        println!();
     }
 
     let mut records = sessions::read_all();

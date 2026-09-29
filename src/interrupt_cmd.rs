@@ -73,25 +73,65 @@ pub(crate) async fn interrupt(
     rows: impl Fn() -> Vec<SessionRecord>,
 ) -> Result<Outcome> {
     let Some(marker) = crate::inflight::live_marker(session_id, data_root) else {
+        // Nothing to signal yet, but not nothing happening: a message is
+        // queued behind the global lock and will start a turn shortly.
+        if crate::inflight::launch_pending(session_id, data_root) {
+            bail!(
+                "a message to session {session_id} is waiting to launch, so there is no \
+                 turn to interrupt yet\n  retry once it has launched, or send your own \
+                 `review message`, which waits for it and then interrupts it"
+            );
+        }
         bail!(
             "no run of session {session_id} is in flight on this host\n  \
              `review sessions --all` lists the ones that are"
         );
     };
-    let provider = marker.provider.as_str();
+    let provider = marker.provider.clone();
+    let provider = provider.as_str();
     if !interruptible(provider) {
         bail!(
             "session {session_id} is a {provider} run; only codex and claude runs can be \
              interrupted"
         );
     }
+    // The pid is offered once the provider has printed its first output, a
+    // second or two after launch. A run caught inside that window - which
+    // `review message` does routinely, its launch lock handing over the moment
+    // the previous message's run spawns - is waited for rather than refused.
+    let marker = if marker.child_pid.is_some() {
+        marker
+    } else {
+        eprintln!("waiting for {provider} to start before interrupting it...");
+        let deadline = std::time::Instant::now() + crate::timings::INTERRUPT_PID_WAIT;
+        loop {
+            tokio::time::sleep(crate::timings::INTERRUPT_PID_POLL).await;
+            match crate::inflight::live_marker(session_id, data_root) {
+                // It ended before it could be interrupted; there is nothing
+                // left to stop.
+                None => {
+                    return Ok(Outcome {
+                        interrupted: false,
+                        project: marker.project.clone(),
+                        provider: provider.to_string(),
+                    });
+                }
+                Some(m) if m.child_pid.is_some() => break m,
+                Some(_) if std::time::Instant::now() >= deadline => bail!(
+                    "session {session_id} cannot be interrupted: {provider} has produced no \
+                     output in {}s, or the run was launched by an older `review` (pid {}) \
+                     that does not record {provider}'s pid",
+                    crate::timings::INTERRUPT_PID_WAIT.as_secs(),
+                    marker.pid
+                ),
+                Some(_) => {}
+            }
+        }
+    };
+    // Always offered by now; refused rather than defaulted, since pid 0 would
+    // signal our own process group.
     let Some(child_pid) = marker.child_pid else {
-        bail!(
-            "session {session_id} cannot be interrupted yet: {provider} has produced no \
-             output, or the run was launched by an older `review` (pid {}) that does not \
-             record {provider}'s pid",
-            marker.pid
-        );
+        bail!("session {session_id}: {provider}'s pid is not recorded");
     };
     let Ok(pid) = i32::try_from(child_pid) else {
         bail!("{provider} pid {child_pid} is out of range");

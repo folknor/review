@@ -1048,10 +1048,21 @@ async fn claude_signalable(scratch: &Scratch) -> String {
 
 /// Run `body` as the owner and `review interrupt` against it from "another
 /// process", appending the owner's sidecar row when its run returns, as the
-/// fan-out task does.
+/// fan-out task does. The interrupt is sent once claude's pid is offered.
 async fn claude_interrupt_stub(
     scratch: &Scratch,
     body: &str,
+) -> (RunOutput, Result<crate::interrupt_cmd::Outcome>) {
+    claude_interrupt_stub_at(scratch, body, true).await
+}
+
+/// As `claude_interrupt_stub`, but `after_pid: false` sends the interrupt as
+/// soon as the run is marked in flight - before claude's first event, as a
+/// second `review message` does when its launch lock hands over.
+async fn claude_interrupt_stub_at(
+    scratch: &Scratch,
+    body: &str,
+    after_pid: bool,
 ) -> (RunOutput, Result<crate::interrupt_cmd::Outcome>) {
     let runtime = fast_runtime(scratch);
     let data_root = scratch.data_root();
@@ -1073,7 +1084,19 @@ async fn claude_interrupt_stub(
         run
     };
     let interrupter = async {
-        let sid = claude_signalable(scratch).await;
+        let sid = if after_pid {
+            claude_signalable(scratch).await
+        } else {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(m) = crate::inflight::read_live(Some(&data_root)).pop() {
+                    assert!(m.child_pid.is_none(), "the stub has not spoken yet");
+                    break m.session_id;
+                }
+                assert!(std::time::Instant::now() < deadline, "no marker");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
         crate::interrupt_cmd::interrupt(&sid, Some(&data_root), || {
             rows.lock().expect("rows").clone()
         })
@@ -1147,6 +1170,26 @@ async fn review_interrupt_ends_a_claude_turn_and_keeps_its_session() {
         !crate::inflight::take_interrupt_request(&sid, Some(&scratch.data_root())),
         "the run consumed the request"
     );
+}
+
+#[tokio::test]
+async fn review_interrupt_waits_for_a_claude_that_has_not_spoken_yet() {
+    // A second `review message` meets a run in the second after it launched,
+    // before claude's first event offers its pid. Refusing then lost the
+    // message; the verb waits for the pid instead.
+    let scratch = Scratch::new();
+    let body = format!(
+        "sleep 1\n{CLAUDE_STUB_INIT}\n{}",
+        claude_stub_await_sigint()
+    );
+    let (run, outcome) = claude_interrupt_stub_at(&scratch, &body, false).await;
+    assert!(
+        outcome
+            .expect("the verb waits rather than refusing")
+            .interrupted,
+        "and then interrupts"
+    );
+    assert!(run.digest.expect("digest").interrupted);
 }
 
 #[tokio::test]
@@ -1247,6 +1290,19 @@ async fn a_claude_that_dies_after_starting_keeps_its_session() {
 }
 
 #[tokio::test]
+async fn output_before_init_is_not_a_claude_start() {
+    // A stray byte or diagnostic, then a crash, before claude's `init` event:
+    // claude never reached the point of having a session, so none is kept.
+    let scratch = Scratch::new();
+    let body = "printf 'booting'\nexit 1";
+    let run = run_claude_stub(&scratch, body, &fast_runtime(&scratch), None).await;
+    assert!(
+        run.is_err(),
+        "no init event, no session: a launch failure, not a death"
+    );
+}
+
+#[tokio::test]
 async fn a_stale_interrupt_request_does_not_mark_a_claude_resume_interrupted() {
     // Left by a `review` killed before it consumed it. A resume that then fails
     // for its own reason must report that reason, not an interrupt.
@@ -1273,10 +1329,102 @@ async fn a_stale_interrupt_request_does_not_mark_a_claude_resume_interrupted() {
     );
 }
 
+/// Whether `session_id`'s marker is readable once this task sees `launched`
+/// fire. `review message` releases its session launch lock on that signal, so
+/// a marker written any later leaves a window in which a second message sees
+/// no turn in flight and launches beside this one.
+///
+/// What this can and cannot catch: it runs when the test task is next
+/// scheduled after the signal, not at the signal itself. It reliably catches
+/// a marker written from a task spawned after launch - the shape the runners
+/// had, which failed it 5 times in 5 - but not one written synchronously just
+/// after the signal, before the runner yields. That the marker is written
+/// before the spawn is stated where each runner writes it; this test guards
+/// against the realistic regression, not every conceivable one.
+async fn marked_at_launch(
+    launched: tokio::sync::oneshot::Receiver<()>,
+    session_id: &str,
+    data_root: &std::path::Path,
+) -> bool {
+    launched.await.expect("the run signals its launch");
+    crate::inflight::live_marker(session_id, Some(data_root)).is_some()
+}
+
+#[tokio::test]
+async fn a_claude_resume_is_marked_in_flight_before_it_launches() {
+    let scratch = Scratch::new();
+    let sid = "0c1a0000-0000-4000-8000-000000000002";
+    let body = format!(
+        "{CLAUDE_STUB_PREAMBLE}\n{CLAUDE_STUB_INIT}\n{}",
+        claude_stub_result(false, r#",\"result\":\"ok\""#)
+    );
+    let mut runtime = fast_runtime(&scratch);
+    runtime.claude_command = vec!["/bin/sh".to_string(), scratch.write_stub(&body)];
+    let mut env = BTreeMap::new();
+    env.insert(
+        "STUB_DIR".to_string(),
+        scratch.root.to_string_lossy().into_owned(),
+    );
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let data_root = scratch.data_root();
+    let project = scratch.project();
+    let (run, marked) = tokio::join!(
+        run_claude(
+            sid,
+            None,
+            None,
+            Some(&env),
+            "more",
+            &project,
+            false,
+            Some(tx),
+            &runtime
+        ),
+        marked_at_launch(rx, sid, &data_root)
+    );
+    assert!(run.is_ok_and(|r| r.text == "ok"));
+    assert!(marked, "the marker must exist when the launch is signalled");
+}
+
+#[tokio::test]
+async fn a_codex_resume_is_marked_in_flight_before_it_launches() {
+    let scratch = Scratch::new();
+    let stub = scratch.write_stub(&format!(
+        "{}\nprintf '%s' 'ok' > \"$LAST_MSG\"",
+        stub_preamble()
+    ));
+    let runtime = fast_runtime(&scratch);
+    let out_file = new_output_file().expect("create -o file");
+    let mut env = BTreeMap::new();
+    env.insert(
+        "CODEX_HOME".to_string(),
+        scratch.codex_home().to_string_lossy().into_owned(),
+    );
+    env.insert("LAST_MSG".to_string(), out_file.clone());
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let data_root = scratch.data_root();
+    let project = scratch.project();
+    let (run, marked) = tokio::join!(
+        run_codex_json(
+            vec![stub, "exec".to_string(), "resume".to_string()],
+            &out_file,
+            Some(STUB_SESSION.to_string()),
+            Some(&env),
+            "more",
+            &project,
+            Some(tx),
+            &runtime,
+        ),
+        marked_at_launch(rx, STUB_SESSION, &data_root)
+    );
+    assert!(run.is_ok());
+    assert!(marked, "the marker must exist when the launch is signalled");
+}
+
 #[tokio::test]
 async fn claude_output_past_the_cap_keeps_its_final_result() {
     // The stream ends in the result: keeping only the head would lose it.
-    let mut stream = String::new();
+    let mut stream = format!("{CLAUDE_INIT}\n");
     for i in 0..200 {
         stream.push_str(&format!("{{\"type\":\"assistant\",\"n\":{i}}}\n"));
     }
@@ -1298,7 +1446,7 @@ async fn claude_output_past_the_cap_keeps_its_final_result() {
         first_tx,
     )
     .await;
-    assert!(*first_rx.borrow(), "output flags the first event");
+    assert!(*first_rx.borrow(), "the init event is seen");
     let head = head.lock().expect("head").clone();
     let tail = tail.lock().expect("tail").clone();
     assert_eq!(head.len(), 100, "the head is capped");

@@ -50,6 +50,12 @@ pub struct Marker {
     /// the field existed; such a run cannot be interrupted.
     #[serde(default)]
     pub child_pid: Option<u32>,
+    /// Unique per run, so a run can tell its own marker from another run's of
+    /// the same session (see `Guard`). Owner pid and start second together
+    /// are not unique: one `review` could run a session twice within a second.
+    /// Empty in markers written before the field existed.
+    #[serde(default)]
+    pub run_id: String,
 }
 
 /// Where markers live. `data_root` overrides the real XDG location and exists so
@@ -138,15 +144,18 @@ impl Guard {
     }
 }
 
-/// Whether the marker at `path` is the one `ours` describes: same owning
-/// `review` and same launch. A missing or unreadable file is not ours to touch.
+/// Whether the marker at `path` is the one `ours` describes: the same run. A
+/// missing or unreadable file is not ours to touch.
+///
+/// A check then an action, so a second run could replace the marker between
+/// the two. Closing that needs a lock around every marker write; the window is
+/// microseconds wide and opens only for two runs of one session at once, which
+/// `review message`'s launch lock already keeps apart.
 fn still_ours(path: &Path, ours: &Marker) -> bool {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|content| serde_json::from_str::<Marker>(&content).ok())
-        .is_some_and(|on_disk| {
-            on_disk.pid == ours.pid && on_disk.started_epoch == ours.started_epoch
-        })
+        .is_some_and(|on_disk| on_disk.run_id == ours.run_id)
 }
 
 /// Write a marker via a rename, so a concurrent reader never sees it
@@ -190,6 +199,7 @@ pub fn mark(session_id: &str, provider: &str, project: &str, data_root: Option<&
         pid: std::process::id(),
         // Offered later, once it is safe to signal - see `Guard::record_child_pid`.
         child_pid: None,
+        run_id: crate::config::generate_uuid(),
     };
     if let Err(e) = write_marker(&path, &marker) {
         eprintln!("warning: failed to write inflight marker: {e}");
@@ -255,6 +265,135 @@ pub fn live_marker(session_id: &str, data_root: Option<&Path>) -> Option<Marker>
     read_live(data_root)
         .into_iter()
         .find(|m| m.session_id == session_id)
+}
+
+/// Held by `review message` from before it checks whether the session has a turn
+/// in flight until its own run has launched - by which point that run's
+/// in-flight marker exists (every runner writes it before spawning when the
+/// session id is known). Released by dropping it.
+///
+/// Without it, two messages to one idle session both saw no turn in flight and
+/// both launched a turn on the same session at once. Codex's session lock made
+/// the second fail; claude has none, so both ran. And a message waiting behind
+/// the global lock was invisible to every other verb: no marker until it
+/// launched. With it, a second message waits for the first to launch, then
+/// finds its marker and interrupts it, as `review message` promises.
+pub struct LaunchLock {
+    /// Held only so the lock lives as long as this value: closing it releases
+    /// the `flock`.
+    _file: std::fs::File,
+}
+
+/// How long a launch lock file may sit unused before `lock_session_launch`
+/// removes it. "Unused" is judged by modification time, which taking an
+/// `flock` does not update, so every open and every acquisition touches the
+/// file; and a file whose lock is held right now is never removed, whatever
+/// its age. Removing one in use would split the session's messages across two
+/// files, each holding a lock on its own.
+const LAUNCH_LOCK_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Path of `session_id`'s launch lock, beside its marker.
+fn launch_lock_path(session_id: &str, data_root: Option<&Path>) -> Option<PathBuf> {
+    if !is_safe_filename_component(session_id) {
+        return None;
+    }
+    Some(dir(data_root)?.join(format!("{session_id}.launch")))
+}
+
+/// Take `session_id`'s launch lock, waiting while another message to the same
+/// session holds it. Blocking - call off the async runtime. `Ok(None)` when no
+/// lock can be made (unsafe id, no data dir): the message then proceeds
+/// unserialised, as it did before the lock existed, rather than failing.
+pub fn lock_session_launch(
+    session_id: &str,
+    data_root: Option<&Path>,
+) -> std::io::Result<Option<LaunchLock>> {
+    use std::os::unix::io::AsRawFd;
+    let Some(path) = launch_lock_path(session_id, data_root) else {
+        return Ok(None);
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        remove_stale_launch_locks(parent, &path);
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    // Touched on open (so a waiter's file is recent) and again on acquiring;
+    // see `LAUNCH_LOCK_MAX_AGE`. Best-effort: an untouched file is still a lock.
+    let _ = file.set_modified(std::time::SystemTime::now());
+    // SAFETY: flock on a descriptor we own; released when the file is closed.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        eprintln!("waiting for another message to session {session_id} to launch...");
+        // SAFETY: as above.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+    Ok(Some(LaunchLock { _file: file }))
+}
+
+/// Whether the lock file at `path` is held by anyone right now.
+fn launch_lock_held(path: &Path) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    // SAFETY: flock on a descriptor we own. A lock taken here is released when
+    // `file` drops at the end of this function.
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    !taken
+}
+
+/// Session ids whose launch lock is held right now: messages waiting to launch,
+/// which have no in-flight marker yet. For `review sessions`.
+pub fn pending_launches(data_root: Option<&Path>) -> Vec<String> {
+    let Some(dir) = dir(data_root) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("launch"))
+        .filter(|p| launch_lock_held(p))
+        .filter_map(|p| p.file_stem().and_then(|s| s.to_str()).map(String::from))
+        .collect()
+}
+
+/// Whether a message to `session_id` holds its launch lock right now: one is
+/// waiting to launch, so the session is about to have a turn in flight.
+pub fn launch_pending(session_id: &str, data_root: Option<&Path>) -> bool {
+    launch_lock_path(session_id, data_root).is_some_and(|path| launch_lock_held(&path))
+}
+
+/// Remove launch lock files nobody has used in `LAUNCH_LOCK_MAX_AGE`, so the
+/// directory does not collect one per session ever messaged. Best-effort.
+fn remove_stale_launch_locks(dir: &Path, keep: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep || path.extension().and_then(|e| e.to_str()) != Some("launch") {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > LAUNCH_LOCK_MAX_AGE);
+        if old && !launch_lock_held(&path) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Is `session_id`'s interrupt request still waiting for its run to consume it?
@@ -332,15 +471,17 @@ mod tests {
         let root = scratch_root();
         let sid = "019fefb0-227c-7c83-a398-380011b8e66b";
         let first = mark(sid, "claude", "/p", Some(&root));
-        // A second `review` of the same session writes the same path.
+        // A second run of the same session writes the same path - here from
+        // the same `review` in the same second, so only the run id differs.
         let path = dir(Some(&root)).expect("dir").join(format!("{sid}.json"));
         let second = Marker {
             session_id: sid.to_string(),
             provider: "claude".to_string(),
             project: "/p".to_string(),
-            started_epoch: 1,
-            pid: std::process::id() + 1,
+            started_epoch: crate::provider::now_epoch_secs(),
+            pid: std::process::id(),
             child_pid: None,
+            run_id: "another-run".to_string(),
         };
         write_marker(&path, &second).expect("second marker");
         drop(first);
@@ -352,6 +493,87 @@ mod tests {
         std::fs::remove_file(&path).expect("clear");
         drop(mark(sid, "claude", "/p", Some(&root)));
         assert!(!path.exists(), "our own marker goes when the run does");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_held_launch_lock_is_seen_as_a_pending_message() {
+        let root = scratch_root();
+        let sid = "019fefb0-227c-7c83-a398-380011b8e66c";
+        assert!(!launch_pending(sid, Some(&root)), "nothing waiting yet");
+        let lock = lock_session_launch(sid, Some(&root))
+            .expect("lock")
+            .expect("a safe id gets a lock");
+        assert!(
+            launch_pending(sid, Some(&root)),
+            "a held lock means a message is waiting to launch"
+        );
+        drop(lock);
+        assert!(
+            !launch_pending(sid, Some(&root)),
+            "released once the message has launched"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_never_removes_a_held_launch_lock_however_old() {
+        // flock does not touch mtime, so age alone cannot tell a held lock from
+        // an abandoned one. Removing a held one would let a later message to
+        // that session lock a fresh file and launch beside the holder.
+        let root = scratch_root();
+        let held_sid = "019fefb0-227c-7c83-a398-380011b8e66e";
+        let held = lock_session_launch(held_sid, Some(&root))
+            .expect("lock")
+            .expect("lock");
+        let held_path = launch_lock_path(held_sid, Some(&root)).expect("path");
+        let two_days_ago = std::time::SystemTime::now() - 2 * LAUNCH_LOCK_MAX_AGE;
+        std::fs::File::options()
+            .write(true)
+            .open(&held_path)
+            .and_then(|f| f.set_modified(two_days_ago))
+            .expect("age the file");
+        // Another session's message runs the cleanup.
+        drop(lock_session_launch(
+            "019fefb0-227c-7c83-a398-380011b8e66f",
+            Some(&root),
+        ));
+        assert!(held_path.exists(), "a held lock survives cleanup");
+        // Released and old, it goes.
+        drop(held);
+        drop(lock_session_launch(
+            "019fefb0-227c-7c83-a398-380011b8e670",
+            Some(&root),
+        ));
+        assert!(!held_path.exists(), "an abandoned old lock is removed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_second_launch_waits_for_the_first() {
+        let root = scratch_root();
+        let sid = "019fefb0-227c-7c83-a398-380011b8e66d";
+        let first = lock_session_launch(sid, Some(&root))
+            .expect("lock")
+            .expect("lock");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let second = lock_session_launch(sid, Some(&root)).expect("lock");
+                tx.send(()).expect("send");
+                drop(second);
+            })
+        };
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the second message must not launch while the first holds the lock"
+        );
+        drop(first);
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the second proceeds once the first has launched");
+        waiter.join().expect("join");
         let _ = std::fs::remove_dir_all(&root);
     }
 

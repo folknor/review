@@ -144,10 +144,14 @@ lands, the answer stands. Before a resume launches, any interrupt request left
 for its session by an earlier `review` that died before consuming it is
 cleared, so it cannot mark this run interrupted.
 
-Two runs of one session can be in flight at once - claude has no session lock,
-so two `review message` calls to an idle session both launch - and they share
-one marker path. A run removes or updates the marker only while it is still the
-one it wrote, so the first to finish no longer deletes the second's.
+Claude has no session lock of its own, so two `review message` calls to an idle
+session used to both launch, running two turns on one session at once. `review
+message` now holds a per-session launch lock from before it checks for a turn in
+flight until its run has launched, and a run's marker is written before its
+spawn, so the second message waits, then finds the first in flight and
+interrupts it. Should two runs of one session still meet (the fan-out's own
+auto-resume is not serialised this way), a run removes or updates the shared
+marker only while it is still the one it wrote.
 
 `src/provider_tests.rs` drives the real `run_claude` against a stub claude
 (`ProviderRuntime::claude_command`) for each of these: the interrupt, an answer

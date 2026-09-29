@@ -117,6 +117,17 @@ pub fn stale_session(provider: &str) -> Duration {
 /// the resume command is printed.
 pub const INTERRUPT_POLL: Duration = Duration::from_millis(500);
 
+/// How long `review interrupt` waits for a run in flight to offer its pid - which
+/// it does once the provider has printed its first output, a second or two after
+/// launch. `review message` meets this window every time a second message
+/// follows a first: its launch lock hands over the moment the first run
+/// spawns. Past this the provider is taken to be stuck before output, and the
+/// interrupt refused.
+pub const INTERRUPT_PID_WAIT: Duration = Duration::from_secs(60);
+
+/// How often `review interrupt` looks for that pid.
+pub const INTERRUPT_PID_POLL: Duration = Duration::from_millis(100);
+
 /// Default seconds between provider launches, to avoid rate limits. Overridable
 /// with `--stagger`; `0` disables.
 ///
