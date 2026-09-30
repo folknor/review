@@ -11,6 +11,11 @@ the codex or claude turn in flight and continues the session with your message. 
 stop or kill the `review` process to interrupt an agent - use `review message`,
 or `review interrupt <ID>` to stop without a message.
 
+Runs can take hours. A harness that stops background commands after a timeout
+(Claude Code: 30 minutes unless the command passes a larger `timeout`) signals
+`review`, which interrupts the turn exactly as above, so launch `review` with
+the largest timeout the harness allows.
+
 Settings resolve from the command line, then the project's .review.toml, then
 the global config ($XDG_CONFIG_HOME/review/config.toml, else
 ~/.config/review/config.toml). `review config` shows the effective result and
