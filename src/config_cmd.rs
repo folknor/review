@@ -212,6 +212,13 @@ fn write_profile(
     let def = &entry.effective;
     let p = &def.profile;
     writeln!(out, "    {name}  ({})", def_source(def))?;
+    // Each line of a multi-line comment keeps the block's indent, so it cannot
+    // be mistaken for the next profile.
+    if let Some(ref c) = p.comment {
+        for line in c.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            writeln!(out, "      # {line}")?;
+        }
+    }
     writeln!(out, "      {}", settings(provider, p))?;
     if !p.writable_roots.is_empty() {
         writeln!(out, "      writable_roots: {}", p.writable_roots.join(", "))?;
@@ -316,6 +323,7 @@ providers = [\"claude\"]
 stall_timeout_secs = 600
 
 [codex.deep]
+comment = \"global deep comment\"
 model = \"fresh-model\"
 effort = \"high\"
 sandbox = \"workspace-write\"
@@ -323,6 +331,10 @@ writable_roots = [\"/srv/data\"]
 config = ['model_provider=\"x\"']
 
 [claude.opus]
+comment = \"\"\"
+Heavy reasoning.
+  Use for design questions.
+\"\"\"
 model = \"opus\"
 ";
 
@@ -379,6 +391,21 @@ model = \"opus\"
         // overrides leak into the effective view.
         assert!(!t.contains("/srv/data"), "{t}");
         assert!(t.contains("opus  (global [claude.opus])"), "{t}");
+    }
+
+    #[test]
+    fn a_profile_comment_is_shown_under_its_name() {
+        let t = text(true);
+        assert!(
+            t.contains(
+                "opus  (global [claude.opus])\n      # Heavy reasoning.\n      \
+                 # Use for design questions.\n      model opus"
+            ),
+            "{t}"
+        );
+        // A shadowed definition's comment describes a profile that will not
+        // run, so it stays out of the effective view.
+        assert!(!t.contains("global deep comment"), "{t}");
     }
 
     #[test]

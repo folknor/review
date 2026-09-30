@@ -136,6 +136,11 @@ pub struct DefaultsConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
+    /// Free text for whoever picks a profile - what it is for, when to reach
+    /// for it. Never sent to a provider; `review config` shows it. A field
+    /// rather than a TOML comment because the parser discards comments, and
+    /// `review config` renders only what the resolver produced.
+    pub comment: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
     /// Sandbox / write-access level, passed as `--sandbox` by both codex (e.g.
