@@ -7,7 +7,9 @@
 //!
 //! - The build wrapper takes its lock in `$HOME/.brokkr`. Failing that write is
 //!   **fatal** - the run dies at `lock: failed to open lock file` before a
-//!   single crate is compiled.
+//!   single crate is compiled. The same directory holds its `--commit`
+//!   worktrees (`$HOME/.brokkr/worktrees/`), which an A/B against another
+//!   commit has to create and build in.
 //! - Two of the five hosts export a global `CARGO_TARGET_DIR` onto a separate
 //!   drive, and several repos carry a `target` symlink pointing at the same
 //!   shared cache. Cargo cannot write there either.
@@ -195,6 +197,18 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
 
     // The build lock. Fatal when missing, and never inside the workspace.
     //
+    // The grant is the whole directory, which also covers brokkr's `--commit`
+    // worktrees under `worktrees/`. They used to be siblings of the project
+    // (`<parent>/.brokkr-worktree-<project>-<sha>`) so that `../dep` path
+    // dependencies resolved, and that location could not be granted at all:
+    // creating one writes into the parent of every repo, the sha is chosen
+    // inside the run, and codex writable roots take no globs. Brokkr now makes
+    // a per-worktree container here, with the checkout and one symlink per
+    // out-of-repo path dependency side by side, so `../dep` still resolves
+    // and the sandbox, which binds the resolved path, keeps the real sibling
+    // checkout read-only. Their build output goes under the project's target,
+    // which the cargo-target grants below already cover.
+    //
     // `$HOME/.brokkr`, not `$XDG_RUNTIME_DIR`. The latter looked like a generic
     // machine fact but never was one - nothing about a Rust build needs it, and
     // it was derived purely because that is where the build lock used to live.
@@ -214,7 +228,13 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
     if let Some(home) = host.var("HOME") {
         let path = PathBuf::from(home).join(".brokkr");
         if path.is_absolute() {
-            push_root(&mut out, cwd, host, &path, "build lock ($HOME/.brokkr)");
+            push_root(
+                &mut out,
+                cwd,
+                host,
+                &path,
+                "build lock and --commit worktrees ($HOME/.brokkr)",
+            );
         }
     }
 
