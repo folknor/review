@@ -41,7 +41,7 @@ pub fn acquire_blocking(file: &File) -> Result<()> {
     }
 
     // Lock is held by another process - wait
-    eprintln!("Waiting for another review to finish...");
+    eprintln!("Waiting for the launch lock...");
     let start = std::time::Instant::now();
 
     let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };

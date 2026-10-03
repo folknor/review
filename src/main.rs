@@ -991,8 +991,8 @@ async fn run_session_resume(
     // provider launches, and a resume launches exactly one thing, so there is
     // nothing left to serialize once it is running. Holding it for the turn's
     // duration meant a single wedged resume froze all `review` traffic on the
-    // host indefinitely - every later invocation sat printing "Waiting for
-    // another review to finish..." behind a process that would never return.
+    // host indefinitely - every later invocation sat waiting on the lock
+    // behind a process that would never return.
     // A hung run should cost you that run, not the tool.
     //
     // It *is* held across the spawn, via the launch handshake: releasing it
