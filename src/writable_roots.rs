@@ -10,6 +10,8 @@
 //!   single crate is compiled. The same directory holds its `--commit`
 //!   worktrees (`$HOME/.brokkr/worktrees/`), which an A/B against another
 //!   commit has to create and build in.
+//! - It records every invocation in `$XDG_DATA_HOME/brokkr/history.db`.
+//!   Failing that write is silent, so sandboxed runs drop out of the history.
 //! - Two of the five hosts export a global `CARGO_TARGET_DIR` onto a separate
 //!   drive, and several repos carry a `target` symlink pointing at the same
 //!   shared cache. Cargo cannot write there either.
@@ -272,6 +274,34 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
         .or_else(|| host.var("HOME").map(|h| PathBuf::from(h).join(".cargo")));
     if let Some(path) = cargo_home.filter(|p| p.is_absolute()) {
         push_root(&mut out, cwd, host, &path, "cargo home ($CARGO_HOME)");
+    }
+
+    // Brokkr's command history (`history.db`, SQLite, so its journal files
+    // need the directory, not just the file).
+    //
+    // Failing this write is silent: the command itself still succeeds, so a
+    // sandboxed codex session's `brokkr fmt` and `corpus-results` both
+    // completed and neither appeared in `brokkr history`.
+    //
+    // `$XDG_DATA_HOME/brokkr`, else `$HOME/.local/share/brokkr`, which is
+    // where brokkr itself resolves it. A relative `XDG_DATA_HOME` is invalid
+    // per the XDG spec and falls back the same way.
+    let data_home = host
+        .var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            host.var("HOME")
+                .map(|h| PathBuf::from(h).join(".local").join("share"))
+        });
+    if let Some(path) = data_home.filter(|p| p.is_absolute()) {
+        push_root(
+            &mut out,
+            cwd,
+            host,
+            &path.join("brokkr"),
+            "brokkr command history ($XDG_DATA_HOME/brokkr)",
+        );
     }
 
     // An explicit shared cargo cache, exported globally on some hosts.
@@ -665,6 +695,26 @@ path = "../piners/crates/piners-facts"
         );
     }
 
+    /// A sandboxed brokkr that cannot write its history drops the row silently,
+    /// so whole codex sessions went missing from `brokkr history`.
+    #[test]
+    fn the_brokkr_history_directory_is_granted() {
+        let host = FakeHost::new().var("HOME", "/home/dev");
+        let paths: Vec<String> = derive(&cwd(), &host).into_iter().map(|g| g.path).collect();
+        assert!(
+            paths.contains(&"/home/dev/.local/share/brokkr".to_string()),
+            "{paths:?}"
+        );
+
+        let host = host.var("XDG_DATA_HOME", "/srv/xdg");
+        let paths: Vec<String> = derive(&cwd(), &host).into_iter().map(|g| g.path).collect();
+        assert!(paths.contains(&"/srv/xdg/brokkr".to_string()), "{paths:?}");
+        assert!(
+            !paths.contains(&"/home/dev/.local/share/brokkr".to_string()),
+            "{paths:?}"
+        );
+    }
+
     /// The lock directory must not depend on `XDG_RUNTIME_DIR`. It was the
     /// previous location and is absent from any login that skips pam_systemd -
     /// a whole host had it unset under Tailscale SSH - so a derivation that
@@ -1038,7 +1088,7 @@ path = "../piners/crates/piners-facts"
         assert_eq!(
             config_override(&grants).as_deref(),
             Some(
-                r#"sandbox_workspace_write.writable_roots=["/home/dev/.brokkr","/home/dev/.cargo","/media/disk/cargo"]"#
+                r#"sandbox_workspace_write.writable_roots=["/home/dev/.brokkr","/home/dev/.cargo","/home/dev/.local/share/brokkr","/media/disk/cargo"]"#
             )
         );
     }
