@@ -69,6 +69,9 @@ pub trait Host {
     /// `path` with every symlink component resolved, or `None` if it does not
     /// exist. Used to check what a grant *reaches*, not merely what it spells.
     fn canonicalize(&self, path: &Path) -> Option<PathBuf>;
+    /// The contents of a file, or `None` if it cannot be read.
+    fn read_to_string(&self, path: &Path) -> Option<String>;
+    fn is_dir(&self, path: &Path) -> bool;
 }
 
 /// The real host.
@@ -93,6 +96,14 @@ impl Host for RealHost {
 
     fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
         std::fs::canonicalize(path).ok()
+    }
+
+    fn read_to_string(&self, path: &Path) -> Option<String> {
+        std::fs::read_to_string(path).ok()
+    }
+
+    fn is_dir(&self, path: &Path) -> bool {
+        path.is_dir()
     }
 }
 
@@ -290,7 +301,90 @@ pub fn derive(cwd: &Path, host: &impl Host) -> Vec<GrantedRoot> {
         );
     }
 
+    // The Git LFS store of every sibling checkout a path dependency lives in.
+    //
+    // A build stamp runs `git status` over those checkouts, and the sandbox
+    // leaves them read-only. Whenever a tracked LFS file's stat data no longer
+    // matches the index (a re-checkout, a touch), git re-hashes it through the
+    // LFS clean filter, which writes into `.git/lfs/tmp` and then
+    // `.git/lfs/objects` - and dies with `read-only file system`. A normal
+    // status would save the refreshed stat data so it happens once, but the
+    // sandbox cannot write the index either, so every sandboxed status in that
+    // checkout fails until someone runs one outside. The failed git call made
+    // the build stamp unidentifiable, which surfaced as test failures far from
+    // the cause.
+    //
+    // Only `.git/lfs` is granted, never `.git`: refs, config and hooks stay
+    // read-only. Only checkouts that already have a `.git/lfs` directory, so a
+    // repo without LFS is granted nothing.
+    for repo in path_dependency_repos(cwd, host) {
+        push_root(
+            &mut out,
+            cwd,
+            host,
+            &repo.join(".git").join("lfs"),
+            "git lfs store of a path dependency's checkout",
+        );
+    }
+
     out
+}
+
+/// The git checkouts, other than the workspace's own, that hold the path
+/// dependencies named in the workspace's root `Cargo.toml` and use Git LFS.
+fn path_dependency_repos(cwd: &Path, host: &impl Host) -> Vec<PathBuf> {
+    let Some(text) = host.read_to_string(&cwd.join("Cargo.toml")) else {
+        return Vec::new();
+    };
+    let Ok(manifest) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    collect_dependency_paths(&manifest, false, &mut paths);
+
+    let own = repo_of(cwd, host);
+    let mut repos: Vec<PathBuf> = Vec::new();
+    for dep in paths {
+        let dep = cwd.join(dep);
+        let Some(resolved) = host.canonicalize(&dep) else {
+            continue;
+        };
+        let Some(repo) = repo_of(&resolved, host) else {
+            continue;
+        };
+        if Some(&repo) == own.as_ref() || repos.contains(&repo) {
+            continue;
+        }
+        if host.is_dir(&repo.join(".git").join("lfs")) {
+            repos.push(repo);
+        }
+    }
+    repos
+}
+
+/// Every `path` of a dependency entry, found in any table whose key ends in
+/// `dependencies` - which covers `[dependencies]`, the dev and build kinds,
+/// `[workspace.dependencies]` and `[target.<cfg>.dependencies]`.
+fn collect_dependency_paths(table: &toml::Table, in_deps: bool, out: &mut Vec<String>) {
+    for (key, value) in table {
+        let toml::Value::Table(inner) = value else {
+            continue;
+        };
+        if in_deps {
+            if let Some(toml::Value::String(path)) = inner.get("path") {
+                out.push(path.clone());
+            }
+        } else {
+            collect_dependency_paths(inner, key.ends_with("dependencies"), out);
+        }
+    }
+}
+
+/// The nearest directory at or above `path` that holds a `.git` directory.
+fn repo_of(path: &Path, host: &impl Host) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|dir| host.is_dir(&dir.join(".git")))
+        .map(Path::to_path_buf)
 }
 
 /// Add one candidate root, applying every filter a grant must pass.
@@ -403,6 +497,8 @@ mod tests {
         vars: HashMap<String, String>,
         links: HashMap<PathBuf, PathBuf>,
         canon: HashMap<PathBuf, PathBuf>,
+        files: HashMap<PathBuf, String>,
+        dirs: Vec<PathBuf>,
     }
 
     impl FakeHost {
@@ -411,7 +507,17 @@ mod tests {
                 vars: HashMap::new(),
                 links: HashMap::new(),
                 canon: HashMap::new(),
+                files: HashMap::new(),
+                dirs: Vec::new(),
             }
+        }
+        fn file(mut self, at: &str, contents: &str) -> Self {
+            self.files.insert(PathBuf::from(at), contents.to_string());
+            self
+        }
+        fn dir(mut self, at: &str) -> Self {
+            self.dirs.push(PathBuf::from(at));
+            self
         }
         fn var(mut self, key: &str, value: &str) -> Self {
             self.vars.insert(key.to_string(), value.to_string());
@@ -441,6 +547,73 @@ mod tests {
         fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
             Some(self.canon.get(path).cloned().unwrap_or(path.to_path_buf()))
         }
+        fn read_to_string(&self, path: &Path) -> Option<String> {
+            self.files.get(path).cloned()
+        }
+        fn is_dir(&self, path: &Path) -> bool {
+            self.dirs.iter().any(|d| d == path)
+        }
+    }
+
+    /// The workspace and a sibling checkout holding its path dependencies.
+    fn lfs_sibling(sibling_has_lfs: bool) -> FakeHost {
+        let manifest = r#"
+[package]
+name = "project"
+
+[dependencies]
+piners-data = { path = "../piners/crates/piners-data" }
+serde = "1"
+
+[target.'cfg(unix)'.dev-dependencies.piners-facts]
+path = "../piners/crates/piners-facts"
+"#;
+        let host = FakeHost::new()
+            .file("/home/dev/project/Cargo.toml", manifest)
+            .dir("/home/dev/project/.git")
+            .dir("/home/dev/piners/.git")
+            .resolves(
+                "/home/dev/project/../piners/crates/piners-data",
+                "/home/dev/piners/crates/piners-data",
+            )
+            .resolves(
+                "/home/dev/project/../piners/crates/piners-facts",
+                "/home/dev/piners/crates/piners-facts",
+            );
+        if sibling_has_lfs {
+            host.dir("/home/dev/piners/.git/lfs")
+        } else {
+            host
+        }
+    }
+
+    /// A sandboxed `git status` in a sibling checkout re-hashes a stale LFS
+    /// file through the clean filter, which writes under `.git/lfs` and failed
+    /// with `read-only file system`, making the build stamp unidentifiable.
+    #[test]
+    fn a_path_dependencys_lfs_store_is_granted_once() {
+        let grants = derive(&cwd(), &lfs_sibling(true));
+        let paths: Vec<&str> = grants.iter().map(|g| g.path.as_str()).collect();
+        assert_eq!(paths, vec!["/home/dev/piners/.git/lfs"]);
+    }
+
+    #[test]
+    fn a_path_dependency_checkout_without_lfs_is_granted_nothing() {
+        assert!(derive(&cwd(), &lfs_sibling(false)).is_empty());
+    }
+
+    /// A path dependency inside the workspace's own repo needs nothing: its
+    /// `.git` is the workspace's, which codex keeps read-only on purpose.
+    #[test]
+    fn a_path_dependency_in_the_workspaces_own_repo_is_granted_nothing() {
+        let host = FakeHost::new()
+            .file(
+                "/home/dev/project/Cargo.toml",
+                "[dependencies]\ninner = { path = \"crates/inner\" }\n",
+            )
+            .dir("/home/dev/project/.git")
+            .dir("/home/dev/project/.git/lfs");
+        assert!(derive(&cwd(), &host).is_empty());
     }
 
     fn cwd() -> PathBuf {
