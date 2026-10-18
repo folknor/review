@@ -68,7 +68,9 @@ Examples:
   echo \"check\" | review -a bugs --dry-run              Preview the prompt
   echo \"follow up\" | review message <ID>               Message a session, running or not
   review interrupt <ID>                                Stop a codex or claude run mid-turn
-  review config                                        Effective configuration";
+  review config                                        Effective configuration
+
+More depth on any of this: `review man` lists the bundled topics.";
 
 // The cutoffs are restated from `timings::stale_session` because clap needs a
 // `&'static str`; a test keeps the two in step.
@@ -289,6 +291,13 @@ pub enum Command {
 
     /// Create a starter .review.toml in the current directory
     Init,
+
+    /// Print a bundled topic with more depth than this help; no topic lists them
+    Man {
+        /// Topic name, as listed by `review man`
+        #[arg(value_name = "TOPIC")]
+        topic: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -423,6 +432,32 @@ mod tests {
             _ => panic!("expected interrupt"),
         }
         assert!(parse(&["interrupt"]).is_err(), "the id is required");
+    }
+
+    /// Every root subcommand, hidden ones, aliases and clap's generated `help`
+    /// included, is a reserved word: while the positional archetype alias
+    /// exists, an archetype by that name would be silently shadowed. Derived
+    /// from the built command so a new subcommand cannot be forgotten.
+    #[test]
+    fn every_subcommand_name_is_reserved() {
+        let mut cmd = Cli::command();
+        cmd.build();
+        for sub in cmd.get_subcommands() {
+            for name in std::iter::once(sub.get_name()).chain(sub.get_all_aliases()) {
+                assert!(
+                    crate::config::RESERVED_NAMES.contains(&name),
+                    "subcommand `{name}` is missing from RESERVED_NAMES"
+                );
+            }
+        }
+        assert!(crate::config::RESERVED_NAMES.contains(&"all"));
+    }
+
+    #[test]
+    fn man_takes_one_topic_at_most() {
+        assert!(parse(&["man"]).is_ok());
+        assert!(parse(&["man", "sandbox"]).is_ok());
+        assert!(parse(&["man", "sandbox", "inheritance"]).is_err());
     }
 
     #[test]

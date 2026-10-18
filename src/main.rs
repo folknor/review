@@ -9,6 +9,7 @@ mod inflight;
 mod input;
 mod interrupt_cmd;
 mod lock;
+mod man;
 mod project;
 mod prompt;
 mod provider;
@@ -395,6 +396,7 @@ async fn main() -> Result<()> {
         let refused = match &cli.command {
             Some(cli::Command::Interrupt { .. }) => Some("review interrupt"),
             Some(cli::Command::Incidents { .. }) => Some("review incidents"),
+            Some(cli::Command::Man { .. }) => Some("review man"),
             Some(cli::Command::Sessions {
                 id: None,
                 all: true,
@@ -407,6 +409,13 @@ async fn main() -> Result<()> {
         }
     }
     let selector = cli.project.as_deref();
+
+    // Right after the arguments are validated and before anything reads the
+    // environment - project, config, stdin, providers - so a broken config or a
+    // vanished checkout cannot stop an agent reading how to repair it.
+    if let Some(cli::Command::Man { topic }) = &cli.command {
+        std::process::exit(man::run(topic.as_deref()));
+    }
 
     if matches!(cli.command, Some(cli::Command::Init)) {
         return config::init(&project::select(selector)?);
@@ -1370,6 +1379,12 @@ fn run_session_show(session_id: &str, selector: Option<&str>) -> Result<()> {
     }
     if let Some(ref effort) = latest.effort {
         println!("effort: {effort}");
+    }
+    if let Some(ref sandbox) = latest.sandbox {
+        println!("sandbox: {sandbox}");
+    }
+    for root in &latest.writable_roots {
+        println!("writable root: {root}");
     }
 
     if let Some(ref d) = latest.digest {

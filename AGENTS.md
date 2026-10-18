@@ -31,6 +31,7 @@ Single binary crate, no workspace.
 
 - `src/cli.rs` - Clap CLI. `review` with no subcommand is the run itself (stdin → providers); the archetype is the `-a` flag (omitted = bare: stdin sent unchanged), `-p` the profile, and the global `-C` the project (see `project.rs`). Subcommands: `message`, `interrupt`, `config`, `sessions`, `incidents`, `init`. Three hidden migration aliases, each warning when used: the old positional archetype (`review security`, with `review bare` meaning none), `review resume <ID>` and `--session <ID>`, both now `review message <ID>`. Reserved archetype/group names are listed under Reserved words. The help text is what orchestrating agents read in place of these docs, so it states the rules they would otherwise trip on: profile precedence and the sandbox default, the digest fields, exit status, resume's limits and stale cutoffs (the cutoffs are restated from `timings`, and a test keeps them in step), and that `review config` rather than `.review.toml` is the authoritative view. Change the behaviour, change the help.
 - `src/config.rs` - Layered config. `parse_file` parses one file (`[archetypes]`, `[_groups]`, `[_defaults]` with `providers`/`stall_timeout_secs`, `[_audit]` - local only, an error in the global file - and profiles); `resolve` merges the local `.review.toml` (found by walking up from cwd, required because it holds the audit id) with the optional global `$XDG_CONFIG_HOME/review/config.toml` (else `~/.config/review/config.toml`) for this host. A top-level table named after a known provider is a hostless `[<provider>.<profile>]` table; any other top-level table is a legacy `[<host>.<provider>.<profile>]` host table, still parsed so existing files need no edit. Profiles carry model/effort/sandbox/env/`writable_roots`/`config` (verbatim codex `-c` overrides), plus a free-text `comment` that only `review config` shows. Every resolved value is `Sourced` (layer + table) and each profile keeps the definitions it shadows, for `review config`. Parsed by peeling reserved sections off a `toml::Table` (serde `flatten` can't coexist with the sibling `archetypes` field). Also holds `sandbox_for` (see [reference/sandbox.md](reference/sandbox.md)) and `generate_uuid`/`generate_short_id`. Uses `toml` and `gethostname` crates.
+- `src/man.rs` - `review man [TOPIC]`: the `docs/*.md` topics compiled in with `include_str!` and printed raw, whole - no renderer (plain text everywhere) and no section addressing (each topic is size-capped by a test instead, so growth means a new topic, and every topic must be safe to act on alone). Dispatched in `main` right after argument validation and before anything reads the environment, so a broken config cannot stop an agent reading how to fix it (`tests/man.rs` runs the binary against one). Tests hold the catalog equal to `docs/`, resolve every `review man <topic>` reference, forbid link syntax, and check the stale-cutoff, sandbox and reserved-word tables against the code.
 - `src/project.rs` - `-C`/`--project`: `select` turns a selector into a `config::Selection` (`Discover` from a directory, walked up as the cwd always was, or `Exact`, a root whose `.review.toml` must sit directly in it). Path spellings (`/`, `./`, `../`, `.`, `..`, `~`, `~/`) resolve against the cwd; anything else is looked up in the global `[_projects.<host>]` registry (exact name ignoring ASCII case, then the part after an `owner/name` key's slash; ambiguity is an error), expanded strictly (`~`, `~/`, `$VAR`; any failure is an error) and must be absolute. `same_project` is the one identity rule for recorded project strings: canonical when the path exists, raw when it is gone.
 - `src/config_tests.rs` - Layering tests for `config::resolve` (precedence, whole-profile replacement, host-vs-hostless, cross-layer group validation), included into `config.rs` as a `#[cfg(test)]` module.
 - `src/config_cmd.rs` - `review config`: the effective configuration from the same resolver a run uses, and outside a project the global layer alone (an orchestrator asks before it has picked a project) - files consulted, default providers and whether each provider is installed here, archetypes, groups, profiles with their source table and whatever they shadow. Env var *names* only. Orchestration procedures should read this rather than parse `.review.toml`, which no longer tells the whole story. Plain text, like all of `review`'s output.
@@ -74,75 +75,14 @@ and [reference/claude.md](reference/claude.md); permissions in
 
 ## Reserved words
 
-A config naming an archetype or group any of these fails to parse (`config::RESERVED_NAMES`, checked in `config::parse_file`):
-
-| Word | Why |
-|---|---|
-| `all` | The `-a` keyword for every configured archetype. |
-| `message`, `resume`, `interrupt`, `config`, `sessions`, `incidents`, `init`, `help` | Subcommand names. `-a` itself cannot collide with them, but while the legacy positional alias exists, `review sessions` runs the subcommand rather than the archetype, silently. |
-| `bare` | The legacy positional `review bare` means "no archetype", whatever the config defines under that name. So `bare` may only be an *empty* archetype (`bare = ""`, in most existing configs, stays valid) and never a group. |
-
-Keep this list in step with `cli::Command` and `config::RESERVED_NAMES` when either changes.
+`config::RESERVED_NAMES`, checked in `config::parse_file`, and the `bare` exception. The list is documented in `docs/config.md`, whose table a test holds equal to `RESERVED_NAMES`, and another test requires every root subcommand name (hidden ones, aliases and clap's `help` included) to be in it, so neither can fall out of step.
 
 ## Config format
 
-The global `~/.config/review/config.toml` and a project `.review.toml` share
-this format; `[_audit]` is the one section allowed only in the project file,
-and `[_projects]` the one allowed only in the global file.
-
-```toml
-[archetypes]
-security = "You are a security expert. Read the codebase."
-bugs = "You hunt for edge cases and correctness bugs."
-
-[_defaults]
-providers = ["claude", "codex"]
-# Seconds of rollout silence with no answer before a codex run is treated as
-# stalled (killed + incident + failure). 0 disables. Omitted = 900. Codex-only.
-stall_timeout_secs = 900
-
-[_groups]
-sweep = ["security", "bugs"]
-
-# provider . profile
-[claude.opus]
-model = "Opus 4.8"
-effort = "medium"
-env = { ANTHROPIC_BASE_URL = "http://localhost:8787" }
-
-[codex.implement]
-# Optional: free text shown under the profile in `review config`, never sent
-# to a provider. TOML comments like this one are not surfaced.
-comment = "Implementation work that must build and test."
-model = "gpt-5.6-terra"
-effort = "high"
-sandbox = "workspace-write"
-# Optional: extra writable roots, ADDED to the ones derived from the host (the
-# build lock, cargo home and cargo target - see `reference/sandbox.md`), never
-# replacing them. Only meaningful under `workspace-write`; a `read-only` profile
-# widens nothing. `~`, `$VAR` and `${VAR}` are expanded, which is what lets one
-# hostless profile serve machines with different layouts; an entry naming an
-# unset variable is dropped with a warning rather than expanded to nothing.
-writable_roots = ["/srv/fixtures", "$XDG_CACHE_HOME/assets", "~/corpora"]
-# Optional: extra codex `-c key=value` overrides, each passed verbatim (codex-only).
-config = ['model_provider="openai-http"']
-
-# Legacy host-scoped form, still accepted: applies only on that host, and beats
-# [codex.implement] in the same file there.
-[myhostname.codex.implement]
-model = "gpt-5.6-sol"
-
-# Project file only.
-[_audit]
-id = "43fd"
-
-# Global file only: projects `-C <name>` can select, per host. A path must be
-# absolute after expanding `~`, `~/` and `$VAR`, and hold the project's
-# .review.toml directly. `owner/name` keys also match by `name`.
-[_projects.myhostname]
-bz = "~/Programs/bz"
-"folknor/piners" = "$HOME/src/piners"
-```
+The format, every section, how the two files combine and the reserved words
+are in `docs/config.md`; profile fields in `docs/profiles.md`; the `-C`
+registry in `docs/projects.md`. Those are the binding description - change
+the behaviour, change the doc.
 
 ## Issue tracking
 
@@ -229,7 +169,12 @@ be right is expected.
 
 In this repo `reference/` holds one document per provider (`codex.md`,
 `grok.md`, `claude.md`) plus `sandbox.md` for the permission machinery they
-share.
+share. `docs/` holds the `review man` topics, one file each, flat: observable
+behaviour for the agent driving `review`, while `reference/` keeps mechanism
+and evidence. The docs never link into `reference/` (an installed binary has no
+checkout to follow it into) and say policy, not measurements - a stale cutoff
+is policy, the cache lifetime behind it is evidence. `--help` stays the
+complete short form; a topic adds depth, never a requirement to read it.
 
 **`scripts/` is a fourth, small exception: maintained diagnostics, not
 transient investigation.** Each one exists because a claim in `reference/`

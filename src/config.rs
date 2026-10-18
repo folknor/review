@@ -70,6 +70,7 @@ pub const RESERVED_NAMES: &[&str] = &[
     "sessions",
     "incidents",
     "init",
+    "man",
     "help",
 ];
 

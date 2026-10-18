@@ -1240,7 +1240,7 @@ fn config_writable_roots_override(config: &[String]) -> Option<Vec<String>> {
 /// session's record carries no level to inherit (a row written before levels
 /// were recorded). Claude has no filesystem sandbox on this axis, so it records
 /// none.
-fn effective_sandbox(provider: &str, sandbox: Option<&str>) -> Option<String> {
+pub(crate) fn effective_sandbox(provider: &str, sandbox: Option<&str>) -> Option<String> {
     match provider {
         "codex" | "grok" => Some(sandbox.unwrap_or("read-only").to_string()),
         _ => None,
