@@ -21,6 +21,16 @@ the global config ($XDG_CONFIG_HOME/review/config.toml, else
 ~/.config/review/config.toml). `review config` shows the effective result and
 where each value came from.
 
+Another project (-C): `review -C <name>` acts on a project registered on this
+host in the global config, under [_projects.<host>] as `name = \"path\"`; the
+path must hold the project's .review.toml itself. A name matches ignoring case,
+and `owner/name` keys also match by the part after the slash. A path selector
+is spelled as one (`-C ../bz`, `-C ~/src/bz`) and is searched upward like the
+current directory. There is no fallback between the two. The current directory
+never changes; -C picks the project. `review message` and `review sessions <ID>`
+take the project from the session itself, and -C there must agree with it.
+`review interrupt`, `review incidents` and `review sessions --all` refuse -C.
+
 Providers: claude, codex, grok, from --provider or [_defaults].providers. A
 provider that is not installed fails the run before anything launches.
 
@@ -54,6 +64,7 @@ Examples:
   echo \"how to handle X?\" | review -a competitors      A group of archetypes
   echo \"everything\" | review -a all                    Every configured archetype
   echo \"just claude\" | review --provider claude        Only one provider
+  echo \"check bz\" | review -C bz                       Another registered project
   echo \"check\" | review -a bugs --dry-run              Preview the prompt
   echo \"follow up\" | review message <ID>               Message a session, running or not
   review interrupt <ID>                                Stop a codex or claude run mid-turn
@@ -69,7 +80,9 @@ interrupted; the message is refused until it ends.
 
 The session must come from a run on this host: its provider is read from the
 record that run left (`review sessions` lists them), and an ID with no record
-is refused. There is no --provider, -a or -p. Stdin is sent as-is, with no
+is refused. The run continues in the project the session was started in,
+whatever the current directory; -C only asserts it. There is no --provider, -a
+or -p. Stdin is sent as-is, with no
 archetype prime, and the session keeps the sandbox, model and effort it was
 started with.
 
@@ -106,15 +119,18 @@ Outside a project it shows the global layer alone.";
     about = "Send a prompt to fresh AI sessions across providers",
     override_usage = "echo <instructions> | review [OPTIONS]\n       review <COMMAND>",
     after_help = AFTER_HELP,
-    subcommand_precedence_over_arg = true,
-    // The run flags belong to the run. Without this clap accepts them in front
-    // of a subcommand and the subcommand never sees them: `review --dry-run
-    // resume <ID>` parsed, dropped the `--dry-run`, and sent the turn for real.
-    args_conflicts_with_subcommands = true
+    // Without this a subcommand name after a flag (`review -C bz config`) is
+    // taken as the legacy positional archetype.
+    subcommand_precedence_over_arg = true
 )]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
+
+    /// Act on another project: a name registered under [_projects.<host>] in
+    /// the global config, or a path spelled as one (/..., ./..., ../..., ~/...)
+    #[arg(short = 'C', long = "project", global = true, value_name = "PROJECT")]
+    pub project: Option<String>,
 
     /// Archetype(s) to prime with: a name, a group, a comma-separated list, or
     /// "all". Omit to send stdin unchanged.
@@ -152,7 +168,57 @@ pub struct Cli {
     pub session: Option<String>,
 }
 
+/// The run's own flags, by clap id. With a subcommand they are refused.
+const RUN_ONLY: &[(&str, &str)] = &[
+    ("archetype", "-a"),
+    ("profile", "-p"),
+    ("provider", "--provider"),
+    ("dry_run", "--dry-run"),
+    ("stagger", "--stagger"),
+    ("legacy_archetype", "a positional archetype"),
+    ("session", "--session"),
+];
+
 impl Cli {
+    /// Parse the real command line, exiting with clap's diagnostic on error.
+    pub fn parse_checked() -> Self {
+        match Self::try_parse_checked(std::env::args_os()) {
+            Ok(cli) => cli,
+            Err(e) => e.exit(),
+        }
+    }
+
+    /// Parse, then refuse run flags beside a subcommand.
+    ///
+    /// The run flags belong to the run, and clap would otherwise accept them in
+    /// front of a subcommand and drop them: `review --dry-run resume <ID>`
+    /// parsed, lost the `--dry-run`, and sent the turn for real. clap's own
+    /// `args_conflicts_with_subcommands` did this until `-C` arrived, but it
+    /// makes no exception for a global flag - `review -C bz config` became a run
+    /// primed with an archetype named `config` - and `conflicts_with` cannot name
+    /// a subcommand. So it is checked here, on explicit presence: `--stagger`
+    /// has a default and would otherwise always look supplied.
+    pub fn try_parse_checked<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        use clap::FromArgMatches;
+        let mut cmd = Self::command();
+        let matches = cmd.try_get_matches_from_mut(args)?;
+        if let Some((sub, _)) = matches.subcommand() {
+            for (id, shown) in RUN_ONLY {
+                if matches.value_source(id) == Some(clap::parser::ValueSource::CommandLine) {
+                    return Err(cmd.error(
+                        clap::error::ErrorKind::ArgumentConflict,
+                        format!("{shown} belongs to a run and cannot be used with `review {sub}`"),
+                    ));
+                }
+            }
+        }
+        Self::from_arg_matches(&matches).map_err(|e| e.format(&mut cmd))
+    }
+
     pub fn print_help() {
         let mut cmd = Self::command();
         let _ = cmd.print_help();
@@ -206,7 +272,7 @@ pub enum Command {
         id: Option<String>,
 
         /// List sessions across all projects, not just the current one
-        #[arg(long)]
+        #[arg(long, conflicts_with = "id")]
         all: bool,
 
         /// Maximum number of sessions to list (most recent first)
@@ -230,7 +296,7 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
-        Cli::try_parse_from(std::iter::once("review").chain(args.iter().copied()))
+        Cli::try_parse_checked(std::iter::once("review").chain(args.iter().copied()))
     }
 
     fn parsed(args: &[&str]) -> Cli {
@@ -310,21 +376,30 @@ mod tests {
             &["-p", "deep", "resume", "abc"],
             &["-a", "bugs", "resume", "abc"],
             &["--provider", "claude", "resume", "abc"],
+            &["--stagger", "0", "message", "abc"],
+            &["-p", "deep", "config"],
+            &["--session", "abc", "sessions"],
         ] {
             assert!(parse(args).is_err(), "{args:?} should be refused");
         }
     }
 
     #[test]
-    fn a_run_flag_never_reaches_a_subcommand() {
-        // After a run flag clap stops matching subcommands, so a lone word is
-        // taken as the legacy positional archetype instead: `-p deep config`
-        // is a run primed with an archetype named `config` (warned about, and
-        // an error unless one exists) - never `review config` with the flag
-        // silently dropped.
-        let cli = parsed(&["-p", "deep", "config"]);
+    fn a_subcommand_keeps_its_own_dry_run() {
+        assert!(parse(&["message", "abc", "--dry-run"]).is_ok());
+    }
+
+    #[test]
+    fn project_goes_before_or_after_a_subcommand() {
+        for args in [&["-C", "bz", "config"][..], &["config", "-C", "bz"]] {
+            let cli = parsed(args);
+            assert!(matches!(cli.command, Some(Command::Config)), "{args:?}");
+            assert_eq!(cli.project.as_deref(), Some("bz"), "{args:?}");
+        }
+        let cli = parsed(&["--project", "bz", "-a", "bugs"]);
         assert!(cli.command.is_none());
-        assert_eq!(cli.legacy_archetype.as_deref(), Some("config"));
+        assert_eq!(cli.project.as_deref(), Some("bz"));
+        assert!(cli.legacy_archetype.is_none());
     }
 
     #[test]

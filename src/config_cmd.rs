@@ -32,8 +32,8 @@ const PRIME_PREVIEW_CHARS: usize = 72;
 /// Works outside a project too: with no `.review.toml` it shows the global
 /// layer and provider availability, which is what an orchestrator needs before
 /// it has picked a project.
-pub fn run() -> Result<()> {
-    let (cfg, project_root) = config::load_optional()?;
+pub fn run(sel: &config::Selection) -> Result<()> {
+    let (cfg, project_root) = config::load_optional(sel)?;
     let avail = probe_availability();
     print!("{}", render_text(&cfg, project_root.as_deref(), &avail));
     Ok(())
@@ -94,6 +94,20 @@ fn write_text(
     match project_root {
         Some(root) => writeln!(out, "project:   {}", root.display())?,
         None => writeln!(out, "project:   none")?,
+    }
+
+    writeln!(out)?;
+    writeln!(
+        out,
+        "projects (for -C, global [_projects.{}]):",
+        config::toml_key(&cfg.hostname)
+    )?;
+    if cfg.projects.is_empty() {
+        writeln!(out, "  (none)")?;
+    }
+    let nw = cfg.projects.keys().map(String::len).max().unwrap_or(0);
+    for (name, path) in &cfg.projects {
+        writeln!(out, "  {name:<nw$}  {path}")?;
     }
 
     writeln!(out)?;

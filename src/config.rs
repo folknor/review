@@ -186,6 +186,9 @@ pub struct ConfigFile {
     /// existing files need no edit; for the host it names, it beats a hostless
     /// profile of the same name in the same file.
     pub hosts: BTreeMap<String, ProfileTables>,
+    /// `[_projects.<host>]`: host -> project name -> path as written. Global
+    /// file only, for `-C <name>` (see `project.rs`).
+    pub projects: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// A resolved value plus the layer and table it came from.
@@ -245,6 +248,8 @@ pub struct ReviewConfig {
     pub profiles: BTreeMap<String, BTreeMap<String, ProfileEntry>>,
     pub hostname: String,
     pub files: ConfigFiles,
+    /// This host's `[_projects.<host>]` registry, name -> path as written.
+    pub projects: BTreeMap<String, String>,
 }
 
 impl ReviewConfig {
@@ -361,10 +366,42 @@ fn global_config_path_from(xdg: Option<OsString>, home: Option<OsString>) -> Opt
     Some(base.join("review").join("config.toml"))
 }
 
+/// Where to look for the project's `.review.toml`.
+///
+/// The two cases are kept apart because they permit different things, and a
+/// bare directory would lose which one applies. `Discover` is the ambient
+/// rule - walk up to the git root - for the invoking directory and for an
+/// explicit `-C ./path`. `Exact` is a root that is already known to be the
+/// project, a registered name or a session's recorded root: its config must sit
+/// directly in it. Walking up from one would let a registered or recorded root
+/// whose config had gone adopt an ancestor's - another project's audit id and
+/// privacy setting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Selection {
+    Discover(PathBuf),
+    Exact(PathBuf),
+}
+
+impl Selection {
+    /// The invoking directory, walked up as `review` always has.
+    pub fn cwd() -> Result<Self> {
+        let dir = std::env::current_dir()
+            .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
+        Ok(Selection::Discover(dir))
+    }
+
+    /// The directory the selection starts from.
+    pub fn dir(&self) -> &std::path::Path {
+        match self {
+            Selection::Discover(d) | Selection::Exact(d) => d,
+        }
+    }
+}
+
 /// Load the project's `.review.toml` (required: it carries the audit id) and
 /// the global config (optional), and resolve them for this host.
-pub fn load() -> Result<(ReviewConfig, PathBuf)> {
-    let local_path = match locate_config()? {
+pub fn load(sel: &Selection) -> Result<(ReviewConfig, PathBuf)> {
+    let local_path = match locate_config(sel)? {
         Located::Found(path) => path,
         Located::Missing(why) => bail!("{why}"),
     };
@@ -377,30 +414,36 @@ pub fn load() -> Result<(ReviewConfig, PathBuf)> {
 /// does not parse still is - callers use this to decide things like whether a
 /// run's logs are private, and silently treating a broken config as an absent
 /// one would downgrade a private project to the public log.
-pub fn load_optional() -> Result<(ReviewConfig, Option<PathBuf>)> {
-    match locate_config()? {
+pub fn load_optional(sel: &Selection) -> Result<(ReviewConfig, Option<PathBuf>)> {
+    match locate_config(sel)? {
         Located::Found(path) => {
             let root = project_root_of(&path)?;
             Ok((load_layers(Some(path))?, Some(root)))
         }
+        // An exact root was chosen as the project; showing the global layer
+        // alone would describe a project that is not there.
+        Located::Missing(why) if matches!(sel, Selection::Exact(_)) => bail!("{why}"),
         Located::Missing(_) => Ok((load_layers(None)?, None)),
     }
 }
 
 /// The project root - the directory holding `.review.toml` - without parsing
 /// anything, for callers that only need to know which project they are in.
-pub fn project_root() -> Result<Option<PathBuf>> {
-    match locate_config()? {
+pub fn project_root(sel: &Selection) -> Result<Option<PathBuf>> {
+    match locate_config(sel)? {
         Located::Found(path) => Ok(Some(project_root_of(&path)?)),
         Located::Missing(_) => Ok(None),
     }
 }
 
+/// The root is canonicalized, so one checkout has one identity: it is what the
+/// sidecar and in-flight markers record and what `-C` and `review sessions`
+/// compare against, and a symlinked spelling must not split a project in two.
 fn project_root_of(local_path: &std::path::Path) -> Result<PathBuf> {
-    local_path
+    let parent = local_path
         .parent()
-        .map(std::path::Path::to_path_buf)
-        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", local_path.display()))
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", local_path.display()))?;
+    Ok(std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf()))
 }
 
 fn load_layers(local_path: Option<PathBuf>) -> Result<ReviewConfig> {
@@ -439,9 +482,22 @@ enum Located {
     Missing(String),
 }
 
-fn locate_config() -> Result<Located> {
-    let mut dir = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?;
+fn locate_config(sel: &Selection) -> Result<Located> {
+    let mut dir = match sel {
+        Selection::Exact(root) => {
+            let candidate = root.join(CONFIG_FILENAME);
+            return Ok(if candidate.exists() {
+                Located::Found(candidate)
+            } else {
+                Located::Missing(format!(
+                    "no {CONFIG_FILENAME} in {}\n\n\
+                     Run `review -C <project> init` to create one.",
+                    root.display()
+                ))
+            });
+        }
+        Selection::Discover(start) => start.clone(),
+    };
 
     loop {
         let candidate = dir.join(CONFIG_FILENAME);
@@ -501,6 +557,16 @@ pub fn parse_file(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile> {
             .try_into()
             .map_err(|e| anyhow::anyhow!("[_defaults] in {origin}: {e}"))?,
         None => DefaultsConfig::default(),
+    };
+    let projects: BTreeMap<String, BTreeMap<String, String>> = match table.remove("_projects") {
+        Some(_) if layer == Layer::Local => bail!(
+            "[_projects] in {origin}: the project registry maps names to this machine's \
+             checkouts, so it belongs in the global config, not in a project's {CONFIG_FILENAME}"
+        ),
+        Some(v) => v
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("[_projects] in {origin}: expected [_projects.<host>] tables of name = \"path\": {e}"))?,
+        None => BTreeMap::new(),
     };
     let archetypes: BTreeMap<String, String> = match table.remove("archetypes") {
         Some(v) => v
@@ -596,6 +662,7 @@ pub fn parse_file(raw: &str, origin: &str, layer: Layer) -> Result<ConfigFile> {
         defaults,
         profiles,
         hosts,
+        projects,
     })
 }
 
@@ -632,8 +699,14 @@ pub fn resolve(
     let mut providers: Option<Sourced<Vec<String>>> = None;
     let mut stall_timeout_secs: Option<Sourced<u64>> = None;
     let mut defs: BTreeMap<String, BTreeMap<String, Vec<ProfileDef>>> = BTreeMap::new();
+    let mut projects = BTreeMap::new();
 
-    for (layer, file) in layers {
+    for (layer, mut file) in layers {
+        // Only the global layer can carry one (`parse_file` refuses it locally).
+        if let Some(mine) = file.projects.remove(hostname) {
+            check_projects(&mine, hostname, layer.as_str())?;
+            projects = mine;
+        }
         for (name, prime) in file.archetypes {
             archetypes.entry(name).or_insert_with(|| Sourced {
                 value: prime,
@@ -776,7 +849,49 @@ pub fn resolve(
         profiles,
         hostname: hostname.to_string(),
         files: ConfigFiles::default(),
+        projects,
     })
+}
+
+/// This host's `[_projects.<host>]` registry from the global file alone,
+/// without a project config: `-C <name>` is resolved before anything knows
+/// which project to read. A global file that does not parse is an error here
+/// too, rather than "no such project".
+pub fn global_projects() -> Result<(BTreeMap<String, String>, Option<PathBuf>)> {
+    let Some(path) = global_config_path() else {
+        return Ok((BTreeMap::new(), None));
+    };
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((BTreeMap::new(), Some(path)));
+        }
+        Err(e) => bail!("failed to read {}: {e}", path.display()),
+    };
+    let mut file = parse_file(&raw, &path.display().to_string(), Layer::Global)?;
+    let host = hostname();
+    let mine = file.projects.remove(&host).unwrap_or_default();
+    check_projects(&mine, &host, "global")?;
+    Ok((mine, Some(path)))
+}
+
+/// Validate this host's registry. Only this host's: another machine's table is
+/// that machine's business, and a clash in it must not stop this one loading.
+fn check_projects(names: &BTreeMap<String, String>, host: &str, layer: &str) -> Result<()> {
+    let mut folded = std::collections::HashMap::new();
+    for name in names.keys() {
+        if let Err(why) = crate::project::check_name(name) {
+            bail!("[_projects.{}] ({layer} config): {why}", toml_key(host));
+        }
+        if let Some(prev) = folded.insert(name.to_ascii_lowercase(), name) {
+            bail!(
+                "[_projects.{}] ({layer} config): '{prev}' and '{name}' differ only in case, \
+                 and names match ignoring case",
+                toml_key(host)
+            );
+        }
+    }
+    Ok(())
 }
 
 const INIT_TEMPLATE_PREFIX: &str = "\
@@ -807,16 +922,17 @@ const INIT_TEMPLATE_PREFIX: &str = "\
 # sandbox = \"read-only\"
 ";
 
-pub fn init() -> Result<()> {
-    let path = std::env::current_dir()
-        .map_err(|e| anyhow::anyhow!("failed to get current directory: {e}"))?
-        .join(CONFIG_FILENAME);
+/// Create a starter config in the selected directory itself - never in an
+/// ancestor, whichever kind of selection it is.
+pub fn init(sel: &Selection) -> Result<()> {
+    let dir = sel.dir();
+    let path = dir.join(CONFIG_FILENAME);
 
     if path.exists() {
-        bail!("{CONFIG_FILENAME} already exists in current directory");
+        bail!("{CONFIG_FILENAME} already exists in {}", dir.display());
     }
 
-    if let Located::Found(existing) = locate_config()? {
+    if let Located::Found(existing) = locate_config(&Selection::Discover(dir.to_path_buf()))? {
         bail!(
             "{CONFIG_FILENAME} already exists at {}\n  \
              Creating another here would shadow it.",
@@ -830,7 +946,7 @@ pub fn init() -> Result<()> {
     std::fs::write(&path, content)
         .map_err(|e| anyhow::anyhow!("failed to write {CONFIG_FILENAME}: {e}"))?;
 
-    println!("Created {CONFIG_FILENAME}");
+    println!("Created {}", path.display());
     println!();
     println!("Next steps:");
     println!("  1. Run `review config` to see what the global config already provides");

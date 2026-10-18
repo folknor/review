@@ -504,6 +504,39 @@ model = \"global-host\"
         assert!(err.contains("global.toml"), "{err}");
     }
 
+    // ---- project registry ----------------------------------------------
+
+    #[test]
+    fn a_project_registry_in_a_project_file_errors() {
+        let err = parse_file("[_projects.h]\nbz = \"/b\"\n", "local.toml", Layer::Local)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[_projects]"), "{err}");
+    }
+
+    #[test]
+    fn only_this_hosts_registry_is_kept() {
+        let cfg = layered(
+            "",
+            "[_projects.h]\nbz = \"/b\"\n[_projects.other]\nx = \"/x\"\n",
+            "h",
+        )
+        .unwrap();
+        assert_eq!(cfg.projects.len(), 1);
+        assert_eq!(cfg.projects["bz"], "/b");
+    }
+
+    #[test]
+    fn another_hosts_registry_clash_does_not_break_this_host() {
+        let raw = "[_projects.other]\nFoo = \"/a\"\nfoo = \"/b\"\n\"./x\" = \"/x\"\n";
+        assert!(layered("", raw, "h").is_ok());
+        let err = layered("", raw, "other").unwrap_err().to_string();
+        assert!(
+            err.contains("differ only in case") || err.contains("path"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn the_resolved_audit_is_the_projects() {
         let cfg = layered(

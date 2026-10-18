@@ -9,6 +9,7 @@ mod inflight;
 mod input;
 mod interrupt_cmd;
 mod lock;
+mod project;
 mod prompt;
 mod provider;
 mod sessions;
@@ -18,7 +19,6 @@ mod watchdog;
 mod writable_roots;
 
 use anyhow::{Result, bail};
-use clap::Parser;
 
 use cli::Cli;
 
@@ -377,7 +377,7 @@ async fn main() -> Result<()> {
     // includes the stdin read and the global-lock wait: it is what the operator
     // waited, not just what the providers spent.
     let started = std::time::Instant::now();
-    let cli = Cli::parse();
+    let cli = Cli::parse_checked();
 
     // Forward SIGINT/SIGTERM to any running codex process groups before exiting.
     // codex runs in its own process group (so we can kill it and its children as
@@ -387,16 +387,37 @@ async fn main() -> Result<()> {
     // `provider::install_signal_supervisor` for why it cannot be per-run.
     provider::install_signal_supervisor();
 
+    // Refused before the registry is read, so `interrupt -C typo <ID>` reports
+    // the misuse rather than a lookup failure. These commands are host-wide or
+    // session-addressed with no project to assert, so accepting -C would
+    // suggest a scope restriction that does not exist.
+    if let Some(ref sel) = cli.project {
+        let refused = match &cli.command {
+            Some(cli::Command::Interrupt { .. }) => Some("review interrupt"),
+            Some(cli::Command::Incidents { .. }) => Some("review incidents"),
+            Some(cli::Command::Sessions {
+                id: None,
+                all: true,
+                ..
+            }) => Some("review sessions --all"),
+            _ => None,
+        };
+        if let Some(what) = refused {
+            bail!("-C {sel} does not apply to `{what}`, which is not scoped to a project");
+        }
+    }
+    let selector = cli.project.as_deref();
+
     if matches!(cli.command, Some(cli::Command::Init)) {
-        return config::init();
+        return config::init(&project::select(selector)?);
     }
 
     if matches!(cli.command, Some(cli::Command::Config)) {
-        return config_cmd::run();
+        return config_cmd::run(&project::select(selector)?);
     }
 
     if let Some(cli::Command::Message { id, dry_run }) = &cli.command {
-        return run_message(id, *dry_run, started).await;
+        return run_message(id, *dry_run, selector, started).await;
     }
 
     // Migration: `review resume` is `review message`, and runs as it - so it
@@ -404,7 +425,7 @@ async fn main() -> Result<()> {
     // than launching a second turn beside a running one.
     if let Some(cli::Command::Resume { id, dry_run }) = &cli.command {
         eprintln!("warning: `review resume <ID>` is now `review message <ID>`");
-        return run_message(id, *dry_run, started).await;
+        return run_message(id, *dry_run, selector, started).await;
     }
 
     if let Some(cli::Command::Interrupt { id }) = &cli.command {
@@ -413,8 +434,8 @@ async fn main() -> Result<()> {
 
     if let Some(cli::Command::Sessions { id, all, limit }) = &cli.command {
         return match id {
-            Some(sid) => run_session_show(sid),
-            None => run_sessions(*all, *limit),
+            Some(sid) => run_session_show(sid, selector),
+            None => run_sessions(*all, *limit, selector),
         };
     }
 
@@ -433,7 +454,7 @@ async fn main() -> Result<()> {
                  keeps its own provider and settings"
             );
         }
-        return run_message(session_id, cli.dry_run, started).await;
+        return run_message(session_id, cli.dry_run, selector, started).await;
     }
 
     let archetype_arg =
@@ -457,7 +478,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let (mut cfg, project_root) = config::load()?;
+    let (mut cfg, project_root) = config::load(&project::select(selector)?)?;
     let stdin_instructions = match early_stdin {
         Some(s) => s,
         None => input::read_stdin()?,
@@ -856,6 +877,70 @@ struct InheritedSettings {
     effort: Option<String>,
 }
 
+/// The project a message to `session_id` runs in, with its config: the one
+/// the session was started in, never the caller's directory.
+///
+/// The cwd used to decide it, so a message sent from another checkout ran the
+/// session there, under that checkout's audit id and privacy setting, and filed
+/// the row under it - after which the next resume inherited the misfiled row.
+/// Now the project comes from the session's record (or, for a fresh run still
+/// in flight, its marker) and `-C` can only confirm it.
+///
+/// Everything is checked before anything is interrupted: the recorded root
+/// must still exist and hold its `.review.toml` directly - every recorded run
+/// required one, so its absence is drift, and walking up instead would adopt an
+/// ancestor's audit id and privacy - and that config must parse. The audit id
+/// must match the record too: a path alone cannot tell the original checkout
+/// from another project initialized in its place.
+fn message_target(
+    session_id: &str,
+    record: Option<&sessions::SessionRecord>,
+    marker_project: Option<&str>,
+    selector: Option<&str>,
+) -> Result<(config::ReviewConfig, std::path::PathBuf)> {
+    let recorded = match (record.map(|r| r.project.as_str()), marker_project) {
+        (Some(r), Some(m)) if !project::same_project(r, std::path::Path::new(m)) => bail!(
+            "session {session_id} is recorded in {r} but its turn in flight runs in {m}\n  \
+             Refusing to guess which project the message belongs to."
+        ),
+        (Some(p), _) | (None, Some(p)) => p,
+        (None, None) => bail!(
+            "no record of session {session_id} on this host\n  \
+             `review sessions` lists the sessions this host's review runs created."
+        ),
+    };
+    let root = std::path::PathBuf::from(recorded);
+    if !root.is_dir() {
+        bail!(
+            "session {session_id} belongs to {recorded}, which no longer exists\n  \
+             `review sessions {session_id}` still shows what it recorded."
+        );
+    }
+    if let Some(sel) = selector {
+        let selected = selected_root(sel)?;
+        if !project::same_project(recorded, &selected) {
+            bail!(
+                "session {session_id} belongs to {recorded}, not {} (-C {sel})",
+                selected.display()
+            );
+        }
+    }
+    let (cfg, root) = config::load(&config::Selection::Exact(root))?;
+    if let Some(rec) = record
+        && !rec.audit_id.is_empty()
+        && cfg.audit.id.as_deref() != Some(rec.audit_id.as_str())
+    {
+        bail!(
+            "session {session_id} was recorded under audit id {} but {} now has {}\n  \
+             The checkout at that path is not the project the session was started in.",
+            rec.audit_id,
+            root.display(),
+            cfg.audit.id.as_deref().unwrap_or("none")
+        );
+    }
+    Ok((cfg, root))
+}
+
 /// `review message <id>`: deliver stdin to a session whatever it is doing. A
 /// codex or claude turn in flight is ended first, exactly as `review interrupt`
 /// ends it, and the message then continues the session as a resume.
@@ -865,7 +950,12 @@ struct InheritedSettings {
 /// agent", an orchestrating Claude reached for its own task-stop tool instead -
 /// killing `review` rather than the turn, which left a fresh session with no
 /// record to resume. "Message the agent" has no such rival.
-async fn run_message(session_id: &str, dry_run: bool, started: std::time::Instant) -> Result<()> {
+async fn run_message(
+    session_id: &str,
+    dry_run: bool,
+    selector: Option<&str>,
+    started: std::time::Instant,
+) -> Result<()> {
     // Read before interrupting anything: a missing message must not cost the
     // turn in flight.
     let instructions = input::read_stdin()?;
@@ -882,7 +972,29 @@ async fn run_message(session_id: &str, dry_run: bool, started: std::time::Instan
             .await
             .map_err(|e| anyhow::anyhow!("launch lock task failed: {e}"))??
     };
-    if !dry_run && let Some(marker) = inflight::live_marker(session_id, None) {
+    // Read on a dry run too: the marker can name the project (a fresh run
+    // still in flight has no row yet) or contradict the row, and a preview
+    // that skipped it would pass what the real message refuses.
+    let marker = inflight::live_marker(session_id, None);
+    let record = sessions::latest_for_session(session_id);
+    // Under the launch lock, before any signal: a message bound for the wrong
+    // project, or one whose project config is broken, must not cost the turn.
+    let (target_cfg, target_root) = message_target(
+        session_id,
+        record.as_ref(),
+        marker.as_ref().map(|m| m.project.as_str()),
+        selector,
+    )?;
+    if dry_run && record.is_none() {
+        // Only a marker so far: nothing to inherit or age-check yet, so the
+        // preview is the message itself.
+        eprintln!("session: {session_id} (turn in flight, not yet recorded)");
+        eprintln!("project: {}", target_root.display());
+        println!("{instructions}");
+        return Ok(());
+    }
+    let expected = (target_root, target_cfg.audit.id);
+    if let Some(marker) = marker.filter(|_| !dry_run) {
         if !interrupt_cmd::interruptible(&marker.provider) {
             bail!(
                 "session {session_id} has a {} turn in flight, which cannot be interrupted\n  \
@@ -902,9 +1014,11 @@ async fn run_message(session_id: &str, dry_run: bool, started: std::time::Instan
     run_session_resume(
         session_id,
         dry_run,
+        selector,
         started,
         Some(instructions),
         launch_lock,
+        Some(expected),
     )
     .await
 }
@@ -917,11 +1031,14 @@ async fn run_message(session_id: &str, dry_run: bool, started: std::time::Instan
 async fn run_session_resume(
     session_id: &str,
     dry_run: bool,
+    selector: Option<&str>,
     started: std::time::Instant,
     instructions: Option<String>,
     // `review message`'s per-session lock, released with the global lock once
     // the run has launched (see `run_message`).
     launch_lock: Option<inflight::LaunchLock>,
+    // The project and audit id `run_message` validated before interrupting.
+    expected: Option<(std::path::PathBuf, Option<String>)>,
 ) -> Result<()> {
     // Looked up once and reused by the cache-age gate and inheritance below.
     let record = resume_record(session_id, sessions::latest_for_session(session_id))?;
@@ -933,16 +1050,25 @@ async fn run_session_resume(
         Some(text) => text,
         None => input::read_stdin()?,
     };
-    // Loaded once, and a config that exists but does not parse is an error
-    // rather than treated as absent: it decides whether this resume's rows go
-    // to the private log, and a silent fallback would file a private project's
-    // turns in the public one. No `.review.toml` at all still works - a resume
-    // needs no prime or profile - with the rows keyed to the cwd.
-    let (cfg, found_root) = config::load_optional()?;
-    let project_root = match found_root {
-        Some(ref root) => root.clone(),
-        None => std::env::current_dir()?,
-    };
+    // Checked again on the record as it is now: an interrupted fresh run has
+    // only just written its first row, which `run_message` could not see. The
+    // config decides whether this resume's rows go to the private log, so one
+    // that does not parse is an error, never treated as absent.
+    let (cfg, project_root) = message_target(session_id, Some(&record), None, selector)?;
+    // And it must still be the project validated before the interrupt: the
+    // row the interrupted run wrote is checked against its own config above,
+    // which on its own would accept a row naming some other valid project.
+    if let Some((root, audit)) = expected
+        && (root != project_root || audit != cfg.audit.id)
+    {
+        bail!(
+            "session {session_id} now records {} (audit id {}), not {} as it did before \
+             the interrupt\n  Nothing was sent.",
+            project_root.display(),
+            cfg.audit.id.as_deref().unwrap_or("none"),
+            root.display()
+        );
+    }
 
     if dry_run {
         eprintln!("session: {session_id}");
@@ -1058,24 +1184,17 @@ async fn run_session_resume(
         }
     };
 
-    // Resolve audit_id/private for the logs, persisting a generated id when a
-    // project config exists. Without one, logging still happens - otherwise a
-    // successful resume in a config-less dir would never be recorded and would
-    // soon be refused as stale.
-    let (audit_id, private) = match found_root {
-        Some(ref root) => {
-            let id = match cfg.audit.id.clone() {
-                Some(id) => id,
-                None => {
-                    let id = config::generate_short_id();
-                    let _ = config_write::append_audit_id(&root.join(".review.toml"), &id);
-                    id
-                }
-            };
-            (id, cfg.audit.private)
+    // The audit id is persisted when the config lacks one, which only a row
+    // recorded without an id can reach (`message_target` matched the rest).
+    let audit_id = match cfg.audit.id.clone() {
+        Some(id) => id,
+        None => {
+            let id = config::generate_short_id();
+            let _ = config_write::append_audit_id(&project_root.join(".review.toml"), &id);
+            id
         }
-        None => (config::generate_short_id(), false),
     };
+    let private = cfg.audit.private;
 
     let digest_summary = result.digest.as_ref().map(provider::Digest::summary);
     audit::log_result(
@@ -1198,7 +1317,11 @@ fn run_incidents(limit: usize) -> Result<()> {
 /// on-disk codex rollout transcript (the authoritative record), and the final
 /// response. This is the on-demand form of the post-mortem that a suspicious
 /// run prints inline - reachable for any past session by ID.
-fn run_session_show(session_id: &str) -> Result<()> {
+///
+/// The session names its own project, so the caller's directory plays no part
+/// and a checkout that has since been deleted still shows. `-C` is an
+/// assertion that the session belongs to the selected project.
+fn run_session_show(session_id: &str, selector: Option<&str>) -> Result<()> {
     let mut records: Vec<sessions::SessionRecord> = sessions::read_all()
         .into_iter()
         .filter(|r| r.session_id == session_id)
@@ -1211,6 +1334,16 @@ fn run_session_show(session_id: &str) -> Result<()> {
     }
     records.sort_by_key(|r| r.epoch_secs);
     let latest = records.last().expect("non-empty");
+    if let Some(sel) = selector {
+        let selected = selected_root(sel)?;
+        if !project::same_project(&latest.project, &selected) {
+            bail!(
+                "session {session_id} belongs to {}, not {} (-C {sel})",
+                latest.project,
+                selected.display()
+            );
+        }
+    }
 
     let now = provider::now_epoch_secs();
     // `format_age` says "now" under a minute, which does not take "ago".
@@ -1368,17 +1501,23 @@ fn digest_summary_note(d: &provider::DigestSummary) -> Option<String> {
 /// `review sessions` - aggregate sidecar records by session_id and print
 /// recent sessions with their age, provider, archetype, touch count, and the
 /// prompt that opened them. Filtered to the current project unless `--all`.
-fn run_sessions(all: bool, limit: usize) -> Result<()> {
-    let project_filter: Option<String> = if all {
+fn run_sessions(all: bool, limit: usize, selector: Option<&str>) -> Result<()> {
+    let project_filter: Option<std::path::PathBuf> = if all {
         None
     } else {
-        // Only which project we are in matters here, so nothing is parsed: a
-        // broken global config must not stop the operator listing sessions.
-        let root = match config::project_root()? {
+        // Only which project we are in matters here, so no project config is
+        // parsed: a broken one must not stop the operator listing sessions.
+        // (A registered `-C` name does read the global file, to find it.)
+        let sel = project::select(selector)?;
+        Some(match config::project_root(&sel)? {
             Some(root) => root,
-            None => std::env::current_dir()?,
-        };
-        Some(root.to_string_lossy().into_owned())
+            None => sel.dir().to_path_buf(),
+        })
+    };
+    let in_filter = |p: &str| {
+        project_filter
+            .as_ref()
+            .is_none_or(|root| project::same_project(p, root))
     };
 
     // Runs that are happening *right now*. The sidecar is only written when a
@@ -1388,9 +1527,7 @@ fn run_sessions(all: bool, limit: usize) -> Result<()> {
     // watchdog, that ambiguity is what made a wedged 10-hour run look like
     // nothing was happening at all.
     let mut live = inflight::read_live(None);
-    if let Some(ref proj) = project_filter {
-        live.retain(|m| &m.project == proj);
-    }
+    live.retain(|m| in_filter(&m.project));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1416,9 +1553,7 @@ fn run_sessions(all: bool, limit: usize) -> Result<()> {
             continue;
         }
         let project = sessions::latest_for_session(&sid).map(|r| r.project);
-        if let Some(ref proj) = project_filter
-            && project.as_ref() != Some(proj)
-        {
+        if project_filter.is_some() && !project.as_deref().is_some_and(in_filter) {
             continue;
         }
         println!("[queued] message waiting to launch");
@@ -1430,9 +1565,7 @@ fn run_sessions(all: bool, limit: usize) -> Result<()> {
     }
 
     let mut records = sessions::read_all();
-    if let Some(ref proj) = project_filter {
-        records.retain(|r| &r.project == proj);
-    }
+    records.retain(|r| in_filter(&r.project));
 
     if records.is_empty() {
         if live.is_empty() {
@@ -1502,6 +1635,20 @@ fn run_sessions(all: bool, limit: usize) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The project root `-C <sel>` names: a registered root as it stands, a path
+/// walked up to its `.review.toml`.
+fn selected_root(sel: &str) -> Result<std::path::PathBuf> {
+    match project::select(Some(sel))? {
+        config::Selection::Exact(dir) => Ok(dir),
+        discover => config::project_root(&discover)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "-C {sel}: no .review.toml at or above {}",
+                discover.dir().display()
+            )
+        }),
+    }
 }
 
 fn first_line_truncated(s: &str, max_chars: usize) -> String {
