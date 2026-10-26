@@ -81,9 +81,11 @@ a run that was interrupted, are never auto-resumed (see `review man failures`).
 
 `0` when at least one run produced an answer and nothing any run started is
 still running, and for a `--dry-run`. `1` when no run produced an answer -
-including runs that died, stalled, stated a failure or were interrupted - when
-anything was left running (see `review man failures`), and on any error before
-launch. `2` for invalid arguments, and
+including runs that died, stalled, stated a failure or were interrupted - and
+on any error before launch. `3` when anything a run started was left running,
+or its teardown could not be confirmed, whatever the answers were (see
+`review man failures`): it outranks `1`, because those processes may still be
+changing the tree and need checking first. `2` for invalid arguments, and
 for bare `review` with nothing on stdin. A run that failed still prints its session ID when the
 provider created one, so it can be inspected (`review sessions <ID>`) or
 continued.

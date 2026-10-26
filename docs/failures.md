@@ -1,7 +1,7 @@
 # Why a run failed
 
-A run exits `1` when no provider produced an answer, or when something it
-started was left running (see the section below). Most failures still print
+A run exits `1` when no provider produced an answer, and `3` when something it
+started was left running (see the section below), whatever the answers were. Most failures still print
 a session ID and a digest, because the session exists and can be inspected or
 continued. Read the digest top down:
 
@@ -73,7 +73,7 @@ background commands, daemons, shells in sessions of their own - is ended before
 record (`leftovers`) and never printed.
 
 What could not be ended is printed above the `runtime:` line, and the command
-exits `1` even if every run answered:
+exits `3` even if every run answered:
 
 - `left running: N processes <run> started survived teardown`, then one line per
   process with its pid and command line. `at least N` means more remain that

@@ -61,7 +61,9 @@ When a run ends, whatever its agent left running (background commands, daemons,
 shells in sessions of their own) is ended before `review` reports. That is
 recorded and never printed. Anything that could not be ended is printed above
 the `runtime:` line as `left running:` with its pids and command lines, or
-`teardown outcome unknown:`, and the exit status is 1 whatever the answers were.
+`teardown outcome unknown:`, and the exit status is 3 whatever the answers were:
+those processes may still be changing the tree, so check them before starting
+more work there.
 
 Examples:
   echo \"what does foo() do?\" | review -p deep          Plain prompt, 'deep' profile
@@ -99,8 +101,8 @@ last touched more than 27 minutes ago (codex) or 55 minutes ago (claude, grok)
 is refused. When that happens, start a fresh run and restate the context the
 new session needs.
 
-The exit status is 1 if the turn produced no answer, or if anything it started
-was left running. A session whose earlier `review` is gone while that run's
+The exit status is 1 if the turn produced no answer, and 3 if anything it
+started was left running (which outranks 1). A session whose earlier `review` is gone while that run's
 processes are still being torn down is refused until they are.";
 
 const INTERRUPT_AFTER_HELP: &str = "\

@@ -784,13 +784,14 @@ pub async fn run() -> Result<()> {
     // id + digest survive), but it is a failure for exit-code purposes - a dead
     // review that exits 0 lies to scripts and CI. Count it as failed.
     //
-    // Leftovers are a separate verdict across every invocation: one provider's
-    // answer cannot excuse another's processes still running.
+    // Leftovers are a separate verdict across every invocation, and outrank
+    // it: one provider's answer cannot excuse another's processes still
+    // running.
     let all_failed = results
         .iter()
         .all(|(_, r)| r.output.is_err() || died_without_answer(r));
-    if all_failed || left_running {
-        std::process::exit(1);
+    if let Some(code) = exit_status(all_failed, left_running) {
+        std::process::exit(code);
     }
 
     Ok(())
@@ -1291,12 +1292,33 @@ async fn run_session_resume(
     // A stalled or dead resume comes back as `Ok` (so its session id, digest and
     // incident survive), but it is a failure for exit-code purposes - exiting 0
     // on a wedged run lies to scripts and CI, exactly as it did on the fan-out
-    // path before this was fixed there. So is anything left running.
-    if result.output.is_err() || died_without_answer(&result) || left_running {
-        std::process::exit(1);
+    // path before this was fixed there. Anything left running outranks it.
+    if let Some(code) = exit_status(
+        result.output.is_err() || died_without_answer(&result),
+        left_running,
+    ) {
+        std::process::exit(code);
     }
     Ok(())
 }
+
+/// Exit status for a finished run or message: `3` when anything it started was
+/// left running or its teardown could not be confirmed, `1` when no answer was
+/// produced, else none (exit 0). Leftovers win: a failed run is retried or
+/// resumed, but with its processes possibly still changing the tree, the
+/// first thing to do is check them, and `3` says so whatever the answers were.
+fn exit_status(no_answer: bool, left_running: bool) -> Option<i32> {
+    if left_running {
+        Some(EXIT_LEFT_RUNNING)
+    } else if no_answer {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// See `exit_status`.
+const EXIT_LEFT_RUNNING: i32 = 3;
 
 /// Print what is still running, or may be, from every invocation this
 /// `review` made (see `contained`), whichever results were reported. Returns
@@ -2009,6 +2031,14 @@ mod tests {
             after_run("codex", &codex_run("s", false, false)),
             AfterRun::AutoResume("s".into())
         );
+    }
+
+    #[test]
+    fn leftovers_outrank_a_missing_answer_in_the_exit_status() {
+        assert_eq!(exit_status(false, false), None);
+        assert_eq!(exit_status(true, false), Some(1));
+        assert_eq!(exit_status(false, true), Some(3));
+        assert_eq!(exit_status(true, true), Some(3));
     }
 
     #[test]

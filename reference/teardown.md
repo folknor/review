@@ -153,7 +153,8 @@ dropped count), what survived, whether enumeration was incomplete, or why the
 outcome is unknown. Cleanly killed leftovers are recorded and never printed:
 nobody can act on them, and nothing explains why an agent left them. Survivors
 and unknown outcomes are printed, every survivor named, before the `runtime:`
-line, and fail the command. A codex death with a non-clean teardown is not
+line, and the command exits 3, which outranks the 1 of a run with no answer
+(`app::exit_status`). A codex death with a non-clean teardown is not
 auto-resumed.
 
 The signal supervisor terminates every live keeper on its way out, closes

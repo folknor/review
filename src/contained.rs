@@ -6,7 +6,7 @@
 //! Three process-wide records hang off it:
 //!
 //! - the ledger: one verdict per invocation, whichever answer is reported. The
-//!   exit status reads it, so a run whose teardown failed fails the command even
+//!   exit status reads it (exit 3), so a run whose teardown failed fails the command even
 //!   when an auto-resume, a grok wake or another provider in the fan-out
 //!   produced the answer;
 //! - the registry of live keepers, which the signal supervisor terminates and
