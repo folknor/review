@@ -1,6 +1,7 @@
 # Why a run failed
 
-A run exits `1` when no provider produced an answer. Most failures still print
+A run exits `1` when no provider produced an answer, or when something it
+started was left running (see the section below). Most failures still print
 a session ID and a digest, because the session exists and can be inspected or
 continued. Read the digest top down:
 
@@ -63,6 +64,35 @@ filed. The session can be messaged to continue.
 The digest is flagged interrupted, the run exits `1`, and it is never
 auto-resumed or filed as an incident. If the provider finished before the
 interrupt landed, the answer stands and the run succeeds.
+
+## Processes left running
+
+Whatever a run's agent started that is still running when the run ends -
+background commands, daemons, shells in sessions of their own - is ended before
+`review` reports, however the run ended. That is recorded in the run's session
+record (`leftovers`) and never printed.
+
+What could not be ended is printed above the `runtime:` line, and the command
+exits `1` even if every run answered:
+
+- `left running: N processes <run> started survived teardown`, then one line per
+  process with its pid and command line. `at least N` means more remain that
+  could not be identified.
+- `teardown outcome unknown: <run> (keeper pid N) - <reason>`: `review` could
+  not confirm the teardown, so processes the run started may still be running;
+  any it knew to have survived are listed under it.
+
+Either way the run's processes may still be changing the tree. Check them
+before starting more work there. A codex death in this state is not
+auto-resumed.
+
+This also ends daemons an agent started and left behind (a build cache server,
+a build tool's daemon), which the next run that needs them starts again.
+
+When `review` is signalled, the same report goes to stderr before it exits. If
+`review` is killed outright, what its runs started is still torn down, but
+nothing is printed; the outcome is appended to `teardowns.jsonl` (or
+`teardowns-private.jsonl`) beside the session logs, best-effort.
 
 ## Before anything launched
 

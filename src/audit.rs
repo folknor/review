@@ -16,6 +16,10 @@ struct AuditEntry {
     /// Absent for providers without a machine-readable stream (claude).
     #[serde(skip_serializing_if = "Option::is_none")]
     digest: Option<crate::provider::DigestSummary>,
+    /// What the run's processes left behind (see `contained::Leftovers`);
+    /// absent when nothing was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leftovers: Option<crate::contained::Leftovers>,
 }
 
 fn audit_dir(project_root: &Path, private: bool, audit_id: &str) -> Option<std::path::PathBuf> {
@@ -54,6 +58,7 @@ pub fn log_result(
     prompt: &str,
     result: &Result<String>,
     digest: Option<&crate::provider::DigestSummary>,
+    leftovers: &crate::contained::Leftovers,
 ) {
     let dir = match audit_dir(project_root, private, audit_id) {
         Some(d) => d,
@@ -79,6 +84,7 @@ pub fn log_result(
         response: result.as_ref().ok().cloned(),
         error: result.as_ref().err().map(ToString::to_string),
         digest: digest.cloned(),
+        leftovers: (!leftovers.is_empty()).then(|| leftovers.clone()),
     };
 
     let line = match serde_json::to_string(&entry) {

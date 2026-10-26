@@ -28,9 +28,12 @@
 //!
 //! Removal is best-effort: `Drop` covers normal returns, errors and panics, but
 //! not `SIGKILL` of `review` itself. Each marker therefore records the `review`
-//! pid that owns it, and readers treat a marker whose pid is gone as stale
-//! rather than as a live turn. Every failure in here warns and continues - a
-//! liveness hint must never be able to derail an actual run.
+//! that owns it (pid and start time, so a reused pid is not mistaken for it),
+//! and readers treat a marker whose owner is gone as stale rather than as a
+//! live turn - unless the run's keeper is still alive, tearing down what the
+//! run started, in which case the marker reads as cleanup pending until it is
+//! not. Every failure in here warns and continues - a liveness hint must never
+//! be able to derail an actual run.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -56,6 +59,44 @@ pub struct Marker {
     /// Empty in markers written before the field existed.
     #[serde(default)]
     pub run_id: String,
+    /// Start time (`/proc/<pid>/stat` field 22) of the owning `review`, so a
+    /// reused pid is not taken for it. Absent in older markers, which fall back
+    /// to a bare existence check.
+    #[serde(default)]
+    pub pid_start: Option<u64>,
+    /// The run's keeper (see `keeper`) and its start time, recorded before the
+    /// provider launches. While the owner is gone but the keeper lives, the
+    /// run's processes are still being torn down.
+    #[serde(default)]
+    pub keeper: Option<u32>,
+    #[serde(default)]
+    pub keeper_start: Option<u64>,
+    /// Set by `read_live`, never stored: the owning `review` is gone and its
+    /// keeper is still tearing the run down. Nothing may launch on the session
+    /// or interrupt it until that ends.
+    #[serde(skip)]
+    pub cleanup_pending: bool,
+}
+
+/// Whether the process recorded as `pid` with start time `start` is alive.
+/// Through a pidfd: opened first, the start time read after, then the pidfd
+/// checked still unexited, so the start time read was this process's. A zombie
+/// leader whose other threads still run counts as alive, which its `/proc`
+/// state would not.
+pub fn identity_alive(pid: u32, start: Option<u64>) -> bool {
+    let Some(start) = start else {
+        return pid_alive(pid);
+    };
+    let Ok(pidfd) = crate::keeper::pidfd_open(pid) else {
+        return false;
+    };
+    crate::keeper::stat_ppid_start(pid).is_some_and(|(_, s)| s == start)
+        && !crate::keeper::pidfd_exited(&pidfd)
+}
+
+/// This process's start time, for its markers.
+fn own_start() -> Option<u64> {
+    crate::keeper::stat_ppid_start(std::process::id()).map(|(_, s)| s)
 }
 
 /// Where markers live. `data_root` overrides the real XDG location and exists so
@@ -129,6 +170,20 @@ impl Drop for Guard {
 }
 
 impl Guard {
+    /// Record the run's keeper. Called before the keeper is told to launch,
+    /// so a marker whose owner dies mid-run always says who is cleaning up.
+    pub fn record_keeper(&mut self, keeper: u32) {
+        if let Some((path, marker)) = self.0.as_mut()
+            && still_ours(path, marker)
+        {
+            marker.keeper = Some(keeper);
+            marker.keeper_start = crate::keeper::stat_ppid_start(keeper).map(|(_, s)| s);
+            if let Err(e) = write_marker(path, marker) {
+                eprintln!("warning: failed to update inflight marker: {e}");
+            }
+        }
+    }
+
     /// Offer the provider's pid to `review interrupt`, once it is safe to
     /// signal (see `run_codex_json`). Best-effort like the rest of the marker,
     /// and skipped if another run has since taken the marker over (see `Guard`).
@@ -200,6 +255,10 @@ pub fn mark(session_id: &str, provider: &str, project: &str, data_root: Option<&
         // Offered later, once it is safe to signal - see `Guard::record_child_pid`.
         child_pid: None,
         run_id: crate::config::generate_uuid(),
+        pid_start: own_start(),
+        keeper: None,
+        keeper_start: None,
+        cleanup_pending: false,
     };
     if let Err(e) = write_marker(&path, &marker) {
         eprintln!("warning: failed to write inflight marker: {e}");
@@ -237,10 +296,18 @@ pub fn read_live(data_root: Option<&Path>) -> Vec<Marker> {
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(marker) = serde_json::from_str::<Marker>(&content) else {
+        let Ok(mut marker) = serde_json::from_str::<Marker>(&content) else {
             continue;
         };
-        if pid_alive(marker.pid) {
+        if identity_alive(marker.pid, marker.pid_start) {
+            out.push(marker);
+        } else if marker
+            .keeper
+            .is_some_and(|k| identity_alive(k, marker.keeper_start))
+        {
+            // The owner is gone but its keeper is still tearing the run down;
+            // the marker stays until the keeper is gone too.
+            marker.cleanup_pending = true;
             out.push(marker);
         } else {
             let _ = std::fs::remove_file(&path);
@@ -482,6 +549,10 @@ mod tests {
             pid: std::process::id(),
             child_pid: None,
             run_id: "another-run".to_string(),
+            pid_start: None,
+            keeper: None,
+            keeper_start: None,
+            cleanup_pending: false,
         };
         write_marker(&path, &second).expect("second marker");
         drop(first);
@@ -574,6 +645,51 @@ mod tests {
         rx.recv_timeout(std::time::Duration::from_secs(5))
             .expect("the second proceeds once the first has launched");
         waiter.join().expect("join");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_marker_whose_owner_is_gone_but_keeper_lives_is_cleanup_pending() {
+        let root = scratch_root();
+        let me = std::process::id();
+        let start = own_start();
+        let write = |sid: &str, keeper: Option<u32>| {
+            let marker = Marker {
+                session_id: sid.to_string(),
+                provider: "codex".to_string(),
+                project: "/p".to_string(),
+                started_epoch: 0,
+                // Our own pid with a start time that is not ours: an owner
+                // whose pid has been reused, so gone.
+                pid: me,
+                child_pid: None,
+                run_id: sid.to_string(),
+                pid_start: start.map(|s| s + 1),
+                keeper,
+                keeper_start: start,
+                cleanup_pending: false,
+            };
+            let path = dir(Some(&root)).expect("dir").join(format!("{sid}.json"));
+            std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            write_marker(&path, &marker).expect("write");
+            path
+        };
+        let pending = "019fefb0-227c-7c83-a398-380011b8e671";
+        let stale = "019fefb0-227c-7c83-a398-380011b8e672";
+        let pending_path = write(pending, Some(me));
+        let stale_path = write(stale, None);
+        let live = read_live(Some(&root));
+        assert!(
+            live.iter()
+                .any(|m| m.session_id == pending && m.cleanup_pending),
+            "a live keeper keeps the marker, as cleanup pending"
+        );
+        assert!(pending_path.exists());
+        assert!(
+            !live.iter().any(|m| m.session_id == stale),
+            "no owner and no keeper: stale"
+        );
+        assert!(!stale_path.exists(), "and removed");
         let _ = std::fs::remove_dir_all(&root);
     }
 

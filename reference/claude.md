@@ -127,13 +127,15 @@ resumable session but printed nothing (exit 143), so nothing could be recorded
 from it; that is why the graceful path sends `SIGINT`.
 
 The mechanics are codex's ([codex.md](codex.md#interrupting-a-run)), minus the
-node wrapper: claude runs in its own process group, registered with the signal
-supervisor; its in-flight marker names claude's pid once claude has printed its
-first event (a `SIGINT` before its handler is installed would kill it with
-nothing printed); `review interrupt` leaves a request beside the marker and
-signals that pid alone; and a signalled `review` sends it `SIGINT` too, waiting
-for the run to record its session before exiting. A run that had produced no
-first event is killed with its group instead, and reported as never started,
+node wrapper: claude runs under a keeper ([teardown.md](teardown.md)), which
+gives it a process group of its own and tears down every shell it started when
+the run ends; its in-flight marker names the keeper's pid once claude has
+printed its first event (a `SIGINT` before its handler is installed would kill
+it with nothing printed); `review interrupt` leaves a request beside the marker
+and signals the keeper, which forwards one `SIGINT` to claude alone; and a
+signalled `review` has the keeper send it `SIGINT` too, waiting for the run to
+record its session before exiting. A run that had produced no first event is
+torn down by its keeper instead, and reported as never started,
 with no session ID: claude cannot have written one, and recording it would
 print a resume command that fails. A run that has not spawned yet when `review`
 is told to stop - still waiting on the lock or its stagger - is not launched at
@@ -153,7 +155,7 @@ interrupts it. As a second line of defence, a run removes or updates the shared
 marker only while it is still the one it wrote, so two runs of one session could
 not hide each other even if they met.
 
-`src/provider_tests.rs` drives the real `run_claude` against a stub claude
+`tests/provider_runs.rs` drives the real `run_claude` against a stub claude
 (`ProviderRuntime::claude_command`) for each of these: the interrupt, an answer
 beating it, a stop after and before the first event, a refused launch after a
 stop, a death after starting, and a stale request before a resume.

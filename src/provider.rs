@@ -18,7 +18,7 @@ pub fn is_available(provider: &str) -> bool {
 /// (`create_new`) makes collisions between concurrent runs impossible and
 /// defeats symlink pre-planting on what used to be a predictable pid+archetype
 /// path. The file is created empty; codex overwrites it with the final message.
-fn new_output_file() -> Result<String> {
+pub fn new_output_file() -> Result<String> {
     new_temp_file("codex")
 }
 
@@ -302,32 +302,6 @@ async fn read_capped_stdout<R>(
     }
 }
 
-/// Process groups of codex and claude children currently running under this
-/// `review`.
-///
-/// Needed because both are spawned into their *own* process group (see
-/// `run_codex_json`, `run_claude`), so a terminal `SIGINT` no longer reaches
-/// them implicitly and a `SIGTERM` aimed at `review` never did. Without explicit
-/// forwarding, killing `review` leaves the provider running detached - observed
-/// in the field with codex, where the abandoned run kept working and editing the
-/// tree for hours after its operator thought it had been stopped.
-static PROVIDER_GROUPS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> =
-    std::sync::Mutex::new(None);
-
-fn register_group(pid: u32) {
-    if let Ok(mut guard) = PROVIDER_GROUPS.lock() {
-        guard.get_or_insert_with(Default::default).insert(pid);
-    }
-}
-
-fn unregister_group(pid: u32) {
-    if let Ok(mut guard) = PROVIDER_GROUPS.lock()
-        && let Some(set) = guard.as_mut()
-    {
-        set.remove(&pid);
-    }
-}
-
 /// Set once by the signal supervisor: codex runs end their turn the way `review
 /// interrupt` ends one, and nothing new launches. See `install_signal_supervisor`.
 static STOP: std::sync::OnceLock<tokio::sync::watch::Sender<bool>> = std::sync::OnceLock::new();
@@ -389,8 +363,14 @@ impl Drop for Unrecorded {
 /// to the kill below, which forfeits the digest and the row; the rollout
 /// transcript is on disk regardless, for `review sessions <id>`.
 ///
+/// Either way `review` then terminates every keeper still running (grok runs,
+/// and whatever the graceful stop did not end), waits for their teardowns up to
+/// `contained::Settings::terminate_bound`, and reports anything left running or
+/// unaccounted for before it exits. A keeper still tearing down at that bound
+/// is named as such; it finishes on its own, writing to the orphan log.
+///
 /// `SIGKILL` cannot be caught, so a stop that sends only that still loses the
-/// row, and orphans codex.
+/// row. The keepers see their control pipes close and tear down regardless.
 pub fn install_signal_supervisor() {
     let mut sigterm =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
@@ -426,79 +406,40 @@ pub fn install_signal_supervisor() {
                 }
             };
             tokio::select! {
-                () = graceful => std::process::exit(exit_code),
+                () = graceful => {}
                 () = tokio::time::sleep(crate::timings::GRACEFUL_STOP) => {
-                    eprintln!("a turn did not end in time; killing what is left");
+                    eprintln!("a turn did not end in time; tearing down what is left");
                 }
                 _ = next_signal() => {}
             }
         }
-        // Snapshot and release the lock before signalling; never hold it across
-        // the kills.
-        let pids: Vec<u32> = PROVIDER_GROUPS
-            .lock()
-            .ok()
-            .and_then(|g| g.as_ref().map(|s| s.iter().copied().collect()))
-            .unwrap_or_default();
-        if !pids.is_empty() {
-            eprintln!(
-                "\n{name}: terminating {} running provider process group(s)",
-                pids.len()
-            );
+        // No keeper spawns from here, and every live one tears down its run.
+        let told = crate::contained::terminate_all();
+        if told > 0 {
+            eprintln!("\n{name}: tearing down {told} running provider(s)");
         }
-        let pids_to_kill = pids.clone();
-        for pid in pids {
-            terminate_group(pid, crate::timings::SIGKILL_ESCALATION);
-        }
-        // Give SIGTERM a brief moment to land before we go; the escalation to
-        // SIGKILL inside `terminate_group` dies with us, so this is the only
-        // window codex gets to shut down cleanly.
-        tokio::time::sleep(crate::timings::SIGTERM_WINDOW).await;
-        // SIGKILL the *original* snapshot, deliberately not a fresh read of the
-        // registry. If codex exits promptly on SIGTERM its waiter unregisters
-        // the group, so a re-read would omit precisely the case that matters: a
-        // descendant that ignored SIGTERM and is still alive in that group.
-        // `process::exit` below cancels `terminate_group`'s deferred escalation,
-        // making this the last chance to reap them.
-        for pid in pids_to_kill {
-            if let Ok(pid) = i32::try_from(pid) {
-                // SAFETY: negative pid addresses the process group; codex was
-                // spawned with `process_group(0)` so this cannot reach `review`.
-                unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
-                }
+        let bound = crate::contained::Settings::default().terminate_bound();
+        let drained = async {
+            while !crate::contained::live_keepers().is_empty() {
+                tokio::time::sleep(crate::timings::GRACEFUL_STOP_POLL).await;
             }
+        };
+        tokio::select! {
+            () = drained => {}
+            () = tokio::time::sleep(bound) => {}
+            _ = next_signal() => {}
+        }
+        for line in crate::contained::report_lines(&crate::contained::unresolved()) {
+            eprintln!("{line}");
+        }
+        for pid in crate::contained::live_keepers() {
+            eprintln!(
+                "teardown still in progress under keeper pid {pid}; its outcome is unknown, \
+                 and processes it started may still be running"
+            );
         }
         // 128 + signal number, the conventional shell encoding.
         std::process::exit(exit_code);
-    });
-}
-
-/// Terminate a codex (or claude) child *and everything it spawned* by signalling
-/// its whole process group, escalating to `SIGKILL` after a grace period.
-///
-/// The group, not the pid: codex spawns exec-server processes, unified-exec
-/// background "cells", network proxies and MCP servers, and a wedged codex is
-/// exactly the case where those are still alive. Killing the pid alone would
-/// orphan them. `run_codex_json` puts codex in its own group so `pgid` equals
-/// the child pid and this cannot reach back and signal `review` itself.
-fn terminate_group(pid: u32, escalate_after: std::time::Duration) {
-    let Ok(pid) = i32::try_from(pid) else {
-        return;
-    };
-    // SAFETY: a negative pid addresses the process group with that id. codex was
-    // spawned with `process_group(0)`, so this group contains codex and its
-    // descendants and nothing else.
-    unsafe {
-        libc::kill(-pid, libc::SIGTERM);
-    }
-    // Escalate if SIGTERM is ignored.
-    tokio::spawn(async move {
-        tokio::time::sleep(escalate_after).await;
-        // SAFETY: as above. Harmless if the group is already gone (ESRCH).
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
     });
 }
 
@@ -690,6 +631,10 @@ pub struct ProviderResult {
     /// MCP/LSP config runs without a prompt) - a change to the operator's
     /// config that must be findable after the terminal is gone.
     pub grok_trust: Option<String>,
+    /// What the run's processes left behind (see `contained`). Recorded in
+    /// the audit and sidecar rows; never printed from here, since the closing
+    /// report reads the process-wide ledger instead.
+    pub leftovers: crate::contained::Leftovers,
 }
 
 /// What a provider reports, after the fact, about what served a run - as
@@ -718,11 +663,13 @@ pub fn now_epoch_secs() -> u64 {
 /// Internal result of one provider run before it's wrapped into a
 /// `ProviderResult`. Lets the run helpers return the session ID and digest
 /// alongside the text without a widening tuple.
-struct RunOutput {
-    text: String,
-    session_id: Option<String>,
-    digest: Option<Digest>,
-    served: Served,
+pub struct RunOutput {
+    pub text: String,
+    pub session_id: Option<String>,
+    pub digest: Option<Digest>,
+    pub served: Served,
+    /// What the run's processes left behind, across every invocation it made.
+    pub leftovers: crate::contained::Leftovers,
 }
 
 /// Knobs on how a codex or claude run is executed, injectable so tests can
@@ -737,15 +684,13 @@ pub struct ProviderRuntime {
     /// The program and leading arguments that run claude; `run_claude`
     /// appends its own. `["claude"]` in production. A prefix rather than a
     /// binary because tests run their stub as `/bin/sh <script>` - exec'ing a
-    /// freshly written script races `ETXTBSY` (see `provider_tests`).
+    /// freshly written script races `ETXTBSY` (see `tests/provider_runs.rs`).
     pub claude_command: Vec<String>,
     /// Watchdog polling/patience.
     pub timings: crate::watchdog::Timings,
     /// How long a pipe reader gets to finish after the child is reaped before
     /// it is aborted and we take whatever it buffered.
     pub drain_grace: std::time::Duration,
-    /// How long a process group gets to honour `SIGTERM` before `SIGKILL`.
-    pub sigkill_escalation: std::time::Duration,
     /// Overrides the XDG data root used for in-flight markers and incident
     /// bundles. `None` in production. Tests set it because redirecting
     /// `CODEX_HOME` only redirects the *child* - `review`'s own paths are
@@ -757,19 +702,49 @@ pub struct ProviderRuntime {
     /// The process-wide channel in production; tests pass their own so a stop
     /// cannot leak into the rest of the suite.
     pub stop: tokio::sync::watch::Receiver<bool>,
+    /// The keeper binary and teardown pacing (see `contained`). Tests point the
+    /// keeper at the built `review` and shorten the graces.
+    pub teardown: crate::contained::Settings,
+    /// Where a keeper writes its outcome if `review` is gone before reading it:
+    /// `teardowns.jsonl`, or `teardowns-private.jsonl` for a private project.
+    pub orphan_log: Option<std::path::PathBuf>,
 }
 
 impl ProviderRuntime {
     /// Build from project config. `stall_timeout_secs` comes from
     /// `[_defaults].stall_timeout_secs`: `None` keeps the built-in default,
-    /// `Some(0)` disables the stall branch, anything else sets it.
-    pub fn from_config(stall_timeout_secs: Option<u64>) -> Self {
+    /// `Some(0)` disables the stall branch, anything else sets it. `private`
+    /// routes the orphan log the way the sidecar is routed.
+    pub fn from_config(stall_timeout_secs: Option<u64>, private: bool) -> Self {
         let mut rt = Self::default();
         if let Some(secs) = stall_timeout_secs {
             rt.timings.stall_grace = (secs > 0).then(|| std::time::Duration::from_secs(secs));
         }
+        rt.orphan_log = orphan_log_path(None, private);
         rt
     }
+}
+
+/// The orphan log beside the sidecar logs. See `ProviderRuntime::orphan_log`.
+pub fn orphan_log_path(
+    data_root: Option<&std::path::Path>,
+    private: bool,
+) -> Option<std::path::PathBuf> {
+    let base = match data_root {
+        Some(root) => root.to_path_buf(),
+        None => std::env::var("XDG_DATA_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|_| {
+                std::env::var("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
+            })
+            .ok()?,
+    };
+    let name = if private {
+        "teardowns-private.jsonl"
+    } else {
+        "teardowns.jsonl"
+    };
+    Some(base.join("review").join(name))
 }
 
 impl Default for ProviderRuntime {
@@ -779,9 +754,10 @@ impl Default for ProviderRuntime {
             claude_command: vec!["claude".to_string()],
             timings: crate::watchdog::Timings::default(),
             drain_grace: crate::timings::DRAIN_GRACE,
-            sigkill_escalation: crate::timings::SIGKILL_ESCALATION,
             data_root: None,
             stop: stop_channel().subscribe(),
+            teardown: crate::contained::Settings::default(),
+            orphan_log: orphan_log_path(None, false),
         }
     }
 }
@@ -982,7 +958,7 @@ pub async fn invoke(
                     project_root,
                     oneshot,
                     launched,
-                    runtime.data_root.as_deref(),
+                    runtime,
                 )
                 .await
             }
@@ -1041,6 +1017,7 @@ pub async fn invoke(
             effort: effort.map(str::to_string),
             served: run.served,
             grok_trust: trust_grant,
+            leftovers: run.leftovers,
         },
         Err(e) => ProviderResult {
             provider: provider.to_string(),
@@ -1059,6 +1036,10 @@ pub async fn invoke(
             // Requested, as `sandbox` is: if grok got as far as running, the
             // grant happened before whatever failed.
             grok_trust: trust_grant,
+            // A runner that failed after its launch left its verdict in the
+            // ledger (`contained::Contained`'s drop), which the exit status
+            // reads; this row has no outcome to carry.
+            leftovers: crate::contained::Leftovers::default(),
         },
     }
 }
@@ -1235,7 +1216,7 @@ fn config_writable_roots_override(config: &[String]) -> Option<Vec<String>> {
 /// `--sandbox read-only`, so the run genuinely is read-only, and recording the
 /// caller's `None` left such rows invisible to the exact query the sidecar
 /// fields exist to answer, `jq 'select(.sandbox=="read-only")'`. On the
-/// `review resume` path the caller is `main::inherited_settings`, which
+/// `review resume` path the caller is `app::inherited_settings`, which
 /// supplies the level the session was created with; `None` there means the
 /// session's record carries no level to inherit (a row written before levels
 /// were recorded). Claude has no filesystem sandbox on this axis, so it records
@@ -1275,7 +1256,7 @@ async fn write_stdin(
 const CLAUDE_COMMAND_WAIT_SECS: u64 = 20 * 60;
 
 #[allow(clippy::too_many_arguments)]
-async fn run_claude(
+pub async fn run_claude(
     session_id: &str,
     model: Option<&str>,
     effort: Option<&str>,
@@ -1338,17 +1319,9 @@ async fn run_claude(
         .split_first()
         .map_or(("claude", &[][..]), |(p, rest)| (p.as_str(), rest));
     let mut cmd = Command::new(program);
-    cmd.args(leading)
-        .args(&args)
-        .current_dir(project_root)
-        // Its own process group, so the signal supervisor can take claude and
-        // every shell it spawned with it when `review` is killed. Otherwise a
-        // SIGTERM to `review` leaves claude running unsupervised, still editing
-        // the tree - the failure codex's process group was introduced for.
-        .process_group(0)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    // Launched under a keeper (`contained::spawn`), which gives claude its own
+    // process group and tears down every shell it started when the run ends.
+    cmd.args(leading).args(&args).current_dir(project_root);
     // Keep the model's shell commands in the foreground, where their output
     // reaches it. `--print` does not wait for a background Bash command when the
     // model ends its turn: it *kills* it and exits 0. Probed on Claude Code
@@ -1404,27 +1377,39 @@ async fn run_claude(
         &project_root.to_string_lossy(),
         runtime.data_root.as_deref(),
     );
-    let mut child = cmd.spawn().context("failed to spawn claude")?;
+    let mut contained = crate::contained::spawn(
+        &cmd,
+        Stdio::piped(),
+        &runtime.teardown,
+        &format!("the claude run of session {marker_sid}"),
+        runtime.orphan_log.clone(),
+    )?;
+    let mut marker = marker;
+    marker.record_keeper(contained.pid());
+    let stdin = contained
+        .child
+        .stdin
+        .take()
+        .context("failed to open claude stdin")?;
+    let stdout_pipe = contained
+        .child
+        .stdout
+        .take()
+        .context("failed to open claude stdout")?;
+    let stderr_pipe = contained
+        .child
+        .stderr
+        .take()
+        .context("failed to open claude stderr")?;
+    let mut contained = contained.launch().await?;
     // Launch has happened: the caller may release the global lock. Dropping the
     // sender instead (on the `?` above) tells it the same thing.
     if let Some(signal) = launched {
         let _ = signal.send(());
     }
-    let stdin = child.stdin.take().context("failed to open claude stdin")?;
-    let stdout_pipe = child
-        .stdout
-        .take()
-        .context("failed to open claude stdout")?;
-    let stderr_pipe = child
-        .stderr
-        .take()
-        .context("failed to open claude stderr")?;
-    // Registered only after the last `?` that could return early, and
-    // unregistered before the next, so the supervisor never holds a stale pid.
-    let pid = child.id();
-    if let Some(pid) = pid {
-        register_group(pid);
-    }
+    // The keeper: what `review interrupt` signals, and which forwards the
+    // SIGINT to claude once.
+    let pid = Some(contained.pid());
 
     let (first_tx, first_rx) = tokio::sync::watch::channel(false);
     // Offers claude's pid on the marker for `review interrupt` only once claude
@@ -1471,20 +1456,15 @@ async fn run_claude(
     // instead, as codex's is.
     let mut stop_rx = runtime.stop.clone();
     let mut stopped_by_signal = false;
-    let status = loop {
+    let keeper_status = loop {
         tokio::select! {
-            status = child.wait() => break status,
+            status = contained.wait() => break status,
             Ok(_) = stop_rx.wait_for(|stop| *stop), if !stopped_by_signal => {
                 stopped_by_signal = true;
-                if let Some(pid) = pid {
-                    if *first_rx.borrow() {
-                        if let Ok(pid) = i32::try_from(pid) {
-                            // SAFETY: our own child, not yet reaped.
-                            unsafe { libc::kill(pid, libc::SIGINT) };
-                        }
-                    } else {
-                        terminate_group(pid, runtime.sigkill_escalation);
-                    }
+                if *first_rx.borrow() {
+                    contained.interrupt();
+                } else {
+                    contained.terminate();
                 }
             }
         }
@@ -1500,10 +1480,12 @@ async fn run_claude(
     // next polls the task.
     marker_task.abort();
     let _ = marker_task.await;
-    if let Some(pid) = pid {
-        unregister_group(pid);
-    }
-    let status = status.context("failed to wait for claude")?;
+    let finished = contained.finish(&keeper_status).await;
+    let leftovers = finished.leftovers;
+    // `None` when the keeper could not report it. The run still goes on to
+    // what claude printed - its answer and session survive an unknown
+    // teardown, which the ledger already fails the command for.
+    let status = finished.status;
     let mut stdout_buf = collect_reader(
         stdout_task,
         &stdout_shared,
@@ -1558,7 +1540,7 @@ async fn run_claude(
         } else {
             "operator interrupt (`review interrupt`)".to_string()
         }),
-        ..with_usage(no_answer_digest(String::new(), &status))
+        ..with_usage(no_answer_digest(String::new(), status.as_ref()))
     };
     // What an interrupted run prints in place of an answer, as codex's does.
     let interrupted_text = |text: String| {
@@ -1587,7 +1569,7 @@ async fn run_claude(
             } else {
                 Digest {
                     turn_error: None,
-                    ..with_usage(no_answer_digest(String::new(), &status))
+                    ..with_usage(no_answer_digest(String::new(), status.as_ref()))
                 }
             };
             let text = if interrupt_requested {
@@ -1600,6 +1582,7 @@ async fn run_claude(
                 session_id: keep_id(None),
                 digest: Some(digest),
                 served,
+                leftovers,
             });
         }
         // Stopped before claude's first event: the group was killed before
@@ -1623,16 +1606,22 @@ async fn run_claude(
             text,
             session_id: keep_id(session_id),
             served,
+            leftovers,
             // As for grok: a real answer from a process that exited non-zero is
             // still an answer, but the status is the only sign something went
             // wrong after the turn, so it is kept. `captured: true` keeps it out
             // of `died_without_answer`.
-            digest: (!status.success()).then(|| {
+            digest: (!status.is_some_and(|s| s.success())).then(|| {
                 with_usage(Digest {
                     captured: true,
                     ..no_answer_digest(
-                        "claude exited non-zero after producing an answer".to_string(),
-                        &status,
+                        if status.is_some() {
+                            "claude exited non-zero after producing an answer".to_string()
+                        } else {
+                            "claude's exit status is unknown: its teardown was not confirmed"
+                                .to_string()
+                        },
+                        status.as_ref(),
                     )
                 })
             }),
@@ -1645,13 +1634,14 @@ async fn run_claude(
             let (text, digest) = if interrupt_requested {
                 (interrupted_text(text), interrupted_digest())
             } else {
-                (text, with_usage(no_answer_digest(reason, &status)))
+                (text, with_usage(no_answer_digest(reason, status.as_ref())))
             };
             RunOutput {
                 text,
                 session_id: keep_id(session_id),
                 digest: Some(digest),
                 served,
+                leftovers,
             }
         }
     })
@@ -1921,7 +1911,7 @@ const GROK_MAX_WAKES: u32 = 10;
 /// `GROK_MAX_WAKES` is reached (each wake delivers what it names, so the cap
 /// only stops a model that keeps starting new background work). It does not
 /// wake after a stated failure - grok said why the turn ended, and resending
-/// buys the same answer (`main::stated_failure`); that digest already fails the
+/// buys the same answer (`app::stated_failure`); that digest already fails the
 /// run. A wake turn that fails to launch keeps the first turn's output and
 /// session id rather than dropping both.
 #[allow(clippy::too_many_arguments)]
@@ -1936,8 +1926,9 @@ async fn run_grok(
     project_root: &Path,
     oneshot: bool,
     launched: Option<LaunchSignal>,
-    data_root: Option<&Path>,
+    runtime: &ProviderRuntime,
 ) -> Result<RunOutput> {
+    let data_root = runtime.data_root.as_deref();
     // In flight for the whole run, wake turns included. Never offered a pid:
     // grok has no clean way to end a turn, so `review interrupt` refuses it.
     // What the marker buys is `review message` seeing the turn in flight and
@@ -1960,6 +1951,8 @@ async fn run_grok(
         project_root,
         oneshot,
         launched,
+        runtime,
+        _marker.as_mut(),
     )
     .await?;
     // A fresh run reports its new id (grok's echo, else the one we minted); a
@@ -2046,6 +2039,8 @@ async fn run_grok(
             project_root,
             false,
             None,
+            runtime,
+            _marker.as_mut(),
         )
         .await
         {
@@ -2068,10 +2063,15 @@ async fn run_grok(
         usage.cached_input_tokens += next_usage.cached_input_tokens;
         usage.output_tokens += next_usage.output_tokens;
         usage.reasoning_output_tokens += next_usage.reasoning_output_tokens;
+        // Every turn's leftovers stay on the run, whichever turn answers.
+        let mut next = next;
+        let mut leftovers = std::mem::take(&mut out.leftovers);
+        leftovers.merge(std::mem::take(&mut next.leftovers));
         out = RunOutput {
             // The wake turn's report is the run's answer; the id stays the
             // first turn's (a resume does not report one).
             session_id: out.session_id,
+            leftovers,
             ..next
         };
     }
@@ -2102,7 +2102,7 @@ fn wake_failure_digest(reason: String, last: Option<&Digest>) -> Digest {
         signal: None,
         turns,
         usage,
-        ..no_answer_digest(reason, &std::process::ExitStatus::default())
+        ..no_answer_digest(reason, Some(&std::process::ExitStatus::default()))
     }
 }
 
@@ -2119,6 +2119,8 @@ async fn run_grok_turn(
     project_root: &Path,
     oneshot: bool,
     launched: Option<LaunchSignal>,
+    runtime: &ProviderRuntime,
+    marker: Option<&mut crate::inflight::Guard>,
 ) -> Result<(RunOutput, u32, Usage)> {
     // Grok takes no prompt on stdin - `-p` requires a value and `-p -` is read
     // literally as a one-character prompt. `--prompt-file` is the equivalent
@@ -2196,11 +2198,7 @@ async fn run_grok_turn(
     args.push(GROK_COMMAND_WAIT_SECS.to_string());
 
     let mut cmd = Command::new("grok");
-    cmd.args(&args)
-        .current_dir(project_root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(&args).current_dir(project_root);
     // Keep shell commands in the foreground until they finish. Grok moves any
     // command that blocks longer than 15s to the background, and headless `-p`
     // then only waits for it to *finish* before exiting - it never gives the
@@ -2236,17 +2234,71 @@ async fn run_grok_turn(
     if trust && let Some(ref g) = grok {
         g.check_trust(project_root)?;
     }
-    let child = cmd.spawn().context("failed to spawn grok")?;
+    let label = match &oneshot_id {
+        Some(id) => format!("the grok run of session {id}"),
+        None => format!("the grok run of session {session_id}"),
+    };
+    let mut contained = crate::contained::spawn(
+        &cmd,
+        Stdio::null(),
+        &runtime.teardown,
+        &label,
+        runtime.orphan_log.clone(),
+    )?;
+    if let Some(marker) = marker {
+        marker.record_keeper(contained.pid());
+    }
+    let stdout_pipe = contained
+        .child
+        .stdout
+        .take()
+        .context("failed to open grok stdout")?;
+    let stderr_pipe = contained
+        .child
+        .stderr
+        .take()
+        .context("failed to open grok stderr")?;
+    // Read while the run goes, not after: the keeper is reaped only once the
+    // teardown is done, and a reader started late could leave grok blocked on
+    // a full pipe.
+    let stdout_shared = new_shared_buf();
+    let stderr_shared = new_shared_buf();
+    let stdout_task = tokio::spawn(read_capped(
+        stdout_pipe,
+        STDOUT_CAPTURE_CAP,
+        std::sync::Arc::clone(&stdout_shared),
+    ));
+    let stderr_task = tokio::spawn(read_capped(
+        stderr_pipe,
+        STDERR_CAPTURE_CAP,
+        std::sync::Arc::clone(&stderr_shared),
+    ));
+    let mut contained = contained.launch().await?;
     if let Some(signal) = launched {
         let _ = signal.send(());
     }
-
-    let output = child
-        .wait_with_output()
-        .await
-        .context("failed to wait for grok")?;
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let keeper_status = contained.wait().await;
+    let finished = contained.finish(&keeper_status).await;
+    let leftovers = finished.leftovers;
+    // `None` when the keeper could not report it; what grok printed still
+    // stands, and the ledger fails the command for the unknown teardown.
+    let status = finished.status;
+    let stdout_buf = collect_reader(
+        stdout_task,
+        &stdout_shared,
+        runtime.drain_grace,
+        "grok stdout",
+    )
+    .await;
+    let stderr_buf = collect_reader(
+        stderr_task,
+        &stderr_shared,
+        runtime.drain_grace,
+        "grok stderr",
+    )
+    .await;
+    let stdout = String::from_utf8_lossy(&stdout_buf).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_buf).into_owned();
     // A failed `--trust` grant is printed only to stderr, which is otherwise
     // read only when interpreting an error - so it would stay invisible on any
     // turn that happened not to edit, and the next run would be untrusted.
@@ -2277,17 +2329,23 @@ async fn run_grok_turn(
             text: answer.text,
             session_id: keep_id(answer.session_id),
             served,
+            leftovers,
             // A real answer from a process that nonetheless exited non-zero is
             // still a real answer, but the status is worth surfacing rather
             // than discarding - it is the only sign that something went wrong
             // after the turn finished. `captured: true` keeps it out of
             // `died_without_answer`, so the run does not fail on it.
-            digest: (!output.status.success()).then(|| {
+            digest: (!status.is_some_and(|s| s.success())).then(|| {
                 with_usage(Digest {
                     captured: true,
                     ..no_answer_digest(
-                        "grok exited non-zero after producing an answer".to_string(),
-                        &output.status,
+                        if status.is_some() {
+                            "grok exited non-zero after producing an answer".to_string()
+                        } else {
+                            "grok's exit status is unknown: its teardown was not confirmed"
+                                .to_string()
+                        },
+                        status.as_ref(),
                     )
                 })
             }),
@@ -2310,8 +2368,9 @@ async fn run_grok_turn(
             RunOutput {
                 text,
                 session_id: keep_id(session_id),
-                digest: Some(with_usage(no_answer_digest(reason, &output.status))),
+                digest: Some(with_usage(no_answer_digest(reason, status.as_ref()))),
                 served,
+                leftovers,
             }
         }
     };
@@ -2421,14 +2480,14 @@ struct GrokAnswer {
 /// first, persists flat, and never invites a retry. The remaining fields
 /// describe a run with no captured answer, which is what happened; the
 /// codex-specific forensics stay `None` because grok has no rollout.
-fn no_answer_digest(reason: String, status: &std::process::ExitStatus) -> Digest {
+fn no_answer_digest(reason: String, status: Option<&std::process::ExitStatus>) -> Digest {
     Digest {
         // The *observed* status, not an assumed one. Hardcoding `1` here made
         // the digest assert something it had never looked at - and the exit
         // code is the field an operator reads to tell "grok declined" from
-        // "grok was killed".
-        exit_code: status.code(),
-        signal: signal_name(status),
+        // "grok was killed". `None` when the keeper could not report it.
+        exit_code: status.and_then(std::process::ExitStatus::code),
+        signal: status.and_then(signal_name),
         captured: false,
         recovered_from_transcript: false,
         turns: 0,
@@ -2808,7 +2867,7 @@ async fn run_codex(
 // purpose is to be destructured immediately, so the lint is waived rather than
 // worked around.
 #[allow(clippy::too_many_arguments)]
-async fn run_codex_json(
+pub async fn run_codex_json(
     args: Vec<String>,
     last_msg_path: &str,
     known_session_id: Option<String>,
@@ -2824,22 +2883,12 @@ async fn run_codex_json(
         // Make a codex panic legible: without this it exits 1 with no trace,
         // which is exactly the "no recorded reason" we kept hitting. Set before
         // the profile env so an explicit override still wins.
-        .env("RUST_BACKTRACE", "1")
-        // Put codex in its own process group so we can signal it *and every
-        // process it spawned* (exec-server, unified-exec background cells, MCP
-        // servers) as a unit, without the signal reaching `review` itself. This
-        // is what makes the watchdog's kill effective: a wedged codex typically
-        // still has live children, and killing the pid alone would orphan them.
-        //
-        // The cost is that a terminal SIGINT no longer reaches codex
-        // implicitly, since it is no longer in the foreground process group -
-        // so `run_codex_json` installs its own handler and forwards it. Without
-        // that forwarding this change would *cause* the orphaning it exists to
-        // prevent.
-        .process_group(0)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .env("RUST_BACKTRACE", "1");
+    // Launched under a keeper (`contained::spawn`), which puts codex in a
+    // process group of its own, out of reach of a terminal SIGINT - the signal
+    // supervisor stops runs instead - and tears down everything codex started
+    // (exec-server, unified-exec cells, sandboxed shells in sessions of their
+    // own, MCP servers) when the run ends, however it ends.
     if let Some(vars) = env {
         cmd.envs(vars);
     }
@@ -2911,19 +2960,45 @@ async fn run_codex_json(
             runtime.data_root.as_deref(),
         )
     });
-    let mut child = cmd.spawn().context("failed to spawn codex")?;
+    // Clean up the `-o` temp file on every exit path, including an error
+    // before the read below.
+    let _output_cleanup = RemoveOnDrop(last_msg_path.to_string());
+    let label = match known_session_id.as_deref() {
+        Some(sid) => format!("the codex run of session {sid}"),
+        None => "a codex run".to_string(),
+    };
+    let mut contained = crate::contained::spawn(
+        &cmd,
+        Stdio::piped(),
+        &runtime.teardown,
+        &label,
+        runtime.orphan_log.clone(),
+    )?;
+    let mut early_marker = early_marker;
+    if let Some(marker) = early_marker.as_mut() {
+        marker.record_keeper(contained.pid());
+    }
+    let stdin = contained
+        .child
+        .stdin
+        .take()
+        .context("failed to open codex stdin")?;
+    let stdout_pipe = contained
+        .child
+        .stdout
+        .take()
+        .context("failed to open codex stdout")?;
+    let stderr_pipe = contained
+        .child
+        .stderr
+        .take()
+        .context("failed to open codex stderr")?;
+    let mut contained = contained.launch().await?;
     // Launch has happened: the caller may release the global lock. Dropping the
     // sender instead (on the `?` above) tells it the same thing.
     if let Some(signal) = launched {
         let _ = signal.send(());
     }
-    // Clean up the `-o` temp file on every exit path - spawn succeeded so it
-    // exists, and an error before the read below would otherwise leak it.
-    let _output_cleanup = RemoveOnDrop(last_msg_path.to_string());
-
-    let stdin = child.stdin.take().context("failed to open codex stdin")?;
-    let stdout_pipe = child.stdout.take().context("failed to open codex stdout")?;
-    let stderr_pipe = child.stderr.take().context("failed to open codex stderr")?;
 
     // Publishes the session id as soon as it is known: immediately on a resume,
     // or when `thread.started` arrives on stdout for a fresh run. The watchdog
@@ -2933,9 +3008,10 @@ async fn run_codex_json(
     // Kept for after the wait, so the id survives a stdout reader that never
     // reached EOF (see where `session_id` is resolved).
     let sid_rx_final = sid_rx.clone();
-    // The group leader: what the watchdog and signal supervisor kill, and what
-    // the in-flight marker records for `review interrupt` to signal.
-    let child_pid = child.id();
+    // The keeper: what the in-flight marker records for `review interrupt` to
+    // signal, and which forwards that SIGINT to codex once.
+    let keeper_pid = contained.pid();
+    let child_pid = Some(keeper_pid);
     // Flips on codex's first stdout. Until then the pid may be a node wrapper
     // that has not yet installed the handler forwarding SIGINT to the native
     // binary, so interrupting it could kill the wrapper and orphan codex -
@@ -2972,7 +3048,10 @@ async fn run_codex_json(
                             return;
                         }
                     };
-                    crate::inflight::mark(&sid, "codex", &project, data_root.as_deref())
+                    let mut guard =
+                        crate::inflight::mark(&sid, "codex", &project, data_root.as_deref());
+                    guard.record_keeper(keeper_pid);
+                    guard
                 }
             };
             if first_output_rx.wait_for(|seen| *seen).await.is_ok() {
@@ -3008,11 +3087,6 @@ async fn run_codex_json(
     ));
     let write_task = tokio::spawn(write_stdin(stdin, prompt.as_bytes().to_vec()));
 
-    // Make this run's process group visible to the signal supervisor, so an
-    // operator killing `review` takes codex with it instead of orphaning it.
-    if let Some(pid) = child_pid {
-        register_group(pid);
-    }
     // Records that *we* ended the run, and why. See `Digest::terminated_by_review`.
     let mut terminated_by_review: Option<String> = None;
     // Forensics from the watchdog verdict, carried onto the digest and into the
@@ -3037,7 +3111,7 @@ async fn run_codex_json(
     //     running detached, still modifying the tree.
     // The watchdog arm below fixes the first; the second is handled process-wide
     // by `install_signal_supervisor`.
-    let status = {
+    {
         let watchdog = crate::watchdog::wait_for_stranded_completion(
             sid_rx,
             env.and_then(|e| e.get("CODEX_HOME")).cloned(),
@@ -3047,8 +3121,9 @@ async fn run_codex_json(
         tokio::pin!(watchdog);
         loop {
             tokio::select! {
-                // Normal path: codex exited on its own.
-                status = child.wait() => break status,
+                // Normal path: codex exited on its own. The teardown of what it
+                // left is waited for below, outside the watchdog's view.
+                () = contained.wait_provider() => break,
 
                 // codex has demonstrably produced its answer but will not exit.
                 // Kill the group; the loop then reaps it on the next iteration
@@ -3070,9 +3145,7 @@ async fn run_codex_json(
                     });
                     quiet_secs = Some(verdict.quiet_secs);
                     last_rollout_event = verdict.last_event.clone();
-                    if let Some(pid) = child_pid {
-                        terminate_group(pid, runtime.sigkill_escalation);
-                    }
+                    contained.terminate();
                 }
 
                 // `review` was signalled: end the turn as `review interrupt`
@@ -3084,20 +3157,20 @@ async fn run_codex_json(
                 // not match, and select disables the arm.)
                 Ok(_) = stop_rx.wait_for(|stop| *stop), if !stopped_by_signal => {
                     stopped_by_signal = true;
-                    if let Some(pid) = child_pid {
-                        if *first_output_seen.borrow() {
-                            if let Ok(pid) = i32::try_from(pid) {
-                                // SAFETY: our own child, not yet reaped.
-                                unsafe { libc::kill(pid, libc::SIGINT) };
-                            }
-                        } else {
-                            terminate_group(pid, runtime.sigkill_escalation);
-                        }
+                    if *first_output_seen.borrow() {
+                        contained.interrupt();
+                    } else {
+                        contained.terminate();
                     }
                 }
             }
         }
-    };
+    }
+    // codex has exited; its keeper exits once whatever it left is torn down.
+    // Waited for before the marker goes, so the session reads as in flight
+    // until nothing of the run is left: a message arriving meanwhile waits for
+    // it rather than launching beside the teardown.
+    let keeper_status = contained.wait().await;
     let watched_session_id = sid_rx_final.borrow().clone();
     // Consumed now that codex is reaped, whatever became of it: a request left
     // behind would mark the session's *next* run as interrupted. Before the
@@ -3106,17 +3179,22 @@ async fn run_codex_json(
     let interrupt_requested = watched_session_id.as_deref().is_some_and(|sid| {
         crate::inflight::take_interrupt_request(sid, runtime.data_root.as_deref())
     }) || stopped_by_signal;
-    // Run is over: drop the in-flight marker and stop advertising the group to
-    // the signal supervisor. Both happen before the `?` below so a failed wait
-    // cannot leak either. `abort` only requests cancellation - the guard drops
+    // Run is over: drop the in-flight marker, before the `?` below so a failed
+    // wait cannot leak it. `abort` only requests cancellation - the guard drops
     // when the runtime next polls the task - so the handle is awaited, or the
     // marker could outlive the run that returned.
     marker_task.abort();
     let _ = marker_task.await;
-    if let Some(pid) = child_pid {
-        unregister_group(pid);
+    if let Some(sid) = watched_session_id.as_deref() {
+        contained.set_label(format!("the codex run of session {sid}"));
     }
-    let status = status.context("failed to wait for codex")?;
+    let finished = contained.finish(&keeper_status).await;
+    let mut leftovers = finished.leftovers;
+    // `None` when the keeper could not report it: the digest then shows no
+    // exit code, the run reads as suspicious (bundled, transcript read), and
+    // its session and any answer survive - the ledger already fails the
+    // command for the unknown teardown.
+    let status = finished.status;
 
     // The child is reaped, so the run is over regardless of what the pipes do.
     //
@@ -3257,8 +3335,8 @@ async fn run_codex_json(
         .or(parsed_session_id)
         .or(watched_session_id);
 
-    let exit_code = status.code();
-    let signal = signal_name(&status);
+    let exit_code = status.and_then(|s| s.code());
+    let signal = status.as_ref().and_then(signal_name);
     // Only pay for transcript forensics when the run looks wrong; a clean
     // captured run needs no post-mortem. Look under the run's effective
     // CODEX_HOME (a profile env override) so a custom codex home is searched.
@@ -3312,7 +3390,13 @@ async fn run_codex_json(
     // argv, and codex's version - so the next death is over-instrumented.
     // An operator interrupt is not an incident: the missing answer is explained.
     let incident_path = if suspicious && !interrupted {
+        // The version probe runs a provider binary too, so it is contained
+        // like the run, and what it leaves joins the run's leftovers.
+        let (codex_version, probe_leftovers) =
+            crate::contained::version_probe(&runtime.codex_binary, &runtime.teardown).await;
+        leftovers.merge(probe_leftovers);
         crate::incident::write_bundle(&crate::incident::Incident {
+            codex_version,
             provider: "codex",
             // The binary actually executed, which is not always "codex": a
             // stub overrides it. `command` in meta.json has to replay the
@@ -3396,6 +3480,7 @@ async fn run_codex_json(
         session_id,
         digest: Some(digest),
         served: Served::default(),
+        leftovers,
     })
 }
 

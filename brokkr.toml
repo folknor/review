@@ -1,1 +1,4 @@
 project = "review"
+
+[test]
+default_package = "review"

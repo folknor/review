@@ -15,18 +15,19 @@
 //!
 //! # How
 //!
-//! 1. The run's in-flight marker names the provider's pid, the leader of the
-//!    process group `review` spawned it into - offered only once the provider
-//!    has produced output, so it is never a process too young to handle the
-//!    signal (for codex, a node wrapper that would die on it).
+//! 1. The run's in-flight marker names its keeper's pid (see `keeper`), the
+//!    owning `review`'s child and leader of its own process group - offered
+//!    only once the provider has produced output, so the provider is never too
+//!    young to handle the signal (for codex, a node wrapper that would die on
+//!    it).
 //! 2. An interrupt request is written beside the marker *before* the signal, so
 //!    the owning `review` can tell this apart from a death once codex exits.
-//! 3. `SIGINT` goes to that pid alone - on a codex npm install the node
-//!    wrapper, which forwards it to the native binary once. Signalling the
-//!    whole group would hand the native binary a second copy. codex answers
-//!    `SIGINT` with a `turn/interrupt`, so the turn ends cleanly and the session
-//!    lock is freed; claude ends the turn, kills its running command and prints
-//!    its result.
+//! 3. `SIGINT` goes to the keeper, which forwards one SIGINT to the provider
+//!    alone, through a pidfd - on a codex npm install the node wrapper, which
+//!    forwards it to the native binary once. Signalling the whole group would
+//!    hand the native binary a second copy. codex answers `SIGINT` with a
+//!    `turn/interrupt`, so the turn ends cleanly and the session lock is freed;
+//!    claude ends the turn, kills its running command and prints its result.
 //! 4. We wait for the owner to consume the request (the provider has been reaped),
 //!    then for its sidecar row, because that row is what `review resume` needs.
 //!    Printing the resume command any earlier would hand the operator a command
@@ -59,7 +60,7 @@ pub async fn run(session_id: &str) -> Result<()> {
 
 /// What became of an interrupt, read from the rows the owner recorded.
 #[derive(Debug)]
-pub(crate) struct Outcome {
+pub struct Outcome {
     pub interrupted: bool,
     pub project: String,
     pub provider: String,
@@ -67,7 +68,7 @@ pub(crate) struct Outcome {
 
 /// The verb, minus printing. `data_root` and `rows` (every sidecar row, oldest
 /// first) are injectable so the whole sequence can run against a stub codex.
-pub(crate) async fn interrupt(
+pub async fn interrupt(
     session_id: &str,
     data_root: Option<&Path>,
     rows: impl Fn() -> Vec<SessionRecord>,
@@ -89,6 +90,9 @@ pub(crate) async fn interrupt(
     };
     let provider = marker.provider.clone();
     let provider = provider.as_str();
+    if marker.cleanup_pending {
+        bail!("{}", cleanup_pending_message(session_id, &marker));
+    }
     if !interruptible(provider) {
         bail!(
             "session {session_id} is a {provider} run; only codex and claude runs can be \
@@ -136,30 +140,45 @@ pub(crate) async fn interrupt(
     let Ok(pid) = i32::try_from(child_pid) else {
         bail!("{provider} pid {child_pid} is out of range");
     };
-    // The provider may have exited since the marker was read, and its pid been
-    // reused. What `review` spawned leads its own process group and is the
-    // owner's child; anything else at that pid is not ours to signal.
+    // The keeper may have exited since the marker was read, and its pid been
+    // reused. A pidfd pins whatever holds the pid now; what `review` spawned
+    // leads its own process group, is the owner's child, and has the start
+    // time the marker recorded. Checked after the pidfd is open and confirmed
+    // still unexited afterwards, so the checks were of the process the signal
+    // will reach.
+    let gone = || {
+        anyhow::anyhow!(
+            "the {provider} run's keeper (pid {child_pid}) has already exited; the run is \
+             finishing on its own"
+        )
+    };
+    let pidfd = crate::keeper::pidfd_open(child_pid).map_err(|_| gone())?;
     // SAFETY: `getpgid` only reads the process table.
     let leads_group = unsafe { libc::getpgid(pid) } == pid;
-    if !leads_group || parent_pid(pid) != Some(marker.pid) {
-        bail!("{provider} (pid {child_pid}) has already exited; the run is finishing on its own");
+    let identity = crate::keeper::stat_ppid_start(child_pid);
+    let ours = leads_group
+        && identity.is_some_and(|(ppid, start)| {
+            ppid == marker.pid && marker.keeper_start.is_none_or(|s| s == start)
+        })
+        && !crate::keeper::pidfd_exited(&pidfd);
+    if !ours {
+        return Err(gone());
     }
 
     let count = |rows: &[SessionRecord]| rows.iter().filter(|r| r.session_id == session_id).count();
     let rows_before = count(&rows());
     crate::inflight::request_interrupt(session_id, data_root)?;
-    // SAFETY: a pid verified above to be the owner's group-leading child.
-    if unsafe { libc::kill(pid, libc::SIGINT) } != 0 {
-        let err = std::io::Error::last_os_error();
+    if let Err(err) = crate::keeper::pidfd_signal(&pidfd, libc::SIGINT) {
         // Gone already, and the owner may have consumed the request on its way
         // out; then there is a run to report on after all.
         if crate::inflight::interrupt_pending(session_id, data_root) {
             let _ = crate::inflight::take_interrupt_request(session_id, data_root);
-            bail!("failed to signal {provider} (pid {child_pid}): {err}");
+            bail!("failed to signal the {provider} run's keeper (pid {child_pid}): {err}");
         }
     } else {
         eprintln!(
-            "interrupt sent to {provider} (pid {child_pid}); waiting for the run to wind down"
+            "interrupt sent to {provider} through its keeper (pid {child_pid}); waiting for the \
+             run to wind down"
         );
     }
 
@@ -221,31 +240,23 @@ pub(crate) async fn interrupt(
     }
 }
 
+/// Why nothing may launch on, or interrupt, a session whose owning `review` is
+/// gone while its keeper still tears the run down. Shared with `review
+/// message`.
+pub fn cleanup_pending_message(session_id: &str, marker: &crate::inflight::Marker) -> String {
+    format!(
+        "session {session_id}: the review that ran it (pid {}) is gone and its processes are \
+         still being torn down (keeper pid {}); retry shortly",
+        marker.pid,
+        marker
+            .keeper
+            .map_or_else(|| "?".to_string(), |k| k.to_string())
+    )
+}
+
 /// Whether a run of `provider` can be ended mid-turn and resumed: both codex and
 /// claude close the turn on `SIGINT` and leave a resumable session. Grok has no
 /// such lever. Shared with `review message`, so the two cannot disagree.
 pub(crate) fn interruptible(provider: &str) -> bool {
     matches!(provider, "codex" | "claude")
-}
-
-/// `pid`'s parent, from `/proc/<pid>/stat`. `comm` may contain spaces and
-/// parentheses, so the fields are read from after the *last* `)`: state, then
-/// ppid.
-fn parent_pid(pid: i32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let (_, fields) = stat.rsplit_once(')')?;
-    fields.split_whitespace().nth(1)?.parse().ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_process_knows_its_parent() {
-        let me = i32::try_from(std::process::id()).expect("pid fits");
-        // SAFETY: getppid has no failure mode.
-        let parent = u32::try_from(unsafe { libc::getppid() }).expect("pid fits");
-        assert_eq!(parent_pid(me), Some(parent));
-    }
 }

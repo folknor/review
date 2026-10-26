@@ -19,6 +19,13 @@ pub struct Incident<'a> {
     pub provider: &'a str,
     /// The binary invoked (e.g. "codex") - argv[0] of the replayable command.
     pub binary: &'a str,
+    /// `<binary> --version`, best-effort; deaths may be version-specific. It
+    /// probes the binary that actually ran, not the provider name: those differ
+    /// whenever the binary is overridden (the test harness runs a stub), and
+    /// probing the name recorded the host's real codex for a stub run. Taken by
+    /// the caller (`contained::version_probe`), so the probe is contained like
+    /// any provider process.
+    pub codex_version: Option<String>,
     pub session_id: Option<&'a str>,
     /// The args passed to the binary (not including argv[0]).
     pub argv: &'a [String],
@@ -210,7 +217,7 @@ pub fn write_bundle(inc: &Incident) -> Option<PathBuf> {
         provider: inc.provider.to_string(),
         session_id: inc.session_id.map(str::to_string),
         review_version: env!("CARGO_PKG_VERSION"),
-        codex_version: probe_codex_version(inc.binary),
+        codex_version: inc.codex_version.clone(),
         argv: full_argv,
         command,
         cwd: inc.cwd.to_string_lossy().into_owned(),
@@ -416,27 +423,6 @@ pub fn list_recent(limit: usize) -> Vec<ListedIncident> {
             ListedIncident { dir, meta }
         })
         .collect()
-}
-
-/// Best-effort `<binary> --version`; deaths may be version-specific.
-///
-/// Probes the binary that was actually executed, not the provider name. Those
-/// differ whenever the binary is overridden (the test harness runs a stub), and
-/// probing the *name* meant a stub run recorded the host's real `codex
-/// --version` - metadata describing a process that never ran.
-fn probe_codex_version(binary: &str) -> Option<String> {
-    let out = std::process::Command::new(binary)
-        .arg("--version")
-        // Never inherit our stdin. `output()` would otherwise hand the probe
-        // whatever `review` is reading from, and a binary that reads stdin
-        // before parsing its arguments then blocks forever - taking the incident
-        // write, and the run, with it. A version probe has no business reading
-        // input, so close it.
-        .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { None } else { Some(s) }
 }
 
 #[cfg(test)]

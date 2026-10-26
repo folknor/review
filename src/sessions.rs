@@ -59,6 +59,11 @@ struct SessionEntry<'a> {
     /// clean short `response`. Absent for claude (no machine-readable stream).
     #[serde(skip_serializing_if = "Option::is_none")]
     digest: Option<crate::provider::DigestSummary>,
+    /// What the run's processes left behind: the ones its keeper killed, and
+    /// any it could not (see `contained::Leftovers`). Absent when nothing was
+    /// left, so `jq 'select(.leftovers)'` finds the runs that left something.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leftovers: Option<crate::contained::Leftovers>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -81,7 +86,7 @@ pub struct SessionRecord {
     /// field existed (none in practice - included for forward compat).
     #[serde(default)]
     pub kind: String,
-    /// Read back by `main::inherited_settings` so a `review resume` launches
+    /// Read back by `app::inherited_settings` so a `review resume` launches
     /// on the session's own model rather than the provider's default.
     pub model: Option<String>,
     /// Absent on rows written before this was recorded, and on any run that
@@ -230,6 +235,7 @@ pub fn record(
     assembled_prompt: &str,
     result: &Result<String>,
     digest: Option<&crate::provider::DigestSummary>,
+    leftovers: &crate::contained::Leftovers,
 ) {
     let path = match sessions_path(private) {
         Some(p) => p,
@@ -270,6 +276,7 @@ pub fn record(
         error: result.as_ref().err().map(ToString::to_string),
         review_version: env!("CARGO_PKG_VERSION"),
         digest: digest.cloned(),
+        leftovers: (!leftovers.is_empty()).then(|| leftovers.clone()),
     };
 
     let line = match serde_json::to_string(&entry) {

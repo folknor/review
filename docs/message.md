@@ -81,6 +81,11 @@ failing.
 
 ## Exit status
 
-`1` if the turn produced no answer, including an interrupted one; `0`
-otherwise, and for `review message --dry-run`, which sends nothing. An
-interrupted run is never auto-resumed (see `review man failures`).
+`1` if the turn produced no answer, including an interrupted one, or if
+anything it started was left running; `0` otherwise, and for `review message
+--dry-run`, which sends nothing. An interrupted run is never auto-resumed (see
+`review man failures`).
+
+A session whose earlier `review` died while that run's processes were still
+being torn down shows as `[cleanup pending]` in `review sessions`, and a message
+or interrupt is refused until the teardown ends.

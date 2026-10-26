@@ -57,6 +57,12 @@ line and the response:
 The output ends with a `runtime:` line. The exit status is 1 when no provider
 produced an answer, including runs that died, stalled or were interrupted.
 
+When a run ends, whatever its agent left running (background commands, daemons,
+shells in sessions of their own) is ended before `review` reports. That is
+recorded and never printed. Anything that could not be ended is printed above
+the `runtime:` line as `left running:` with its pids and command lines, or
+`teardown outcome unknown:`, and the exit status is 1 whatever the answers were.
+
 Examples:
   echo \"what does foo() do?\" | review -p deep          Plain prompt, 'deep' profile
   echo \"audit the auth flow\" | review -a security      With an archetype
@@ -93,7 +99,9 @@ last touched more than 27 minutes ago (codex) or 55 minutes ago (claude, grok)
 is refused. When that happens, start a fresh run and restate the context the
 new session needs.
 
-The exit status is 1 if the turn produced no answer.";
+The exit status is 1 if the turn produced no answer, or if anything it started
+was left running. A session whose earlier `review` is gone while that run's
+processes are still being torn down is refused until they are.";
 
 const INTERRUPT_AFTER_HELP: &str = "\
 Works on codex and claude runs, not grok. This ends the turn, waits for the run
@@ -103,7 +111,9 @@ turn and send new information in one step, use `review message` instead.
 
 Signalling the `review` process (Ctrl-C, SIGTERM, a stopped background task)
 ends its codex and claude turns the same way and records them before exiting; a
-second signal kills them outright. SIGKILL loses the session.";
+second signal skips that and tears the runs down at once, which can lose their
+records, and a third exits without waiting for the teardown to report. SIGKILL
+loses the session, though what the runs started is still torn down.";
 
 const CONFIG_AFTER_HELP: &str = "\
 This is the authoritative view of what a run in this directory will use. It

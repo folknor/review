@@ -28,8 +28,9 @@
 //! bug that does not exist. Pinned by
 //! `an_answered_run_is_stranded_even_with_a_shorter_stall_grace`.
 //!
-//! `SIGTERM_WINDOW` is the odd one out: it is not patience with codex but with
-//! ourselves, on the way out of a signal handler that is about to `exit`.
+//! The teardown timings (`LEFTOVER_GRACE`, `KILL_PHASE`, `TEARDOWN_BEAT`) are
+//! the keeper's (see `keeper`): they bound how long a finished run's leftovers
+//! can delay its report.
 
 use std::time::Duration;
 
@@ -64,19 +65,34 @@ pub const STALL_GRACE: Duration = Duration::from_secs(900);
 /// exposure without discarding what was already captured.
 pub const DRAIN_GRACE: Duration = Duration::from_secs(5);
 
-/// How long a process group gets to honour `SIGTERM` before `SIGKILL`.
+/// How long a run that is told to terminate (the watchdog, or a stop before
+/// its first output) gets to honour `SIGTERM` before its keeper starts killing
+/// (see `keeper`).
 ///
 /// A codex wedged in an unbounded shutdown await may never process the first
 /// signal, and a deliberately stubborn descendant may ignore it outright.
 pub const SIGKILL_ESCALATION: Duration = Duration::from_secs(10);
 
-/// The window the signal supervisor allows between `SIGTERM`ing codex's groups
-/// and `SIGKILL`ing them on its way to `process::exit`.
-///
-/// Short by necessity rather than choice: `exit` cancels the deferred
-/// `SIGKILL_ESCALATION`, so this is the *only* chance a cooperative codex gets
-/// to shut down cleanly once the operator has asked us to stop.
-pub const SIGTERM_WINDOW: Duration = Duration::from_millis(250);
+/// How long processes a provider left behind, once it exited on its own, get
+/// to honour `SIGTERM` before the keeper starts killing them. Short: the run is
+/// over, and this only lets a cooperative process (codex's sandbox supervisor
+/// removing the placeholder files it made in the workspace) clean up.
+pub const LEFTOVER_GRACE: Duration = Duration::from_secs(2);
+
+/// After the `SIGTERM` grace, how long the keeper's `SIGKILL` rounds may take.
+/// Past it, whatever is alive is reported as surviving.
+pub const KILL_PHASE: Duration = Duration::from_secs(3);
+
+/// The keeper's pause between teardown rounds, which gives a supervising
+/// process a moment to reap a killed child before its own turn.
+pub const TEARDOWN_BEAT: Duration = Duration::from_millis(50);
+
+/// How long a provider may take to exec under its keeper before the launch is
+/// failed, so a stuck exec cannot hold the global launch lock.
+pub const KEEPER_STARTUP: Duration = Duration::from_secs(30);
+
+/// How long a keeper's final report may take to drain to `review`.
+pub const KEEPER_FLUSH: Duration = Duration::from_secs(2);
 
 /// How long a signalled `review` waits for its codex runs to end their turns and
 /// be recorded before falling back to killing them.
@@ -154,11 +170,11 @@ mod tests {
         assert!(POLL_INTERVAL * 4 <= STALL_GRACE);
     }
 
-    /// The supervisor's window must be shorter than the escalation it stands in
-    /// for; if it were longer it would simply be the escalation.
+    /// A beat is a pause inside the kill phase; at or above it, the leaves-first
+    /// rounds would collapse into one.
     #[test]
-    fn the_sigterm_window_is_shorter_than_the_escalation() {
-        assert!(SIGTERM_WINDOW < SIGKILL_ESCALATION);
+    fn the_teardown_beat_fits_many_times_in_the_kill_phase() {
+        assert!(TEARDOWN_BEAT * 10 <= KILL_PHASE);
     }
 
     #[test]
